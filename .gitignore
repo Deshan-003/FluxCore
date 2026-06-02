@@ -1,0 +1,23 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+target/
+*.local
+
+# Local tooling: installers, DLLs, archives and build logs (not source)
+tools/
+logs/
+*.log
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
