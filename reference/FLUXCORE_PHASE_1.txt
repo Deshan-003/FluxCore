@@ -1,0 +1,323 @@
+# FLUXCORE — PHASE 1 COMPLETE DEVELOPMENT PROMPT
+## Hardware Monitoring & Resource Intelligence Foundation
+
+Act as a Senior Windows Systems Engineer, Rust Developer, Desktop Application Architect, GPU Computing Engineer, and UI/UX Designer.
+
+Your task is to DEVELOP Phase 1 of **FluxCore**, a professional Windows desktop hardware monitoring and resource intelligence application.
+
+Do not just explain the architecture, generate mockups, or create sample code. Analyze the existing repository, implement the complete working application, integrate all components, test the implementation, and fix discovered bugs.
+
+---
+
+# 1. PROJECT VISION
+
+FluxCore is an intelligent hardware resource monitoring and optimization platform.
+
+Its long-term objective is to monitor and intelligently utilize:
+
+- CPU
+- System RAM
+- GPU
+- Dedicated GPU VRAM
+- Shared GPU memory
+- SSD / HDD
+- Operating system resources
+- Running application resources
+
+The long-term vision includes intelligent memory management, compatible GPU workload acceleration, resource optimization, and adaptive resource allocation.
+
+IMPORTANT TECHNICAL REQUIREMENT:
+
+Do not attempt to convert GPU VRAM into ordinary Windows system RAM. Do not claim that GPU memory can directly replace physical RAM.
+
+Phase 1 focuses exclusively on building a reliable hardware monitoring foundation.
+
+# 2. PHASE 1 OBJECTIVES
+
+Implement a complete monitoring application with:
+
+1. Real-time CPU monitoring.
+2. Real-time system RAM monitoring.
+3. GPU monitoring.
+4. Dedicated and shared GPU memory monitoring.
+5. SSD/HDD monitoring.
+6. Hardware identification.
+7. Application/process monitoring.
+8. Historical performance charts.
+9. Hardware status dashboard.
+10. Monitoring configuration and settings.
+11. Reliable background monitoring engine.
+12. Proper error handling and hardware compatibility.
+
+All displayed metrics must come from real hardware or operating-system information. Never use fake, random, simulated, or hardcoded performance values in production.
+
+# 3. TECHNOLOGY STACK
+
+Use the following architecture:
+
+Frontend:
+- React
+- TypeScript
+- Vite
+- Tailwind CSS
+- shadcn/ui
+- Lucide React
+- Recharts
+- Zustand
+
+Desktop:
+- Tauri 2
+
+Backend / System Engine:
+- Rust
+- Tauri commands
+- Background monitoring service
+- Windows system APIs
+
+Hardware Integration:
+- Windows Performance Counters
+- Windows Management Instrumentation (WMI)
+- Windows APIs
+- NVIDIA NVML
+- NVIDIA GPU monitoring interfaces
+- PDH where appropriate
+
+Database:
+- SQLite
+- SQL migrations
+
+Architecture must be modular, maintainable, and extensible.
+
+Use supported Windows APIs. Avoid unnecessary kernel drivers and administrator privileges.
+
+# 4. COMPLETE HARDWARE MONITORING MODULES
+
+## 4.1 CPU Monitoring
+
+Implement:
+
+- Total CPU utilization.
+- Per-core CPU utilization.
+- CPU model.
+- CPU manufacturer.
+- Physical core count.
+- Logical processor count.
+- Current clock speed where available.
+- Maximum clock speed where available.
+- CPU temperature where supported.
+- CPU frequency monitoring where supported.
+
+Display:
+- Overall CPU usage percentage.
+- Individual core usage.
+- Current CPU frequency.
+- Temperature and sensor availability.
+
+Handle unsupported temperature sensors gracefully.
+
+## 4.2 RAM Monitoring
+
+Implement:
+
+- Total physical RAM.
+- Used RAM.
+- Available RAM.
+- Free RAM where available.
+- Memory utilization percentage.
+- Cached memory where available.
+- Committed memory.
+- Commit limit.
+- Pagefile usage.
+- Memory pressure indicators.
+
+Calculate memory usage accurately.
+
+Provide visual indicators for:
+- Normal memory usage.
+- Elevated memory pressure.
+- Critical memory pressure.
+
+Do not confuse committed memory with physical RAM usage.
+
+## 4.3 GPU Monitoring
+
+Create a GPU monitoring module.
+
+Detect available GPUs and identify:
+
+- GPU manufacturer.
+- GPU model.
+- GPU architecture where available.
+- Dedicated GPU memory.
+- Shared GPU memory.
+- GPU utilization.
+- GPU memory utilization where available.
+- GPU temperature.
+- GPU clock speed.
+- Memory clock speed where available.
+- Power consumption where available.
+- Fan speed where available.
+
+For NVIDIA GPUs, integrate NVML when supported.
+
+For AMD and Intel GPUs, investigate supported Windows monitoring interfaces and implement compatible detection where feasible.
+
+If a particular metric cannot be retrieved, display "Unavailable" rather than inventing a value.
+
+Support multiple GPUs.
+
+## 4.4 GPU VRAM Monitoring
+
+This is an important FluxCore module.
+
+Display separate values for:
+
+- Dedicated GPU memory total.
+- Dedicated GPU memory used.
+- Dedicated GPU memory available.
+- Shared GPU memory usage.
+- GPU memory budget where supported.
+
+Clearly distinguish:
+- Dedicated VRAM.
+- Shared GPU memory.
+- System RAM.
+
+Do not combine these into a single RAM capacity figure.
+
+## 4.5 SSD / HDD Monitoring
+
+Implement:
+
+- Detected storage devices.
+- Device model.
+- Storage type where detectable.
+- Total capacity.
+- Used capacity.
+- Available capacity.
+- Disk utilization where supported.
+- Read speed.
+- Write speed.
+- Disk temperature where supported.
+- Drive health information where supported.
+
+Support multiple storage devices.
+
+Distinguish between disk space utilization and real-time disk activity.
+
+## 4.6 Process Monitoring
+
+Build a process monitoring module.
+
+Display:
+
+- Process name.
+- Process ID.
+- CPU utilization where reliably available.
+- RAM consumption.
+- Memory percentage.
+- GPU utilization where available.
+- GPU memory usage where available.
+
+Provide:
+- Sort by CPU.
+- Sort by RAM.
+- Sort by GPU.
+- Search processes.
+- Refresh process information.
+
+Do not automatically terminate processes.
+
+Any future process termination feature must require explicit user confirmation.
+
+# 5. REAL-TIME MONITORING ENGINE
+
+Create a dedicated Rust monitoring engine.
+
+Requirements:
+
+- Background hardware polling.
+- Configurable refresh interval.
+- Efficient resource collection.
+- Thread-safe communication.
+- Proper error handling.
+- Cancellation and shutdown handling.
+- No unnecessary CPU usage.
+- No memory leaks.
+- No blocking frontend operations.
+
+Use a reasonable default refresh interval, such as one second for dashboard metrics.
+
+Allow users to change the monitoring interval.
+
+Use Tauri events or an appropriate state-management mechanism to send updated metrics to the frontend.
+
+Avoid unnecessary repeated hardware queries.
+
+Cache hardware identification information where appropriate.
+
+# 6. DASHBOARD UI/UX
+
+Create a professional, modern desktop application.
+
+Design direction:
+
+- Dark-first interface.
+- Deep navy / charcoal background.
+- Blue and cyan accent colors.
+- Subtle gradients.
+- Clean cards.
+- Modern typography.
+- Smooth animations.
+- Responsive desktop layouts.
+- Professional technical dashboard appearance.
+
+Do not make it look like a basic Windows Task Manager clone.
+
+## Main Dashboard
+
+Create:
+
+### Header
+- FluxCore logo.
+- Application name.
+- Monitoring status.
+- Settings button.
+- Minimize and close controls where appropriate.
+
+### System Overview
+
+Display cards for:
+
+- CPU usage.
+- RAM usage.
+- GPU usage.
+- VRAM usage.
+- Disk activity.
+
+Each card should include:
+- Current value.
+- Usage percentage.
+- Small historical graph.
+- Status indicator.
+
+### Live Performance Section
+
+Create real-time graphs for:
+
+- CPU utilization.
+- RAM utilization.
+- GPU utilization.
+- VRAM consumption.
+- Disk read/write speed.
+
+Charts must update using actual collected metrics.
+
+### Hardware Information Section
+
+Display:
+- CPU model.
+- Installed RAM.
+- GPU model.
+- Dedicated VRAM.
+- Storage devices.
