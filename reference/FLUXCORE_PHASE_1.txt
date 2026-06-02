@@ -321,3 +321,268 @@ Display:
 - GPU model.
 - Dedicated VRAM.
 - Storage devices.
+- Windows version.
+
+### Resource Health
+
+Provide a simple status summary:
+
+- Healthy.
+- Elevated usage.
+- High resource pressure.
+
+Status must be based on actual measurements and clearly documented thresholds.
+
+# 7. APPLICATION PAGES
+
+Implement the following pages:
+
+1. Overview Dashboard.
+2. CPU Monitor.
+3. Memory Monitor.
+4. GPU Monitor.
+5. Storage Monitor.
+6. Process Monitor.
+7. Hardware Information.
+8. Settings.
+
+Each page must be functional and use the same monitoring data source.
+
+Do not create decorative pages without real functionality.
+
+# 8. SETTINGS
+
+Implement:
+
+- Monitoring refresh interval.
+- Application startup preference.
+- Minimize to tray preference.
+- Theme preference.
+- Chart history duration.
+- Supported hardware detection options.
+- Monitoring enable/disable controls.
+
+Persist settings locally.
+
+Do not automatically enable administrator-level access or modify system settings without permission.
+
+# 9. DATABASE AND DATA MANAGEMENT
+
+Use SQLite for local monitoring history and settings.
+
+Create structured tables for:
+
+- Hardware information.
+- Performance snapshots.
+- Monitoring settings.
+- Application preferences.
+
+Requirements:
+
+- Proper database migrations.
+- Efficient inserts.
+- Historical data retention policy.
+- Avoid unlimited database growth.
+- Handle database errors.
+- Do not store unnecessary personal information.
+
+Use in-memory data for high-frequency dashboard updates and persist historical snapshots at a sensible interval.
+
+# 10. SYSTEM RESOURCE EFFICIENCY
+
+FluxCore itself must not become a resource-intensive application.
+
+Set engineering goals for:
+
+- Low idle CPU consumption.
+- Controlled RAM usage.
+- Efficient GPU monitoring.
+- No unnecessary GPU computation.
+- Efficient chart rendering.
+- Limited database writes.
+- Proper background task lifecycle.
+
+Benchmark FluxCore's own CPU and memory consumption during development.
+
+Do not promise fixed performance numbers without measurement.
+
+# 11. ERROR HANDLING AND COMPATIBILITY
+
+Implement proper handling for:
+
+- NVIDIA driver unavailable.
+- AMD GPU detected.
+- Intel GPU detected.
+- Multiple GPUs.
+- Unsupported temperature sensors.
+- Missing monitoring APIs.
+- Permission restrictions.
+- Hardware information unavailable.
+- Storage device errors.
+- Database errors.
+- Monitoring engine failure.
+
+The application must continue monitoring available hardware even if one monitoring provider fails.
+
+Never crash the entire application because one sensor is unavailable.
+
+# 12. TESTING REQUIREMENTS
+
+Create automated tests wherever practical.
+
+Test:
+
+- RAM calculations.
+- CPU metric parsing.
+- GPU metric parsing.
+- VRAM calculations.
+- Storage calculations.
+- Process information.
+- Historical data storage.
+- Settings persistence.
+- Monitoring engine lifecycle.
+- Error handling.
+
+Perform integration testing between:
+
+React frontend → Tauri commands/events → Rust monitoring engine → Windows APIs → SQLite.
+
+Verify that dashboard values are actual collected values.
+
+Test the application with:
+- NVIDIA hardware.
+- Integrated graphics.
+- Multiple GPUs where available.
+- Missing GPU monitoring providers.
+- High RAM utilization.
+- Low available memory.
+
+Do not report a test as passed unless it was actually executed.
+
+# 13. PROJECT STRUCTURE
+
+Create a clean modular project structure.
+
+Suggested organization:
+
+src/
+  components/
+    dashboard/
+    charts/
+    hardware/
+    processes/
+    layout/
+    common/
+  pages/
+  hooks/
+  stores/
+  services/
+  types/
+  utils/
+
+src-tauri/
+  src/
+    monitoring/
+      cpu/
+      memory/
+      gpu/
+      storage/
+      processes/
+    database/
+    system/
+    commands/
+    events/
+    lib.rs
+    main.rs
+
+  migrations/
+
+You may improve this structure if a better architectural organization is justified.
+
+# 14. DEVELOPMENT EXECUTION RULES
+
+Follow these rules throughout development:
+
+1. First inspect the existing repository.
+2. Understand its existing architecture and dependencies.
+3. Preserve useful existing code.
+4. Do not unnecessarily delete or rewrite working components.
+5. Create a development plan internally.
+6. Implement all Phase 1 modules.
+7. Integrate frontend and backend.
+8. Verify actual hardware data collection.
+9. Fix compilation errors.
+10. Fix TypeScript errors.
+11. Fix Rust errors.
+12. Fix runtime errors.
+13. Fix UI/UX inconsistencies.
+14. Remove unused code and unnecessary dependencies.
+15. Verify the application builds successfully.
+
+Do not stop after creating the frontend.
+
+Do not leave important modules as TODO comments.
+
+Do not use mock data as a substitute for actual hardware integration.
+
+If a hardware feature cannot be supported on the current machine, implement a clean unsupported-state response and explain the limitation.
+
+# 15. PHASE 1 COMPLETION CRITERIA
+
+Phase 1 is complete only when:
+
+- The desktop application launches successfully.
+- Real CPU information is displayed.
+- Real RAM information is displayed.
+- GPU detection works with supported hardware.
+- Dedicated and shared GPU memory are distinguished.
+- Storage information is displayed.
+- Process monitoring works.
+- Historical graphs update.
+- Settings persist.
+- SQLite works correctly.
+- Monitoring can be stopped and restarted safely.
+- Unsupported hardware does not crash the application.
+- No production dashboard metric uses random or fake data.
+- The application passes its available automated tests.
+- A release build succeeds.
+
+# 16. FINAL DELIVERABLES
+
+Provide:
+
+1. Complete working Phase 1 source code.
+2. Full frontend implementation.
+3. Full Rust monitoring engine.
+4. Windows hardware integration.
+5. NVIDIA monitoring integration where supported.
+6. SQLite database and migrations.
+7. Automated tests.
+8. README.md.
+9. ARCHITECTURE.md.
+10. HARDWARE_COMPATIBILITY.md.
+11. DEVELOPMENT.md.
+12. BUILD_AND_INSTALL.md.
+13. Known limitations documentation.
+
+At the end, provide a development report containing:
+
+- Implemented features.
+- Architecture decisions.
+- Files created and modified.
+- Hardware APIs integrated.
+- Tests executed and their actual results.
+- Build verification results.
+- Known issues.
+- Unsupported hardware features.
+- Remaining work.
+
+# FINAL INSTRUCTION
+
+Develop FluxCore Phase 1 as a complete, working Windows desktop hardware monitoring application.
+
+Prioritize accuracy, stability, low resource consumption, modular architecture, and future extensibility.
+
+Do not proceed to Phase 2 memory optimization or Phase 3 GPU workload acceleration until Phase 1 has been implemented, tested, and verified.
+
+Start by analyzing the repository, then execute the complete implementation.
