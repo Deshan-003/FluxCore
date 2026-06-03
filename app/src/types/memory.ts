@@ -142,3 +142,121 @@ export interface AuditEntry {
   mode: OptimizationMode
   actionId: string
   confirmed: boolean
+  status: ActionStatus
+  detail: string
+}
+
+export interface PressureThresholds {
+  elevatedAvailablePercent: number
+  highAvailablePercent: number
+  criticalAvailablePercent: number
+  elevatedCommitPercent: number
+  highCommitPercent: number
+  criticalCommitPercent: number
+  hardFaultsHighPerSec: number
+}
+
+export interface PolicyConfig {
+  thresholds: PressureThresholds
+  upgradeMinSeconds: number
+  downgradeMinSeconds: number
+  processScanIntervalMs: number
+  persistIntervalMs: number
+  processPersistIntervalMs: number
+  idleAfterSeconds: number
+  idleRefreshIntervalMs: number
+  predictionWindowMinutes: number
+  retentionDays: number
+}
+
+export interface ActivePolicy {
+  id: string
+  title: string
+  detail: string
+}
+
+export interface PolicyStatus {
+  mode: OptimizationMode
+  active: ActivePolicy[]
+  config: PolicyConfig
+  dashboardActive: boolean
+}
+
+export interface TrendForecast {
+  slopeBytesPerMin: number
+  currentBytes: number | null
+  projectedBytes: number | null
+  r2: number
+  samples: number
+}
+
+export interface ProcessGrowth {
+  pid: number
+  name: string
+  growthBytesPerMin: number
+  confidence: number
+}
+
+export interface Prediction {
+  generatedAt: string
+  observationMinutes: number
+  confidence: number
+  horizonMinutes: number
+  availableForecast: TrendForecast
+  commitForecast: TrendForecast
+  timeToHighPressureMinutes: number | null
+  growingProcesses: ProcessGrowth[]
+  summary: string
+  disclaimer: string
+}
+
+export interface MemoryHistoryPoint {
+  timestamp: string
+  usedBytes: number
+  availableBytes: number
+  committedBytes: number | null
+  compressedBytes: number | null
+  pagefileUsedBytes: number | null
+  pressureLevel: PressureLevel
+}
+
+export interface ProcessHistoryPoint {
+  timestamp: string
+  pid: number
+  name: string
+  privateBytes: number
+  workingSetBytes: number
+  trendBytesPerMin: number
+}
+
+export interface StoredRecommendation {
+  id: number
+  createdAt: string
+  recommendationId: string
+  title: string
+  reason: string
+  risk: RiskLevel
+  category: string
+}
+
+export interface MemoryIntelligenceSnapshot {
+  collectedAt: string
+  analysis: MemoryAnalysis
+  pressure: PressureReport
+  compression: CompressionInfo
+  virtualMemory: VirtualMemoryInfo
+  processes: ProcessMemoryInfo[]
+  recommendations: Recommendation[]
+  prediction: Prediction
+  policies: PolicyStatus
+  recentActions: AuditEntry[]
+  limitations: string[]
+}
+
+export interface MemoryHistorySeries {
+  samples: MemoryHistoryPoint[]
+  pressureEvents: PressureEvent[]
+  processHistory: ProcessHistoryPoint[]
+  recommendations: StoredRecommendation[]
+  actions: AuditEntry[]
+}
