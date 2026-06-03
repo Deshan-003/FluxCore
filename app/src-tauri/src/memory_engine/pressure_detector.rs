@@ -205,3 +205,174 @@ impl PressureDetector {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::memory_engine::models::MemoryAnalysis;
+
+    fn analysis(available_percent: f32, commit_percent: Option<f32>) -> MemoryAnalysis {
+        let total = 32u64 * 1024u64.pow(3);
+        MemoryAnalysis {
+            collected_at: "t".into(),
+            total_bytes: total,
+            used_bytes: (total as f32 * (100.0 - available_percent) / 100.0) as u64,
+            available_bytes: (total as f32 * available_percent / 100.0) as u64,
+            free_bytes: None,
+            usage_percent: 100.0 - available_percent,
+            available_percent,
+            cached_bytes: Some(4 * 1024u64.pow(3)),
+            standby_bytes: Some(2 * 1024u64.pow(3)),
+            modified_bytes: None,
+            compressed_bytes: None,
+            committed_bytes: None,
+            commit_limit_bytes: None,
+            commit_percent,
+            pagefile_used_bytes: None,
+            pagefile_total_bytes: None,
+            pagefile_percent: None,
+            hard_faults_per_sec: None,
+            page_faults_per_sec: None,
+            memory_load_percent: None,
+            sources: vec![],
+            limitations: vec![],
+        }
+    }
+
+    fn level_available(level: PressureLevel, thresholds: &PressureThresholds) -> f32 {
+        match level {
+            PressureLevel::Normal => thresholds.elevated_available_percent + 20.0,
+            PressureLevel::Elevated => thresholds.elevated_available_percent - 1.0,
+            PressureLevel::High => thresholds.high_available_percent - 1.0,
+            PressureLevel::Critical => thresholds.critical_available_percent - 1.0,
+        }
+    }
+
+    #[test]
+    fn high_cache_does_not_raise_pressure() {
+        let thresholds = PressureThresholds::default();
+        let mut detector = PressureDetector::new();
+        let mut healthy = analysis(60.0, Some(40.0));
+        healthy.cached_bytes = Some(12 * 1024u64.pow(3));
+        healthy.standby_bytes = Some(6 * 1024u64.pow(3));
+        let out = detector.update(&healthy, 0.0, &thresholds, 15, 45, Instant::now(), "t");
+        assert_eq!(out.level, PressureLevel::Normal);
+    }
+
+    #[test]
+    fn commit_charge_alone_can_raise_pressure() {
+        let thresholds = PressureThresholds::default();
+        let (instant, _, _) = PressureDetector::evaluate_instant(&analysis(50.0, Some(96.0)), 0.0, &thresholds);
+        assert_eq!(instant, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn upgrade_requires_minimum_duration() {
+        let thresholds = PressureThresholds::default();
+        let mut detector = PressureDetector::new();
+        let start = Instant::now();
+        let critical = analysis(5.0, None);
+        // First observation: pending, not yet adopted.
+        let out = detector.update(&critical, 0.0, &thresholds, 15, 45, start, "t0");
+        assert_eq!(out.level, PressureLevel::Normal);
+        // Still inside the hysteresis window.
+        let out = detector.update(
+            &critical,
+            0.0,
+            &thresholds,
+            15,
+            45,
+            start + std::time::Duration::from_secs(10),
+            "t1",
+        );
+        assert_eq!(out.level, PressureLevel::Normal);
+        // Sustained past the window: adopted.
+        let out = detector.update(
+            &critical,
+            0.0,
+            &thresholds,
+            15,
+            45,
+            start + std::time::Duration::from_secs(16),
+            "t2",
+        );
+        assert_eq!(out.level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn downgrade_is_slower_than_upgrade() {
+        let thresholds = PressureThresholds::default();
+        let mut detector = PressureDetector::new();
+        let start = Instant::now();
+        let critical = analysis(5.0, None);
+        detector.update(&critical, 0.0, &thresholds, 0, 45, start, "t0");
+        assert_eq!(detector.current_level(), PressureLevel::Critical);
+        let healthy = analysis(60.0, None);
+        let out = detector.update(
+            &healthy,
+            0.0,
+            &thresholds,
+            0,
+            45,
+            start + std::time::Duration::from_secs(30),
+            "t1",
+        );
+        assert_eq!(out.level, PressureLevel::Critical, "downgrade must wait out its window");
+        // 46 s after the first healthy observation: the 45 s window has elapsed.
+        let out = detector.update(
+            &healthy,
+            0.0,
+            &thresholds,
+            0,
+            45,
+            start + std::time::Duration::from_secs(76),
+            "t2",
+        );
+        assert_eq!(out.level, PressureLevel::Normal);
+    }
+
+    #[test]
+    fn brief_spike_does_not_flap_state() {
+        let thresholds = PressureThresholds::default();
+        let mut detector = PressureDetector::new();
+        let start = Instant::now();
+        let critical = analysis(5.0, None);
+        let healthy = analysis(60.0, None);
+        detector.update(&critical, 0.0, &thresholds, 15, 45, start, "t0");
+        // A single healthy sample cancels the pending upgrade entirely.
+        let out = detector.update(
+            &healthy,
+            0.0,
+            &thresholds,
+            15,
+            45,
+            start + std::time::Duration::from_secs(5),
+            "t1",
+        );
+        assert_eq!(out.level, PressureLevel::Normal);
+        let out = detector.update(
+            &critical,
+            0.0,
+            &thresholds,
+            15,
+            45,
+            start + std::time::Duration::from_secs(20),
+            "t2",
+        );
+        assert_eq!(out.level, PressureLevel::Normal, "pending timer restarted, window not elapsed");
+    }
+
+    #[test]
+    fn hard_faults_need_low_availability_to_reach_high() {
+        let thresholds = PressureThresholds::default();
+        let mut faulty = analysis(50.0, None);
+        faulty.hard_faults_per_sec = Some(3000.0);
+        let (instant, reasons, _) = PressureDetector::evaluate_instant(&faulty, 0.0, &thresholds);
+        assert_eq!(instant, PressureLevel::Elevated, "faults alone escalate one step");
+        assert!(reasons.iter().any(|reason| reason.contains("page reads/s")));
+    }
+
+    #[test]
+    fn level_available_helper_matches_levels() {
+        let thresholds = PressureThresholds::default();
+        assert!(level_available(PressureLevel::Normal, &thresholds) > thresholds.elevated_available_percent);
+        assert!(level_available(PressureLevel::Critical, &thresholds) <= thresholds.critical_available_percent);
+    }
+}
