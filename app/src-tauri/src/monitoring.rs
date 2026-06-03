@@ -788,3 +788,650 @@ fn windows_disk_io(mount_point: &str) -> Option<(u64, u64)> {
         let _ = CloseHandle(handle);
         result
             .ok()
+            .map(|_| (performance.BytesRead as u64, performance.BytesWritten as u64))
+    }
+}
+
+/// Bus type and rotational-media flag from documented storage queries.
+#[cfg(windows)]
+fn windows_drive_properties(mount_point: &str) -> (Option<u32>, Option<bool>) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{
+        PropertyStandardQuery, DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
+        STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+        StorageDeviceSeekPenaltyProperty,
+    };
+    let Some(device) = volume_device_path(mount_point) else {
+        return (None, None);
+    };
+    let path = windows::core::HSTRING::from(device);
+    unsafe {
+        let Ok(handle) = CreateFileW(
+            PCWSTR::from_raw(path.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        ) else {
+            return (None, None);
+        };
+        let mut query = STORAGE_PROPERTY_QUERY::default();
+        query.PropertyId = StorageDeviceProperty;
+        query.QueryType = PropertyStandardQuery;
+        let mut descriptor: STORAGE_DEVICE_DESCRIPTOR = std::mem::zeroed();
+        let mut returned = 0u32;
+        let bus = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&query as *const _ as *const _),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(&mut descriptor as *mut _ as *mut _),
+            std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .is_ok()
+        .then(|| descriptor.BusType.0 as u32);
+        let mut penalty_query = STORAGE_PROPERTY_QUERY::default();
+        penalty_query.PropertyId = StorageDeviceSeekPenaltyProperty;
+        penalty_query.QueryType = PropertyStandardQuery;
+        let mut penalty = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+        let seek_penalty = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&penalty_query as *const _ as *const _),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(&mut penalty as *mut _ as *mut _),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .is_ok()
+        .then(|| penalty.IncursSeekPenalty.as_bool());
+        let _ = CloseHandle(handle);
+        (bus, seek_penalty)
+    }
+}
+
+#[cfg(windows)]
+fn volume_device_path(mount_point: &str) -> Option<String> {
+    let drive = mount_point.chars().next()?;
+    (drive.is_ascii_alphabetic()).then(|| format!("\\\\.\\{drive}:"))
+}
+
+#[cfg(windows)]
+type NvmlDevice = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+#[repr(C)]
+struct NvmlUtilization {
+    gpu: u32,
+    memory: u32,
+}
+#[cfg(windows)]
+#[repr(C)]
+struct NvmlMemoryInfo {
+    total: u64,
+    free: u64,
+    used: u64,
+}
+
+/// One NVML initialization shared by every refresh tick. Function pointers are
+/// resolved once, device handles are enumerated once, and the init refcount is
+/// released by `nvmlShutdown` when the collector drops the session.
+#[cfg(windows)]
+struct NvmlSession {
+    _library: libloading::Library,
+    shutdown: Option<unsafe extern "C" fn() -> i32>,
+    name: unsafe extern "C" fn(NvmlDevice, *mut i8, u32) -> i32,
+    memory: unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfo) -> i32,
+    utilization: Option<unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> i32>,
+    temperature: Option<unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> i32>,
+    clock: Option<unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> i32>,
+    power: Option<unsafe extern "C" fn(NvmlDevice, *mut u32) -> i32>,
+    fan: Option<unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> i32>,
+    driver_version: Option<unsafe extern "C" fn(*mut i8, u32) -> i32>,
+    devices: Vec<NvmlDevice>,
+}
+#[cfg(windows)]
+impl NvmlSession {
+    fn open(errors: &mut Vec<String>) -> Option<Self> {
+        use libloading::Library;
+        let library = unsafe { Library::new("nvml.dll").or_else(|_| Library::new("nvml64.dll")) };
+        let Ok(library) = library else {
+            errors.push("NVIDIA NVML provider is unavailable; using OS GPU identification only.".into());
+            return None;
+        };
+        unsafe {
+            let Ok(init) = library.get::<unsafe extern "C" fn() -> i32>(b"nvmlInit_v2") else {
+                errors.push("NVML is missing required monitoring functions.".into());
+                return None;
+            };
+            if init() != 0 {
+                errors.push("NVIDIA driver was found but NVML initialization failed.".into());
+                return None;
+            }
+            let (Ok(count_fn), Ok(by_index), Ok(name), Ok(memory)) = (
+                library.get::<unsafe extern "C" fn(*mut u32) -> i32>(b"nvmlDeviceGetCount_v2"),
+                library.get::<unsafe extern "C" fn(u32, *mut NvmlDevice) -> i32>(b"nvmlDeviceGetHandleByIndex_v2"),
+                library.get::<unsafe extern "C" fn(NvmlDevice, *mut i8, u32) -> i32>(b"nvmlDeviceGetName"),
+                library.get::<unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfo) -> i32>(b"nvmlDeviceGetMemoryInfo"),
+            ) else {
+                errors.push("NVML is missing required monitoring functions.".into());
+                return None;
+            };
+            let mut count = 0u32;
+            if count_fn(&mut count) != 0 {
+                errors.push("NVML loaded, but GPU enumeration failed.".into());
+                return None;
+            }
+            let mut devices = Vec::new();
+            for index in 0..count {
+                let mut device: NvmlDevice = std::ptr::null_mut();
+                if by_index(index, &mut device) == 0 {
+                    devices.push(device);
+                }
+            }
+            Some(Self {
+                shutdown: library.get(b"nvmlShutdown").ok().map(|f| *f),
+                name: *name,
+                memory: *memory,
+                utilization: library.get(b"nvmlDeviceGetUtilizationRates").ok().map(|f| *f),
+                temperature: library.get(b"nvmlDeviceGetTemperature").ok().map(|f| *f),
+                clock: library.get(b"nvmlDeviceGetClockInfo").ok().map(|f| *f),
+                power: library.get(b"nvmlDeviceGetPowerUsage").ok().map(|f| *f),
+                fan: library.get(b"nvmlDeviceGetFanSpeed_v2").ok().map(|f| *f),
+                driver_version: library.get(b"nvmlSystemGetDriverVersion").ok().map(|f| *f),
+                _library: library,
+                devices,
+            })
+        }
+    }
+
+    /// Reads every live sensor for one device; unavailable sensors stay None.
+    fn metrics(&self, device: NvmlDevice) -> GpuMetrics {
+        unsafe {
+            let mut name = [0i8; 96];
+            let display_name = if (self.name)(device, name.as_mut_ptr(), name.len() as u32) == 0 {
+                std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy().to_string()
+            } else {
+                "NVIDIA GPU".to_string()
+            };
+            let mut memory_slot = std::mem::MaybeUninit::<NvmlMemoryInfo>::uninit();
+            let memory = ((self.memory)(device, memory_slot.as_mut_ptr()) == 0)
+                .then(|| memory_slot.assume_init());
+            let utilization = self.utilization.and_then(|f| {
+                let mut u = NvmlUtilization { gpu: 0, memory: 0 };
+                (f(device, &mut u) == 0).then_some((u.gpu as f32, u.memory as f32))
+            });
+            let temperature = self.temperature.and_then(|f| {
+                let mut v = 0u32;
+                (f(device, 0, &mut v) == 0).then_some(v as f32)
+            });
+            let core_clock = self.clock.and_then(|f| {
+                let mut v = 0u32;
+                (f(device, 0, &mut v) == 0).then_some(v)
+            });
+            let memory_clock = self.clock.and_then(|f| {
+                let mut v = 0u32;
+                (f(device, 2, &mut v) == 0).then_some(v)
+            });
+            let power = self.power.and_then(|f| {
+                let mut v = 0u32;
+                (f(device, &mut v) == 0).then_some(v as f32 / 1000.0)
+            });
+            let fan = self.fan.and_then(|f| {
+                let mut v = 0u32;
+                (f(device, 0, &mut v) == 0).then_some(v)
+            });
+            let driver_version = self.driver_version.and_then(|f| {
+                let mut buffer = [0i8; 96];
+                (f(buffer.as_mut_ptr(), buffer.len() as u32) == 0).then(|| {
+                    std::ffi::CStr::from_ptr(buffer.as_ptr())
+                        .to_string_lossy()
+                        .to_string()
+                })
+            });
+            let dedicated_used = memory.as_ref().map(|m| m.used);
+            let dedicated_total = memory.as_ref().map(|m| m.total);
+            GpuMetrics {
+                name: display_name,
+                vendor: "NVIDIA".into(),
+                provider: "NVIDIA NVML".into(),
+                utilization_percent: utilization.map(|u| u.0),
+                dedicated_used_bytes: dedicated_used,
+                dedicated_total_bytes: dedicated_total,
+                dedicated_available_bytes: memory.as_ref().map(|m| m.free),
+                shared_used_bytes: None,
+                vram_usage_percent: dedicated_used
+                    .zip(dedicated_total)
+                    .and_then(|(used, total)| percent(used, total)),
+                memory_utilization_percent: utilization.map(|u| u.1),
+                temperature_c: temperature,
+                core_clock_mhz: core_clock,
+                memory_clock_mhz: memory_clock,
+                power_watts: power,
+                fan_percent: fan,
+                driver_version,
+                gpu_class: Some("Dedicated".into()),
+            }
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for NvmlSession {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown {
+            unsafe {
+                let _ = shutdown();
+            }
+        }
+    }
+}
+
+/// Cumulative per-volume I/O counters from the previous tick.
+#[cfg(windows)]
+#[derive(Default)]
+struct DiskIoState {
+    last: std::collections::HashMap<String, (Instant, u64, u64)>,
+}
+
+/// Live PDH read of the system processor frequency (MHz), when the counter
+/// exists on this Windows build.
+#[cfg(windows)]
+struct CpuFrequencyCounter {
+    query: isize,
+    counter: isize,
+}
+#[cfg(windows)]
+impl CpuFrequencyCounter {
+    fn open() -> Option<Self> {
+        use windows::core::w;
+        use windows::Win32::System::Performance::*;
+        // PDH functions in windows 0.58 return raw u32 status codes.
+        const ERROR_SUCCESS: u32 = 0;
+        unsafe {
+            let mut query: isize = 0;
+            if PdhOpenQueryW(None, 0, &mut query) != ERROR_SUCCESS {
+                return None;
+            }
+            let mut counter: isize = 0;
+            let added = PdhAddEnglishCounterW(
+                query,
+                w!(r"\Processor Information(_Total)\Processor Frequency"),
+                0,
+                &mut counter,
+            ) == ERROR_SUCCESS;
+            if !added {
+                let _ = PdhCloseQuery(query);
+                return None;
+            }
+            Some(Self { query, counter })
+        }
+    }
+    fn read(&mut self) -> Option<u64> {
+        use windows::Win32::System::Performance::*;
+        const ERROR_SUCCESS: u32 = 0;
+        unsafe {
+            if PdhCollectQueryData(self.query) != ERROR_SUCCESS {
+                return None;
+            }
+            let mut value = PDH_FMT_COUNTERVALUE::default();
+            if PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut value)
+                != ERROR_SUCCESS
+                || value.CStatus != 0
+            {
+                return None;
+            }
+            let mhz = value.Anonymous.doubleValue;
+            (mhz > 0.0).then_some(mhz as u64)
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for CpuFrequencyCounter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Performance::PdhCloseQuery(self.query);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn detect_gpus(nvml: Option<&NvmlSession>) -> (Vec<GpuMetrics>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    if let Some(session) = nvml {
+        for device in &session.devices {
+            out.push(session.metrics(*device));
+        }
+    }
+    let system_gpus = windows_gpu_names();
+    for (name, vendor, driver) in system_gpus {
+        let nvml_present = out.iter().any(|gpu| gpu.provider == "NVIDIA NVML");
+        if vendor.to_lowercase().contains("nvidia") && nvml_present {
+            continue;
+        }
+        let known = out.iter().any(|gpu| gpu.name.eq_ignore_ascii_case(&name));
+        if !known {
+            out.push(GpuMetrics {
+                driver_version: driver,
+                gpu_class: gpu_class_for(&vendor, false),
+                vram_usage_percent: None,
+                name,
+                vendor: vendor.clone(),
+                provider: "Windows device identification".into(),
+                utilization_percent: None,
+                dedicated_used_bytes: None,
+                dedicated_total_bytes: None,
+                dedicated_available_bytes: None,
+                shared_used_bytes: None,
+                memory_utilization_percent: None,
+                temperature_c: None,
+                core_clock_mhz: None,
+                memory_clock_mhz: None,
+                power_watts: None,
+                fan_percent: None,
+            });
+        }
+    }
+    if out.is_empty() {
+        errors
+            .push("No GPU monitoring provider was available; GPU metrics are unavailable.".into());
+    }
+    (out, errors)
+}
+
+#[cfg(windows)]
+fn windows_gpu_names() -> Vec<(String, String, Option<String>)> {
+    use std::process::Command;
+    let output = Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","Get-CimInstance Win32_VideoController | Select-Object -Property Name,AdapterCompatibility,DriverVersion | ConvertTo-Json -Compress"]).output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&output.stdout);
+    match parsed {
+        Ok(serde_json::Value::Array(items)) => items.iter().filter_map(parse_gpu_entry).collect(),
+        Ok(item) => parse_gpu_entry(&item).into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+/// Parses one Win32_VideoController CIM object; platform-independent so the
+/// mapping is covered by the native test suite.
+fn parse_gpu_entry(item: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+    let name = item.get("Name")?.as_str()?.trim().to_string();
+    let vendor = item
+        .get("AdapterCompatibility")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown vendor")
+        .to_string();
+    let driver = item
+        .get("DriverVersion")
+        .and_then(|v| v.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    (!name.is_empty()).then_some((name, vendor, driver))
+}
+#[cfg(not(windows))]
+fn detect_gpus() -> (Vec<GpuMetrics>, Vec<String>) {
+    (
+        Vec::new(),
+        vec!["GPU providers are implemented for Windows only.".into()],
+    )
+}
+
+fn refresh_gpu_metrics(
+    #[cfg(windows)] nvml: Option<&NvmlSession>,
+    cache: &[GpuMetrics],
+    errors: &mut Vec<String>,
+) -> Vec<GpuMetrics> {
+    #[cfg(windows)]
+    {
+        let _ = errors;
+        let Some(session) = nvml else {
+            return cache.to_vec();
+        };
+        let mut refreshed: Vec<GpuMetrics> = session
+            .devices
+            .iter()
+            .map(|device| session.metrics(*device))
+            .collect();
+        for gpu in cache.iter().filter(|gpu| gpu.provider != "NVIDIA NVML") {
+            refreshed.push(gpu.clone());
+        }
+        refreshed
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = errors;
+        cache.to_vec()
+    }
+}
+
+/// Benchmarks the Phase 1 collector: average microseconds per full collect.
+/// Used by the Phase 2 benchmark example to quantify engine overhead.
+pub fn benchmark_collect(iterations: u32) -> u128 {
+    let mut collector = Collector::new();
+    let iterations = iterations.max(1);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = collector.collect();
+    }
+    start.elapsed().as_micros() / u128::from(iterations)
+}
+
+/// Benchmarks the combined Phase 1 + Phase 2 pipeline: one full collect
+/// followed by one memory engine tick per iteration.
+/// Returns (average collect microseconds, average tick microseconds).
+pub fn benchmark_collect_and_tick(iterations: u32, memory: &MemoryEngine) -> (u128, u128) {
+    let mut collector = Collector::new();
+    let iterations = iterations.max(1);
+    let mut collect_micros = 0u128;
+    let mut tick_micros = 0u128;
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let snapshot = collector.collect();
+        collect_micros += start.elapsed().as_micros();
+        let start = Instant::now();
+        memory.tick(&snapshot);
+        tick_micros += start.elapsed().as_micros();
+    }
+    (
+        collect_micros / u128::from(iterations),
+        tick_micros / u128::from(iterations),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn memory_usage_is_physical_used_over_total() {
+        let total = 16 * 1024u64.pow(3);
+        let available = 4 * 1024u64.pow(3);
+        let used = total - available;
+        assert_eq!(percent(used, total), Some(75.0));
+        assert_eq!(percent(used, 0), None, "unknown totals must not become zeros");
+    }
+    #[test]
+    fn rate_helper_derives_bytes_per_second() {
+        let elapsed = Duration::from_secs(2);
+        assert_eq!(rate_bytes_per_second(1000, 3000, elapsed), Some(1000));
+        assert_eq!(rate_bytes_per_second(5000, 5000, elapsed), Some(0));
+        assert_eq!(
+            rate_bytes_per_second(9000, 1000, elapsed),
+            Some(0),
+            "counter resets saturate instead of going negative"
+        );
+        assert_eq!(rate_bytes_per_second(1, 2, Duration::ZERO), None);
+    }
+    #[test]
+    fn drive_classification_uses_documented_queries() {
+        assert_eq!(classify_drive(Some(17), None, false), "NVMe SSD");
+        assert_eq!(classify_drive(Some(3), Some(true), false), "HDD");
+        assert_eq!(classify_drive(Some(3), Some(false), false), "SSD");
+        assert_eq!(
+            classify_drive(None, None, false),
+            "Mounted volume (device type unavailable)"
+        );
+        assert_eq!(classify_drive(Some(17), Some(false), true), "Removable volume");
+    }
+    #[test]
+    fn gpu_class_inference_is_conservative() {
+        assert_eq!(gpu_class_for("NVIDIA", false), Some("Dedicated".into()));
+        assert_eq!(gpu_class_for("Intel Corporation", false), Some("Integrated".into()));
+        assert_eq!(gpu_class_for("Advanced Micro Devices", false), None);
+        assert_eq!(gpu_class_for("Advanced Micro Devices", true), Some("Dedicated".into()));
+    }
+    #[test]
+    fn cim_entry_parser_maps_name_vendor_and_driver() {
+        let item = serde_json::json!({
+            "Name": " NVIDIA GeForce RTX 2050 ",
+            "AdapterCompatibility": "NVIDIA",
+            "DriverVersion": "31.0.15.1694"
+        });
+        let (name, vendor, driver) = parse_gpu_entry(&item).expect("parsed entry");
+        assert_eq!(name, "NVIDIA GeForce RTX 2050");
+        assert_eq!(vendor, "NVIDIA");
+        assert_eq!(driver.as_deref(), Some("31.0.15.1694"));
+        let missing = serde_json::json!({ "Name": "Basic adapter", "AdapterCompatibility": "Contoso" });
+        let (name, _, driver) = parse_gpu_entry(&missing).expect("parsed entry");
+        assert_eq!(name, "Basic adapter");
+        assert_eq!(driver, None);
+        assert!(parse_gpu_entry(&serde_json::json!({ "Name": "  " })).is_none());
+    }
+    #[test]
+    fn snapshot_serialization_uses_camel_case_contract() {
+        let cpu = CpuMetrics {
+            name: "cpu".into(),
+            vendor: "vendor".into(),
+            architecture: Some("x86-64".into()),
+            physical_cores: Some(1),
+            logical_processors: 1,
+            usage_percent: None,
+            frequency_mhz: None,
+            max_frequency_mhz: None,
+            temperature_c: None,
+            cores: vec![],
+        };
+        let json = serde_json::to_value(&cpu).expect("serialize");
+        assert!(json.get("usagePercent").is_some());
+        assert!(json.get("architecture").is_some());
+        assert!(json.get("usage_percent").is_none());
+        let point = HistoryPoint {
+            timestamp: "t".into(),
+            cpu_percent: None,
+            memory_percent: Some(1.5),
+            gpu_percent: None,
+            vram_used_bytes: None,
+            disk_read_bytes_per_second: Some(7),
+            disk_write_bytes_per_second: None,
+        };
+        let json = serde_json::to_value(&point).expect("serialize");
+        assert_eq!(json["cpuPercent"], serde_json::Value::Null);
+        assert_eq!(json["diskReadBytesPerSecond"], 7);
+    }
+    #[test]
+    fn history_aggregates_only_available_gpu_memory() {
+        let snapshot = SystemSnapshot {
+            collected_at: "now".into(),
+            monitoring: true,
+            cpu: CpuMetrics {
+                name: "cpu".into(),
+                vendor: "vendor".into(),
+                architecture: None,
+                physical_cores: Some(1),
+                logical_processors: 1,
+                usage_percent: Some(10.0),
+                frequency_mhz: None,
+                max_frequency_mhz: None,
+                temperature_c: None,
+                cores: vec![],
+            },
+            memory: MemoryMetrics {
+                total_bytes: 100,
+                used_bytes: 50,
+                available_bytes: 50,
+                free_bytes: None,
+                usage_percent: Some(50.0),
+                cached_bytes: None,
+                committed_bytes: None,
+                commit_limit_bytes: None,
+                pagefile_used_bytes: None,
+                pagefile_total_bytes: None,
+            },
+            gpus: vec![GpuMetrics {
+                name: "gpu".into(),
+                vendor: "x".into(),
+                provider: "x".into(),
+                utilization_percent: Some(25.0),
+                dedicated_used_bytes: Some(2),
+                dedicated_total_bytes: Some(4),
+                dedicated_available_bytes: Some(2),
+                shared_used_bytes: None,
+                vram_usage_percent: Some(50.0),
+                memory_utilization_percent: None,
+                temperature_c: None,
+                core_clock_mhz: None,
+                memory_clock_mhz: None,
+                power_watts: None,
+                fan_percent: None,
+                driver_version: None,
+                gpu_class: None,
+            }],
+            storage: vec![],
+            processes: vec![],
+            hardware: HardwareInfo {
+                os_name: "x".into(),
+                os_version: "x".into(),
+                host_name: "x".into(),
+                gpus: vec![],
+            },
+            errors: vec![],
+        };
+        let point = snapshot.history_point();
+        assert_eq!(point.vram_used_bytes, Some(2));
+        assert_eq!(point.gpu_percent, Some(25.0));
+        assert_eq!(point.cpu_percent, Some(10.0));
+        assert_eq!(point.disk_read_bytes_per_second, None);
+    }
+    #[test]
+    fn settings_reject_unreasonable_intervals() {
+        let mut settings = MonitoringSettings::default();
+        settings.refresh_interval_ms = 100;
+        assert!(validate_settings(&settings).is_err(), "100 ms is below the 250 ms floor");
+        settings.refresh_interval_ms = 60_001;
+        assert!(validate_settings(&settings).is_err(), "over one minute exceeds the ceiling");
+        settings.refresh_interval_ms = 1000;
+        assert!(validate_settings(&settings).is_ok());
+        settings.history_duration_minutes = 0;
+        assert!(validate_settings(&settings).is_err(), "history duration must be at least 1 minute");
+    }
+    #[test]
+    fn monitor_engine_starts_publishes_and_stops() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database =
+            Arc::new(Database::open_at_path(directory.path().join("engine.sqlite3")).expect("open"));
+        let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
+        let engine = MonitorEngine::new(Arc::clone(&database), memory);
+        let mut published = false;
+        for _ in 0..200 {
+            if engine.snapshot().is_ok() {
+                published = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "the monitor loop must publish a snapshot");
+        assert!(engine.history().is_ok());
+        drop(engine);
+    }
+}
