@@ -248,3 +248,208 @@ pub struct ActionResult {
     pub executed_at: String,
     pub duration_ms: u64,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEntry {
+    pub id: i64,
+    pub executed_at: String,
+    pub mode: OptimizationMode,
+    pub action_id: String,
+    pub confirmed: bool,
+    pub status: ActionStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureThresholds {
+    /// Available-memory percentages at or below which each state activates.
+    pub elevated_available_percent: f32,
+    pub high_available_percent: f32,
+    pub critical_available_percent: f32,
+    /// Commit-charge percentages at or above which each state activates.
+    pub elevated_commit_percent: f32,
+    pub high_commit_percent: f32,
+    pub critical_commit_percent: f32,
+    /// Hard-fault rate considered impactful.
+    pub hard_faults_high_per_sec: f32,
+}
+
+impl Default for PressureThresholds {
+    fn default() -> Self {
+        Self {
+            elevated_available_percent: 25.0,
+            high_available_percent: 15.0,
+            critical_available_percent: 7.0,
+            elevated_commit_percent: 70.0,
+            high_commit_percent: 85.0,
+            critical_commit_percent: 95.0,
+            hard_faults_high_per_sec: 500.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyConfig {
+    pub thresholds: PressureThresholds,
+    /// Minimum time in a worse state before upgrading (hysteresis).
+    pub upgrade_min_seconds: u64,
+    /// Minimum time in a better state before downgrading (hysteresis).
+    pub downgrade_min_seconds: u64,
+    pub process_scan_interval_ms: u64,
+    pub persist_interval_ms: u64,
+    pub process_persist_interval_ms: u64,
+    pub idle_after_seconds: u64,
+    pub idle_refresh_interval_ms: u64,
+    pub prediction_window_minutes: u32,
+    pub retention_days: u32,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            thresholds: PressureThresholds::default(),
+            upgrade_min_seconds: 15,
+            downgrade_min_seconds: 45,
+            process_scan_interval_ms: 5000,
+            persist_interval_ms: 10000,
+            process_persist_interval_ms: 60000,
+            idle_after_seconds: 120,
+            idle_refresh_interval_ms: 5000,
+            prediction_window_minutes: 10,
+            retention_days: 7,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivePolicy {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyStatus {
+    pub mode: OptimizationMode,
+    pub active: Vec<ActivePolicy>,
+    pub config: PolicyConfig,
+    pub dashboard_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrendForecast {
+    pub slope_bytes_per_min: f64,
+    pub current_bytes: Option<u64>,
+    pub projected_bytes: Option<f64>,
+    pub r2: f32,
+    pub samples: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessGrowth {
+    pub pid: u32,
+    pub name: String,
+    pub growth_bytes_per_min: f64,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prediction {
+    pub generated_at: String,
+    pub observation_minutes: f32,
+    pub confidence: f32,
+    pub horizon_minutes: u32,
+    pub available_forecast: TrendForecast,
+    pub commit_forecast: TrendForecast,
+    pub time_to_high_pressure_minutes: Option<f32>,
+    pub growing_processes: Vec<ProcessGrowth>,
+    pub summary: String,
+    pub disclaimer: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHistoryPoint {
+    pub timestamp: String,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub committed_bytes: Option<u64>,
+    pub compressed_bytes: Option<u64>,
+    pub pagefile_used_bytes: Option<u64>,
+    pub pressure_level: PressureLevel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessHistoryPoint {
+    pub timestamp: String,
+    pub pid: u32,
+    pub name: String,
+    pub private_bytes: u64,
+    pub working_set_bytes: u64,
+    pub trend_bytes_per_min: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRecommendation {
+    pub id: i64,
+    pub created_at: String,
+    pub recommendation_id: String,
+    pub title: String,
+    pub reason: String,
+    pub risk: RiskLevel,
+    pub category: String,
+}
+
+/// Everything the Memory Intelligence dashboard needs in one payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryIntelligenceSnapshot {
+    pub collected_at: String,
+    pub analysis: MemoryAnalysis,
+    pub pressure: PressureReport,
+    pub compression: CompressionInfo,
+    pub virtual_memory: VirtualMemoryInfo,
+    pub processes: Vec<ProcessMemoryInfo>,
+    pub recommendations: Vec<Recommendation>,
+    pub prediction: Prediction,
+    pub policies: PolicyStatus,
+    pub recent_actions: Vec<AuditEntry>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHistorySeries {
+    pub samples: Vec<MemoryHistoryPoint>,
+    pub pressure_events: Vec<PressureEvent>,
+    pub process_history: Vec<ProcessHistoryPoint>,
+    pub recommendations: Vec<StoredRecommendation>,
+    pub actions: Vec<AuditEntry>,
+}
+
+/// Internal per-process observation kept in the trend ring buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessSample {
+    pub at_secs: f64,
+    pub private_bytes: u64,
+    pub working_set_bytes: u64,
+}
+
+/// Internal system-memory observation kept for trend/prediction analysis.
+#[derive(Clone, Copy, Debug)]
+pub struct SystemSample {
+    pub at_secs: f64,
+    pub available_bytes: u64,
+    pub committed_bytes: Option<u64>,
+    pub used_bytes: u64,
+}
