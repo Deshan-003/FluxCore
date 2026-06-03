@@ -88,3 +88,78 @@ async function subscribeToEvents() {
 export function stopMonitoringSubscriptions() {
   eventUnlisten?.()
   eventUnlisten = null
+  if (historyTimer !== null) {
+    window.clearInterval(historyTimer)
+    historyTimer = null
+  }
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+export const useMonitoringStore = create<MonitoringState>((set, get) => ({
+  snapshot: null,
+  history: [],
+  settings: readPreferences(),
+  status: 'loading',
+  error: null,
+  page: 'Overview',
+  search: '',
+  sortBy: 'cpu',
+  initialize: async () => {
+    if (!isDesktopRuntime()) {
+      set({ status: 'web-preview', error: 'Live system collection is available in the installed Windows desktop app. No sample metrics are shown in browser preview.' })
+      return
+    }
+    try {
+      const [settings, history] = await Promise.all([getSettings(), getHistory()])
+      set({ settings, history, status: 'connected', error: null })
+      await get().refresh()
+      if (eventUnlisten === null) {
+        try {
+          await subscribeToEvents()
+        } catch (error) {
+          set({ error: `Snapshot events unavailable, falling back to polling: ${String(error)}` })
+          pollTimer = window.setInterval(() => {
+            const state = useMonitoringStore.getState()
+            if (state.settings.monitoringEnabled) void state.refresh()
+          }, get().settings.refreshIntervalMs)
+        }
+      }
+    } catch (error) {
+      set({ status: 'error', error: String(error) })
+    }
+  },
+  refresh: async () => {
+    try {
+      const snapshot = await getSnapshot()
+      applySnapshot(snapshot, !get().settings.persistHistory)
+    } catch (error) {
+      set({ status: 'error', error: String(error) })
+    }
+  },
+  updateSettings: async (settings) => {
+    const previous = get().settings
+    set({ settings })
+    localStorage.setItem(STORE_KEY, JSON.stringify(settings))
+    if (isDesktopRuntime()) {
+      try {
+        await saveSettings(settings)
+        set({ error: null })
+        void get().refresh()
+      } catch (error) {
+        // The backend rejected the change: roll back to the stored values so
+        // the UI never runs on settings the engine refused. Refresh first,
+        // then surface the rejection so the snapshot cannot clear it.
+        set({ settings: previous })
+        localStorage.setItem(STORE_KEY, JSON.stringify(previous))
+        await get().refresh()
+        set({ error: `Settings change rejected: ${String(error)}` })
+      }
+    }
+  },
+  setPage: (page) => set({ page }),
+  setSearch: (search) => set({ search }),
+  setSortBy: (sortBy) => set({ sortBy }),
+}))
