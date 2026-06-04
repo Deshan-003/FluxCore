@@ -128,3 +128,111 @@ pub fn predict(
         .iter()
         .filter(|process| process.leak.is_some() || process.trend_bytes_per_min > noise_floor.max(1024.0 * 1024.0))
         .map(|process| ProcessGrowth {
+            pid: process.pid,
+            name: process.name.clone(),
+            growth_bytes_per_min: process.trend_bytes_per_min,
+            confidence: process
+                .leak
+                .as_ref()
+                .map(|leak| match leak.confidence {
+                    super::models::LeakConfidence::High => 0.9,
+                    super::models::LeakConfidence::Medium => 0.7,
+                    super::models::LeakConfidence::Low => 0.5,
+                })
+                .unwrap_or(0.4),
+        })
+        .collect();
+
+    let observation_minutes = window.observation_minutes();
+    let sample_coverage = (available.samples as f32 / 60.0).clamp(0.0, 1.0);
+    let confidence = (available.r2 * 0.6 + sample_coverage * 0.4).clamp(0.0, 1.0);
+
+    let summary = match time_to_high_pressure_minutes {
+        Some(minutes) if minutes <= horizon_minutes as f32 * 6.0 => format!(
+            "At the current rate, available memory could reach the high-pressure threshold in about {:.0} minutes.",
+            minutes
+        ),
+        _ => "No sustained decline in available memory was observed within the observation window.".to_string(),
+    };
+
+    Prediction {
+        generated_at: generated_at.to_string(),
+        observation_minutes,
+        confidence,
+        horizon_minutes,
+        available_forecast: available,
+        commit_forecast: commit,
+        time_to_high_pressure_minutes,
+        growing_processes,
+        summary,
+        disclaimer: "Forecast based on recent trends only; actual behavior depends on workload changes.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window_with_decline(rate_bytes_per_min: f64, minutes: u64, start: u64) -> SampleWindow {
+        let mut window = SampleWindow::new(3600.0, 4096);
+        for minute in 0..=minutes {
+            window.record(SystemSample {
+                at_secs: minute as f64 * 60.0,
+                available_bytes: start.saturating_sub((rate_bytes_per_min * minute as f64) as u64),
+                committed_bytes: Some(start + (rate_bytes_per_min * minute as f64) as u64),
+                used_bytes: 0,
+            });
+        }
+        window
+    }
+
+    #[test]
+    fn declining_availability_produces_exhaustion_estimate() {
+        let gib = 1024u64.pow(3);
+        let window = window_with_decline(1.0 * gib as f64, 10, 20 * gib);
+        let prediction = predict(&window, &[], 32 * gib, 15.0, 30, "t");
+        // The forecast is made at the window end (10 GiB available); from there
+        // toward the 4.8 GiB threshold at 1 GiB/min ≈ 5.2 minutes.
+        let minutes = prediction.time_to_high_pressure_minutes.expect("decline must be projected");
+        assert!((minutes - 5.2).abs() < 0.5, "minutes={minutes}");
+        assert!(prediction.summary.contains("high-pressure threshold"));
+        assert!(prediction.available_forecast.slope_bytes_per_min < 0.0);
+        assert!(prediction.commit_forecast.slope_bytes_per_min > 0.0);
+    }
+
+    #[test]
+    fn stable_system_has_no_exhaustion_estimate() {
+        let gib = 1024u64.pow(3);
+        let window = window_with_decline(0.0, 10, 20 * gib);
+        let prediction = predict(&window, &[], 32 * gib, 15.0, 30, "t");
+        assert_eq!(prediction.time_to_high_pressure_minutes, None);
+        assert!(prediction.summary.contains("No sustained decline"));
+    }
+
+    #[test]
+    fn confidence_scales_with_observation() {
+        let gib = 1024u64.pow(3);
+        let short = window_with_decline(2.0 * gib as f64, 2, 20 * gib);
+        let long = window_with_decline(2.0 * gib as f64, 60, 30 * gib);
+        let short_prediction = predict(&short, &[], 32 * gib, 15.0, 30, "t");
+        let long_prediction = predict(&long, &[], 32 * gib, 15.0, 30, "t");
+        assert!(long_prediction.confidence > short_prediction.confidence);
+        assert!(long_prediction.observation_minutes > short_prediction.observation_minutes);
+    }
+
+    #[test]
+    fn window_drops_samples_outside_retention() {
+        let mut window = SampleWindow::new(600.0, 4096);
+        for second in 0..2000u64 {
+            window.record(SystemSample {
+                at_secs: second as f64,
+                available_bytes: 1,
+                committed_bytes: None,
+                used_bytes: 0,
+            });
+        }
+        let samples = window.samples();
+        assert!(samples.len() <= 1001, "window keeps at most max_seconds of samples");
+        assert!(samples.front().unwrap().at_secs >= 999.0);
+    }
+}
