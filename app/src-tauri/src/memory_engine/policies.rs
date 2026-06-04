@@ -109,3 +109,94 @@ mod tests {
             },
         }
     }
+
+    fn analysis() -> MemoryAnalysis {
+        MemoryAnalysis {
+            collected_at: "t".into(),
+            total_bytes: 32 * 1024u64.pow(3),
+            used_bytes: 0,
+            available_bytes: 0,
+            free_bytes: None,
+            usage_percent: 50.0,
+            available_percent: 50.0,
+            cached_bytes: None,
+            standby_bytes: None,
+            modified_bytes: None,
+            compressed_bytes: None,
+            committed_bytes: None,
+            commit_limit_bytes: None,
+            commit_percent: None,
+            pagefile_used_bytes: None,
+            pagefile_total_bytes: None,
+            pagefile_percent: None,
+            hard_faults_per_sec: None,
+            page_faults_per_sec: None,
+            memory_load_percent: None,
+            sources: vec![],
+            limitations: vec![],
+        }
+    }
+
+    fn process(name: &str, share: f32) -> ProcessMemoryInfo {
+        ProcessMemoryInfo {
+            pid: 1,
+            name: name.to_string(),
+            private_bytes: 0,
+            working_set_bytes: 0,
+            private_working_set_bytes: None,
+            peak_working_set_bytes: 0,
+            virtual_bytes: None,
+            cpu_percent: None,
+            share_percent: share,
+            trend_bytes_per_min: 0.0,
+            trend_direction: TrendDirection::Stable,
+            samples: 0,
+            observation_seconds: 0,
+            leak: None,
+            started_at: None,
+        }
+    }
+
+    fn ids(policies: &[ActivePolicy]) -> Vec<&str> {
+        policies.iter().map(|policy| policy.id.as_str()).collect()
+    }
+
+    #[test]
+    fn normal_pressure_activates_only_background_policy() {
+        let (active, boost) = evaluate(&report(PressureLevel::Normal), &analysis(), &[], false);
+        assert_eq!(ids(&active), vec![POLICY_BACKGROUND]);
+        assert!(!boost);
+    }
+
+    #[test]
+    fn elevated_pressure_activates_low_memory_policy() {
+        let (active, boost) = evaluate(
+            &report(PressureLevel::Elevated),
+            &analysis(),
+            &[process("browser", 22.0)],
+            false,
+        );
+        assert!(ids(&active).contains(&POLICY_LOW_MEMORY));
+        assert!(active.iter().any(|policy| policy.detail.contains("browser")));
+        assert!(!boost);
+    }
+
+    #[test]
+    fn high_pressure_boosts_detail_and_critical_warns() {
+        let (active, boost) = evaluate(&report(PressureLevel::High), &analysis(), &[], false);
+        assert!(ids(&active).contains(&POLICY_HIGH_PRESSURE));
+        assert!(boost);
+
+        let (active, _) = evaluate(&report(PressureLevel::Critical), &analysis(), &[process("editor", 40.0)], false);
+        assert!(ids(&active).contains(&POLICY_CRITICAL));
+        assert!(active.iter().any(|policy| policy.detail.contains("editor")));
+    }
+
+    #[test]
+    fn idle_policy_only_when_unattended() {
+        let (active, _) = evaluate(&report(PressureLevel::Normal), &analysis(), &[], true);
+        assert!(ids(&active).contains(&POLICY_IDLE));
+        let (active, _) = evaluate(&report(PressureLevel::Normal), &analysis(), &[], false);
+        assert!(!ids(&active).contains(&POLICY_IDLE));
+    }
+}
