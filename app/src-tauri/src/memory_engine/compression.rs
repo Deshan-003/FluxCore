@@ -70,3 +70,62 @@ mod tests {
             compressed_bytes: compressed,
             committed_bytes: None,
             commit_limit_bytes: None,
+            commit_percent: None,
+            pagefile_used_bytes: None,
+            pagefile_total_bytes: None,
+            pagefile_percent: None,
+            hard_faults_per_sec: None,
+            page_faults_per_sec: None,
+            memory_load_percent: None,
+            sources: vec![],
+            limitations: vec![],
+        }
+    }
+
+    fn process(name: &str, working_set: u64) -> ProcessMemoryInfo {
+        ProcessMemoryInfo {
+            pid: 1,
+            name: name.to_string(),
+            private_bytes: working_set / 2,
+            working_set_bytes: working_set,
+            private_working_set_bytes: None,
+            peak_working_set_bytes: working_set,
+            virtual_bytes: None,
+            cpu_percent: None,
+            share_percent: 1.0,
+            trend_bytes_per_min: 0.0,
+            trend_direction: TrendDirection::Stable,
+            samples: 0,
+            observation_seconds: 0,
+            leak: None,
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn compression_is_reported_with_pressure_context() {
+        let info = analyze(&analysis(Some(512 * 1024u64.pow(2)), 12.0), &[]);
+        assert!(info.available);
+        assert_eq!(info.compressed_bytes, Some(512 * 1024u64.pow(2)));
+        assert!(info.pressure_relationship.contains("actively compressing"));
+        assert!(info.cpu_impact_note.contains("CPU"));
+    }
+
+    #[test]
+    fn compression_process_working_set_is_attached() {
+        let info = analyze(
+            &analysis(Some(1), 60.0),
+            &[process("Memory Compression", 300 * 1024u64.pow(2))],
+        );
+        assert_eq!(info.compression_process_bytes, Some(300 * 1024u64.pow(2)));
+        assert!(info.pressure_relationship.contains("routine background activity"));
+    }
+
+    #[test]
+    fn missing_counter_is_a_limitation_not_zero() {
+        let info = analyze(&analysis(None, 50.0), &[]);
+        assert!(!info.available);
+        assert!(info.compressed_bytes.is_none());
+        assert!(info.limitation.is_some());
+    }
+}
