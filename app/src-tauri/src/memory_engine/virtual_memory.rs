@@ -108,3 +108,94 @@ pub fn analyze(analysis: &MemoryAnalysis, config: Vec<PagefileConfigEntry>) -> V
     };
 
     if let Some(commit_percent) = analysis.commit_percent {
+        if commit_percent >= 85.0 {
+            notes.push(format!(
+                "Commit charge is at {commit_percent:.0}% of the commit limit; new allocations may fail before physical RAM is exhausted."
+            ));
+        }
+    }
+    if let Some(pagefile_percent) = analysis.pagefile_percent {
+        if pagefile_percent >= 80.0 {
+            notes.push(format!(
+                "Paging file usage is at {pagefile_percent:.0}%; sustained paging at this level usually indicates commit pressure."
+            ));
+        }
+    }
+    if config.is_empty() {
+        limitations.push("Pagefile configuration could not be read from the registry.".to_string());
+    }
+
+    VirtualMemoryInfo {
+        commit_charge_bytes: analysis.committed_bytes,
+        commit_limit_bytes: analysis.commit_limit_bytes,
+        commit_percent: analysis.commit_percent,
+        available_commit_bytes: available_commit,
+        pagefile_percent_usage: analysis.pagefile_percent,
+        pagefile_config: config,
+        notes,
+        limitations,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analysis(commit_percent: Option<f32>, pagefile_percent: Option<f32>) -> MemoryAnalysis {
+        MemoryAnalysis {
+            collected_at: "t".into(),
+            total_bytes: 32 * 1024u64.pow(3),
+            used_bytes: 0,
+            available_bytes: 0,
+            free_bytes: None,
+            usage_percent: 0.0,
+            available_percent: 100.0,
+            cached_bytes: None,
+            standby_bytes: None,
+            modified_bytes: None,
+            compressed_bytes: None,
+            committed_bytes: Some(34 * 1024u64.pow(3)),
+            commit_limit_bytes: Some(40 * 1024u64.pow(3)),
+            commit_percent,
+            pagefile_used_bytes: None,
+            pagefile_total_bytes: None,
+            pagefile_percent,
+            hard_faults_per_sec: None,
+            page_faults_per_sec: None,
+            memory_load_percent: None,
+            sources: vec![],
+            limitations: vec![],
+        }
+    }
+
+    #[test]
+    fn paging_file_entries_parse() {
+        let managed = parse_paging_file_entry("C:\\pagefile.sys 0 0").expect("system managed entry");
+        assert!(managed.system_managed);
+        assert_eq!(managed.path, "C:\\pagefile.sys");
+        let fixed = parse_paging_file_entry("D:\\pagefile.sys 1024 2048").expect("fixed entry");
+        assert!(!fixed.system_managed);
+        assert_eq!(fixed.initial_size_mb, Some(1024));
+        assert_eq!(fixed.maximum_size_mb, Some(2048));
+        assert!(parse_paging_file_entry("").is_none());
+    }
+
+    #[test]
+    fn commit_headroom_is_limit_minus_charge() {
+        let info = analyze(&analysis(Some(85.0), None), Vec::new());
+        assert_eq!(info.available_commit_bytes, Some(6 * 1024u64.pow(3)));
+        assert!(info.notes.iter().any(|note| note.contains("85%")));
+    }
+
+    #[test]
+    fn high_pagefile_usage_is_flagged() {
+        let info = analyze(&analysis(Some(50.0), Some(90.0)), Vec::new());
+        assert!(info.notes.iter().any(|note| note.contains("90%")));
+    }
+
+    #[test]
+    fn missing_config_is_a_limitation() {
+        let info = analyze(&analysis(None, None), Vec::new());
+        assert!(info.limitations.iter().any(|limitation| limitation.contains("Pagefile configuration")));
+    }
+}
