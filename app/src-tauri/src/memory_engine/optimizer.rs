@@ -106,3 +106,93 @@ pub fn startup_entries() -> Vec<String> {
     };
     let paths: [(HKEY, windows::core::PCWSTR); 2] = [
         (HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\CurrentVersion\Run")),
+        (HKEY_LOCAL_MACHINE, w!(r"Software\Microsoft\Windows\CurrentVersion\Run")),
+    ];
+    let mut entries = Vec::new();
+    for (root, path) in paths {
+        let mut key = HKEY::default();
+        if unsafe { RegOpenKeyExW(root, path, 0, KEY_READ, &mut key) }.is_err() {
+            continue;
+        }
+        let mut index = 0u32;
+        loop {
+            let mut name = [0u16; 256];
+            let mut name_len = name.len() as u32;
+            let result = unsafe {
+                RegEnumValueW(
+                    key,
+                    index,
+                    windows::core::PWSTR(name.as_mut_ptr()),
+                    &mut name_len,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            if result.is_err() {
+                break;
+            }
+            let value = String::from_utf16_lossy(&name[..name_len as usize]);
+            if !value.is_empty() {
+                entries.push(value);
+            }
+            index += 1;
+            if index > 512 {
+                break;
+            }
+        }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+    }
+    entries
+}
+
+#[cfg(not(windows))]
+pub fn startup_entries() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_covers_every_documented_action() {
+        let registry = descriptors();
+        let ids: Vec<&str> = registry.iter().map(|descriptor| descriptor.id.as_str()).collect();
+        for expected in [
+            ACTION_CLEAR_CACHES,
+            ACTION_RELEASE_RESOURCES,
+            ACTION_PAUSE_BACKGROUND,
+            ACTION_REFRESH_DATA,
+            ACTION_GUIDANCE_CLOSE_APPS,
+            ACTION_GUIDANCE_STARTUP,
+            ACTION_GUIDANCE_PAGEFILE,
+        ] {
+            assert!(ids.contains(&expected), "missing action {expected}");
+        }
+    }
+
+    #[test]
+    fn no_descriptor_is_destructive() {
+        for descriptor in descriptors() {
+            assert!(!super::super::safety::is_forbidden(&descriptor.id));
+            assert!(!descriptor.changes_system, "{} must not change system state", descriptor.id);
+        }
+    }
+
+    #[test]
+    fn analysis_only_mode_has_no_executable_actions() {
+        for descriptor in descriptors() {
+            assert!(!descriptor.available_in_modes.contains(&OptimizationMode::AnalysisOnly));
+        }
+    }
+
+    #[test]
+    fn descriptor_lookup_by_id() {
+        assert!(descriptor(ACTION_REFRESH_DATA).is_some());
+        assert!(descriptor("kill_process").is_none());
+    }
+}
