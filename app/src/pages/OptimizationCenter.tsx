@@ -65,3 +65,58 @@ function PolicyPanel() {
 }
 
 function ManualActions() {
+  const { actions, mode, runAction, lastResult } = useMemoryStore()
+  const [pending, setPending] = useState<string | null>(null)
+  const run = async (id: string, requiresConfirmation: boolean) => {
+    if (requiresConfirmation && pending !== id) { setPending(id); return }
+    setPending(null)
+    await runAction(id, true)
+  }
+  return <section className="panel"><div className="panel-head"><div className="panel-title"><Hand size={16} /><h2>Optimization actions</h2></div><span className="chart-period">mode: {mode}</span></div>
+    <div className="action-list">{actions.map((action) => {
+      const available = action.availableInModes.includes(mode)
+      const result = lastResult?.actionId === action.id ? lastResult : null
+      return <div className={`action-row ${available ? '' : 'disabled'}`} key={action.id}>
+        <div className="action-info"><strong>{action.title}</strong><span>{action.description}</span><small>Side effects: {action.sideEffects}</small></div>
+        <div className="action-side">
+          <span className={`risk-badge ${action.risk}`}>{action.risk} risk</span>
+          <button className={`rec-action ${pending === action.id ? 'confirming' : ''}`} disabled={!available} onClick={() => void run(action.id, action.requiresConfirmation)} title={!available ? 'Not available in the current mode' : undefined}>
+            {pending === action.id ? 'Confirm run' : action.requiresConfirmation ? 'Run with confirmation' : 'Run'}
+          </button>
+        </div>
+        {result && <p className={`rec-result ${result.status}`}>{result.status}: {result.detail}</p>}
+      </div>
+    })}</div>
+    <div className="sensor-notice"><Ban size={15} /><span>FluxCore never terminates applications, trims working sets as a RAM-cleaning routine, purges standby lists, resizes the pagefile or disables Windows memory compression. Those operations are not part of the action registry and are rejected by the safety engine.</span></div>
+  </section>
+}
+
+function OptimizationHistory() {
+  const series = useMemoryStore((state) => state.series)
+  const refreshSeries = useMemoryStore((state) => state.refreshSeries)
+  const [tab, setTab] = useState<'actions' | 'events' | 'recommendations'>('actions')
+  useEffect(() => {
+    void refreshSeries()
+  }, [refreshSeries, tab])
+  const actions = series?.actions ?? []
+  const events = series?.pressureEvents ?? []
+  const recommendations = series?.recommendations ?? []
+  return <section className="panel"><div className="panel-head"><div className="panel-title"><History size={16} /><h2>Optimization history</h2></div>
+    <div className="history-tabs">{(['actions', 'events', 'recommendations'] as const).map((key) => <button key={key} className={`history-tab ${tab === key ? 'active' : ''}`} onClick={() => setTab(key)}>{key}</button>)}</div></div>
+    {tab === 'actions' && <div className="process-table-wrap"><table className="process-table"><thead><tr><th>WHEN</th><th>MODE</th><th>ACTION</th><th>CONFIRMED</th><th>STATUS</th><th>DETAIL</th></tr></thead>
+      <tbody>{actions.map((entry) => <tr key={entry.id}><td>{new Date(entry.executedAt).toLocaleString()}</td><td>{entry.mode}</td><td>{entry.actionId}</td><td>{entry.confirmed ? 'yes' : 'no'}</td><td><span className={`status-chip ${entry.status}`}>{entry.status}</span></td><td className="audit-detail">{entry.detail}</td></tr>)}</tbody></table>
+      {actions.length === 0 && <div className="empty-state"><strong>No actions recorded</strong><span>Every executed, rejected or failed action is audited here.</span></div>}</div>}
+    {tab === 'events' && <div className="event-list">{events.map((event) => <div className={`event-row ${event.level}`} key={event.id}><FileClock size={14} /><div><strong>{event.level} pressure</strong><span>{event.reason}</span><small>{new Date(event.startedAt).toLocaleString()} → {event.endedAt ? new Date(event.endedAt).toLocaleString() : 'ongoing'} · min available {(event.minAvailableBytes / 1024 ** 3).toFixed(1)} GiB{event.peakCommitPercent == null ? '' : ` · peak commit ${event.peakCommitPercent.toFixed(0)}%`}</small></div></div>)}
+      {events.length === 0 && <div className="empty-state"><strong>No pressure events yet</strong><span>Sustained elevated, high or critical pressure periods are recorded here.</span></div>}</div>}
+    {tab === 'recommendations' && <div className="event-list">{recommendations.map((entry) => <div className="event-row stored" key={entry.id}><ClipboardList size={14} /><div><strong>{entry.title}</strong><span>{entry.reason}</span><small>{new Date(entry.createdAt).toLocaleString()} · {entry.category} · {entry.risk} risk</small></div></div>)}
+      {recommendations.length === 0 && <div className="empty-state"><strong>No stored recommendations</strong><span>Generated recommendations are persisted for review.</span></div>}</div>}
+  </section>
+}
+
+export default function OptimizationCenterPage() {
+  return <div className="oc-page">
+    <ModeSelector />
+    <div className="mi-grid-2"><PolicyPanel /><ManualActions /></div>
+    <OptimizationHistory />
+  </div>
+}
