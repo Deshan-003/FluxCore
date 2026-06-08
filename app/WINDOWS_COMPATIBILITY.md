@@ -54,3 +54,49 @@ Every counter is optional at runtime:
 - If a counter cannot be added or read (missing on the OS edition, performance libraries
   disabled, counter not yet initialized), the analyzer records it in `limitations` and the UI
   shows "Unavailable" plus the limitation note. Analysis continues with the remaining signals.
+- If the "Memory Compression" process is not visible, compression analysis falls back to the
+  PDH counter only, and says so (`compression.limitation`).
+- Per-process reads that fail (protected or exited processes) are skipped individually; the
+  process simply does not appear in the ranking for that scan.
+- `private_working_set_bytes` is `Option<u64>`: exposed only when the EX2 structure is returned
+  with a non-zero value.
+- Non-Windows compilation targets keep the engine logic testable with `None`/no-op stubs; no
+  fake values are produced on Windows itself.
+
+## Known limitations (deliberate)
+
+| Limitation | Reason |
+| --- | --- |
+| Per-process **virtual size** is not reported | Requires `NtQueryInformationProcess`/`QueryWorkingSetEx` paths that are not exposed as documented APIs in the `windows` crate. Private bytes + working set + private working set cover the meaningful signals. |
+| Pagefile configuration is **read-only** | Sizing/moving/disabling the pagefile is guidance-only by policy (see [OPTIMIZATION_SAFETY.md](OPTIMIZATION_SAFETY.md)). Registry values describe configuration; system-managed entries report sizes as 0 until Windows materializes them. |
+| Standby-cache breakdown availability | The three standby counters are not present on every SKU/configuration; totals then come from `GlobalMemoryStatusEx` alone and the limitation is surfaced. |
+| Hard-fault attribution per process | Windows does not expose per-process page-read rates through documented APIs; fault rates are system-wide only. |
+| No working-set manipulation at all | `EmptyWorkingSet`/`SetProcessWorkingSetSize` are intentionally never called — see forbidden operations. |
+
+## Privileges
+
+FluxCore runs **unelevated**. `PROCESS_QUERY_LIMITED_INFORMATION` is sufficient for
+private-bytes/working-set reads of normal user processes; processes owned by other users or
+protected processes may return nothing and are skipped. Registry reads use `KEY_READ` on
+documented keys. PDH counters are available to standard users.
+
+## Verification environment note
+
+This development machine enforces Smart App Control, which blocks locally built unsigned
+executables (including cargo build scripts), so host-native `cargo build` is prevented by OS
+policy — not by FluxCore code. The crate was therefore verified inside a Linux container
+(see [BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md)):
+
+1. `cargo check --all-targets --target x86_64-pc-windows-gnu` — every `cfg(windows)`
+   Windows API path (PDH counters, `GlobalMemoryStatusEx`, `GetNativeSystemInfo`,
+   `K32GetProcessMemoryInfo`, registry reads, `CreateFileW`/`DeviceIoControl` storage queries,
+   NVML dynamic loading) compiles against the real `windows` crate.
+2. The full unit-test suite and the benchmark example run natively (Linux host target).
+   The engine logic under test — analysis, pressure hysteresis, prediction, policies,
+   safety, optimizer registry, audit trail — is platform-independent and identical on both
+   targets; only the raw collectors use non-Windows fallbacks in this mode.
+
+Executing the compiled Windows test binaries under wine in the same container was attempted
+and abandoned after wineserver repeatedly crashed in the headless display chain. Runtime
+execution of the Windows collector paths on a real Windows host therefore remains a known
+verification gap, covered statically by step 1.
