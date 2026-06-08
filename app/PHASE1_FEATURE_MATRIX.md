@@ -16,3 +16,19 @@ Evidence references are real files and executed tests — logs are kept under `t
 | 7 | Background monitoring engine (worker thread, settings, pause, clean stop) | Complete | `monitoring.rs` — `MonitorEngine` named worker thread, `RwLock` shared state, `validate_settings` (250 ms–60 s), stop signal + join in `Drop`, per-tick `fluxcore-snapshot` event emission | Rust tests `settings_reject_unreasonable_intervals`, `monitor_engine_starts_publishes_and_stops` |
 | 8 | Frontend dashboard (overview, CPU, memory, GPU, storage, processes, hardware, settings pages) | Complete | `src/App.tsx` + `src/components/monitoring.tsx` + `src/lib/format.ts`; event-driven zustand store with polling fallback, timestamp-windowed charts, settings rollback, system-theme support | `npm run build` exit 0, `npm run lint` exit 0, vitest 40/40 incl. web-preview state and unavailable-sensor rendering |
 | 9 | SQLite persistence (settings, snapshots, 5 s cadence, 7-day retention) | Complete | `src-tauri/src/database.rs` — WAL, idempotent migrations 0001–0003; migration 0003 makes snapshot percentages nullable via row-preserving table rebuild | Rust tests `settings_and_history_persist_in_sqlite`, `migration_three_preserves_legacy_rows` |
+| 10 | Hardware compatibility handling (honest unavailable metrics, diagnostics) | Complete | `Option`/null end to end (percent/rate helpers return `None` on zero totals), limitation strings appended to snapshot `errors`, `check_hardware` diagnostic report; no hardcoded or synthetic values outside tests | Rust test `snapshot_serialization_uses_camel_case_contract` (null contract); vitest `renders unavailable sensors as Unavailable, never as zero` |
+| 11 | Performance (low-overhead collection at 1 s cadence) | Complete — measured | Bounded in-memory series, single snapshot clone per UI read, event push instead of 1 s polling; benchmark example in `src-tauri/examples/benchmark.rs` | Benchmark executed in container (`test-native4.log`, debug profile): collector pass avg 4957 µs, memory-engine steady tick 110 µs, combined collect+tick 3747 µs (engine overhead 2.2 % of Phase 1 baseline), resident 5.2 MiB — Linux logic path; a warm re-run measured 2407 µs collector / 1.8 % overhead, i.e. per-tick cost stays far below the 1 s budget; see known gaps |
+| 12 | Automated tests (backend + frontend + build) | Complete | 66 Rust unit tests (monitoring, database, memory engine, safety) + 40 vitest frontend tests + tsc/vite build + eslint + windows-gnu `cargo check --all-targets` | All executed: `test-native4.log` 66/66 passed, `frontend-tests.log` 40/40 passed, `frontend-build2.log`/`frontend-lint.log` exit 0, `check-docker10.log` exit 0 |
+
+## Known verification gaps (honest disclosure)
+
+- This workstation enforces Windows Smart App Control, which blocks locally built unsigned
+  binaries (os error 4551). Rust verification therefore ran in a Linux container: full test
+  execution against the platform-independent engine logic, plus a compile/type check of every
+  `cfg(windows)` API path for `x86_64-pc-windows-gnu`.
+- No Windows-host **runtime** execution of the NVML/PDH/IOCTL collectors was possible in this
+  environment; their API usage is verified by compilation against the real `windows` crate and
+  by unit tests of the pure derivation logic (rates, classification, percentages).
+- Benchmark numbers come from the container's Linux logic path (Windows collectors stubbed);
+  they bound the engine overhead but are not a substitute for on-target Windows measurements
+  on the Lenovo IdeaPad Gaming 3 (Ryzen 5 5500H / RTX 2050 / 8 GB / NVMe).
