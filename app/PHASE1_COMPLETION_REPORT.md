@@ -55,3 +55,50 @@ PDH raw-`u32` status codes, NVML `Symbol` deref), and test-fixture type fixes.
 | `—%` rendering bug, paused state showed stale "active" labels | `pct(null) → '—'`; sidebar pill shows "Monitoring paused" |
 | `useMemo(() => void refreshSeries(), …)` side effect (fires twice under StrictMode) | Converted to `useEffect` |
 | "System" theme did nothing | `matchMedia('(prefers-color-scheme: light)')` effect with change listener |
+| Dead Vite demo page `pages/Home.tsx`; duplicated `fmtBytes` | Page deleted; helpers consolidated into `src/lib/format.ts` |
+| No display of the new backend fields | CPU page: architecture, base/max frequency; GPU page: class, driver version, VRAM usage, "Memory controller activity" relabel; Storage page: drive kind; Memory page: cache/standby/compression panel fed by engine analysis |
+| Zero frontend tests | vitest + jsdom + @testing-library/react: 40 tests across helpers, process filtering, store behavior (null preservation, settings rollback), shared components and App-level render states (`src/**/*.test.ts[x]`, `npm run test:frontend`) |
+
+### Deliberately out of scope
+
+- `MemoryAnalysis` (Phase 2 internal model) keeps its own `f32` percentage convention — it is
+  Phase 2 code, untouched per the task constraints.
+- Per-process GPU columns remain null/"Unavailable" (no Windows provider exposes them without
+  a kernel driver).
+- Tray/startup registration remain stored preferences only, as documented in Settings.
+
+## Verification evidence (all executed)
+
+| Check | Command / environment | Result |
+|---|---|---|
+| Rust unit tests + benchmark | `sh tools/verify/run-native.sh` in `fluxcore-verify` container (Linux native) | **66 passed, 0 failed**; benchmark executed (see PHASE1_TEST_REPORT.md) — `tools/test-native4.log` |
+| Windows API compile check | `cargo check --all-targets --target x86_64-pc-windows-gnu` in container | **exit 0, zero errors** — `tools/check-docker10.log` |
+| Frontend tests | `npm run test:frontend` (host, JS-only — allowed under Smart App Control) | **40 passed, 0 failed** — `tools/frontend-tests.log` |
+| Frontend build | `npm run build` (`tsc -b && vite build`, host) | **exit 0** — `tools/frontend-build2.log` |
+| Lint | `npm run lint` (host) | **exit 0** — `tools/frontend-lint.log` |
+
+**Correction of an earlier claim:** the Phase 2 sign-off reported a passing windows-gnu
+cross-check (`tools/check-docker7.log`) based on a shell exit-code artifact; the log in fact
+contained 19 compile errors introduced by the Phase 1 backend refactor. All of them are fixed
+and the cross-check now genuinely passes (`check-docker10.log`, "Finished" + `CROSSCHECK_EXIT=0`
+appended by a reliable `&&`/`||` capture). The Phase 2 native test runs were genuine.
+
+## Remaining limitations (unchanged, documented)
+
+- No Windows-host runtime execution was possible on this workstation (Smart App Control blocks
+  locally built unsigned binaries; wine execution in-container crashes in the headless display
+  chain). `cfg(windows)` collector code is compile-verified against the real `windows` crate and
+  its pure derivation logic is unit-tested, but live sensor output has not been observed on the
+  target Lenovo IdeaPad Gaming 3 in this environment.
+- CPU temperature, AMD/Intel GPU telemetry, shared GPU memory, disk temperature/SMART and
+  per-process GPU usage remain unavailable and are displayed as such.
+- Benchmark figures come from the Linux logic path and bound engine overhead; they are not
+  on-target Windows measurements.
+
+## Documentation
+
+Updated: [HARDWARE_COMPATIBILITY.md](HARDWARE_COMPATIBILITY.md),
+[ARCHITECTURE.md](ARCHITECTURE.md), [DEVELOPMENT.md](DEVELOPMENT.md),
+[BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md).
+Created: [PHASE1_FEATURE_MATRIX.md](PHASE1_FEATURE_MATRIX.md),
+[PHASE1_TEST_REPORT.md](PHASE1_TEST_REPORT.md), this report.
