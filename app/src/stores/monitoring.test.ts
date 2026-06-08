@@ -83,3 +83,74 @@ describe('toHistory', () => {
   })
 
   it('carries real percentages through unchanged', () => {
+    const base = snapshot()
+    const point = toHistory(snapshot({
+      ...base,
+      cpu: { ...base.cpu, usagePercent: 12.5 },
+      memory: { ...base.memory, usagePercent: 61.25 },
+    }))
+    expect(point.cpuPercent).toBe(12.5)
+    expect(point.memoryPercent).toBe(61.25)
+  })
+
+  it('picks the first reporting GPU utilization and sums only dedicated VRAM', () => {
+    const point = toHistory(snapshot({
+      gpus: [
+        gpu({ name: 'iGPU', utilizationPercent: null, dedicatedUsedBytes: null }),
+        gpu({ name: 'dGPU', utilizationPercent: 37, dedicatedUsedBytes: 2 * 1024 ** 3 }),
+      ],
+    }))
+    expect(point.gpuPercent).toBe(37)
+    expect(point.vramUsedBytes).toBe(2 * 1024 ** 3)
+  })
+
+  it('reports null VRAM when no adapter exposes dedicated memory', () => {
+    const point = toHistory(snapshot({ gpus: [gpu({ sharedUsedBytes: 512 * 1024 ** 2 })] }))
+    expect(point.vramUsedBytes).toBeNull()
+  })
+
+  it('sums disk rates across volumes but stays null when no counter is provided', () => {
+    expect(toHistory(snapshot({ storage: [volume(), volume()] })).diskReadBytesPerSecond).toBeNull()
+    const point = toHistory(snapshot({
+      storage: [
+        volume({ name: 'C:', readBytesPerSecond: 100, writeBytesPerSecond: null }),
+        volume({ name: 'D:', readBytesPerSecond: 50, writeBytesPerSecond: 25 }),
+      ],
+    }))
+    expect(point.diskReadBytesPerSecond).toBe(150)
+    expect(point.diskWriteBytesPerSecond).toBe(25)
+  })
+})
+
+describe('updateSettings', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    mocks.getSnapshot.mockResolvedValue(snapshot())
+    mocks.getHistory.mockResolvedValue([])
+    mocks.isDesktopRuntime.mockReturnValue(true)
+    mocks.saveSettings.mockResolvedValue(undefined)
+    useMonitoringStore.setState({
+      snapshot: null, history: [], settings: { ...DEFAULT_SETTINGS },
+      status: 'loading', error: null, page: 'Overview', search: '', sortBy: 'cpu',
+    })
+  })
+
+  it('persists accepted settings locally', async () => {
+    const next = { ...DEFAULT_SETTINGS, refreshIntervalMs: 5000 }
+    await useMonitoringStore.getState().updateSettings(next)
+    expect(useMonitoringStore.getState().settings.refreshIntervalMs).toBe(5000)
+    expect(useMonitoringStore.getState().error).toBeNull()
+    expect(JSON.parse(localStorage.getItem('fluxcore.preferences.v1')!).refreshIntervalMs).toBe(5000)
+  })
+
+  it('rolls back and surfaces the rejection when the backend refuses the change', async () => {
+    mocks.saveSettings.mockRejectedValue(new Error('refresh_interval_ms must be between 250 and 60000'))
+    await useMonitoringStore.getState().updateSettings({ ...DEFAULT_SETTINGS, refreshIntervalMs: 10 })
+    const state = useMonitoringStore.getState()
+    expect(state.settings.refreshIntervalMs).toBe(DEFAULT_SETTINGS.refreshIntervalMs)
+    expect(state.error).toContain('Settings change rejected')
+    expect(state.error).toContain('between 250 and 60000')
+    expect(JSON.parse(localStorage.getItem('fluxcore.preferences.v1')!).refreshIntervalMs)
+      .toBe(DEFAULT_SETTINGS.refreshIntervalMs)
+  })
+})
