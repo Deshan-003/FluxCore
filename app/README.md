@@ -44,3 +44,41 @@ telemetry, never treats GPU memory as system RAM, and never performs destructive
 
 - Windows 10/11 x64
 - Node.js 20 or newer and npm
+- Rust stable MSVC toolchain (`x86_64-pc-windows-msvc`)
+- Microsoft C++ Build Tools and WebView2 Runtime (Tauri prerequisites)
+
+## Run
+
+```powershell
+npm install
+npm run tauri dev
+```
+
+Web-only preview (`npm run dev`) is intentionally an empty live-data state: it does not
+substitute sample measurements.
+
+## Checks
+
+```powershell
+npm run lint
+npm run build
+npm test
+npm run test:frontend
+npm run tauri build
+```
+
+Benchmark harness (real measurements; never modifies system state):
+
+```powershell
+cargo run --release --manifest-path src-tauri/Cargo.toml --example benchmark
+```
+
+## Documentation
+
+- [MEMORY_ENGINE.md](MEMORY_ENGINE.md) — engine architecture, pressure model, leak detection, prediction, persistence
+- [OPTIMIZATION_SAFETY.md](OPTIMIZATION_SAFETY.md) — forbidden operations, action registry, validation and audit flow
+- [WINDOWS_COMPATIBILITY.md](WINDOWS_COMPATIBILITY.md) — every Windows API used, fallbacks and deliberate limitations
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system boundaries and data flow
+- [BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md) — build, test and packaging
+- [DEVELOPMENT.md](DEVELOPMENT.md), [HARDWARE_COMPATIBILITY.md](HARDWARE_COMPATIBILITY.md)
+- [PHASE1_COMPLETION_REPORT.md](PHASE1_COMPLETION_REPORT.md), [PHASE1_FEATURE_MATRIX.md](PHASE1_FEATURE_MATRIX.md), [PHASE1_TEST_REPORT.md](PHASE1_TEST_REPORT.md) — Phase 1 audit, implementation and executed-verification record
