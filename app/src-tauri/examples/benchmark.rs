@@ -65,3 +65,58 @@ fn main() {
     );
     let memory = MemoryEngine::new(Arc::clone(&database));
     memory.set_dashboard_active(true);
+
+    // 2. Cold tick: PDH init + full process scan + prediction + persistence.
+    let (cold_collect_us, cold_tick_us) = benchmark_collect_and_tick(1, &memory);
+    println!("[phase 2] first engine tick       once {cold_tick_us:>8} µs  (cold: counters + full scan)");
+    println!("[phase 2] collect alongside tick  once {cold_collect_us:>8} µs");
+
+    // 3. Steady-state ticks.
+    let (steady_collect_us, steady_tick_us) = benchmark_collect_and_tick(iterations, &memory);
+    println!("[phase 2] steady engine tick      avg {steady_tick_us:>8} µs");
+    println!("[phase 2] collect in pipeline     avg {steady_collect_us:>8} µs");
+
+    // 4. Combined cost and overhead.
+    let combined_us = steady_collect_us.saturating_add(steady_tick_us);
+    let overhead_percent = if collect_only_us > 0 {
+        (steady_tick_us as f64 / collect_only_us as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!("[combined] collect + tick         avg {combined_us:>8} µs  (engine overhead {overhead_percent:.1}% of Phase 1 baseline)");
+
+    // 5. Own footprint, same APIs used for every other process.
+    match read_process(std::process::id()) {
+        Some(reading) => println!(
+            "[footprint] fluxcore benchmark    private {:.1} MiB · working set {:.1} MiB · peak WS {:.1} MiB",
+            mib(reading.private_bytes),
+            mib(reading.working_set_bytes),
+            mib(reading.peak_working_set_bytes)
+        ),
+        None => match linux_footprint_mib() {
+            Some((rss, peak)) => println!(
+                "[footprint] fluxcore benchmark    resident {:.1} MiB · peak resident {:.1} MiB (non-Windows platform)",
+                rss, peak
+            ),
+            None => println!("[footprint] unavailable on this platform"),
+        },
+    }
+
+    // Intelligence snapshot sanity: the engine must be serving live data.
+    match memory.intelligence() {
+        Ok(snapshot) => println!(
+            "[engine] serving live intelligence: pressure={} processes={} recommendations={} limitations={}",
+            snapshot.pressure.level.as_str(),
+            snapshot.processes.len(),
+            snapshot.recommendations.len(),
+            snapshot.limitations.len()
+        ),
+        Err(error) => println!("[engine] intelligence unavailable: {error}"),
+    }
+
+    // Cleanup: close the database and remove the throwaway file.
+    drop(database);
+    let _ = std::fs::remove_file(&db_path);
+    println!("-------------------------------------------------------------------");
+    println!("benchmark database removed; no system state was modified");
+}
