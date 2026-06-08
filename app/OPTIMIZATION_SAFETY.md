@@ -49,3 +49,46 @@ against the registry first, and `safety::validate` then re-checks the forbidden 
 mode, and the confirmation flag. A unit test asserts the registry contains no destructive action
 and that every forbidden ID is rejected in every mode.
 
+## Validation flow
+
+```
+UI click → execute_optimization_action(action_id, confirmed)
+  1. descriptor = registry.lookup(action_id)      → unknown ID: rejected + audited
+  2. safety::validate(mode, descriptor, confirmed)
+       - forbidden ID               → rejected + audited
+       - mode == AnalysisOnly       → rejected + audited
+       - requires_confirmation and !confirmed → rejected + audited
+  3. run_action(descriptor)                       → success/failed + audited
+  4. AuditEntry { action, mode, confirmed, status, detail, timestamp }
+```
+
+Every outcome — executed, rejected, failed or cancelled — is written to `optimization_actions`
+and shown in the Optimization Center history with mode, confirmation state and detail text.
+
+## User confirmation
+
+- Recommendations that map to an action show **Approve & run**; the first click arms the button
+  ("Click again to confirm"), the second executes with `confirmed: true`.
+- Manual actions with `requires_confirmation` use the same two-step flow.
+- `analysisOnly` mode renders action buttons inert with an explanation — the mode guarantee is
+  enforced in the backend, not just the UI.
+
+## Honesty rules baked into the engine
+
+- **No invented savings.** Recommendation `expected_benefit` is qualitative ("reduces background
+  overhead while you work"); byte-count promises appear nowhere.
+- **Cached/standby ≠ unavailable.** The analyzer reports standby, modified and cache bytes as
+  reclaimable memory Windows is using *well*, and available memory excludes them correctly.
+- **VRAM is not RAM.** GPU memory is never added to physical RAM, never offered as an extension
+  of it, and no action moves application memory to the GPU.
+- **Labels require evidence.** "Suspected growth pattern" appears only after ≥ 8 samples over
+  ≥ 4 minutes with strong regression fit; a single large allocation never triggers it.
+- **Limitations are surfaced.** Missing PDH counters, unavailable private-working-set values and
+  other gaps are collected into `limitations` and rendered in the UI rather than papered over.
+
+## Stability first
+
+The engine never sacrifices system stability for a better-looking number: it cannot terminate,
+trim, purge, resize or disable anything belonging to Windows or other applications. The worst
+case of any FluxCore action is degraded *FluxCore* telemetry quality, which the side-effect
+descriptors state up front.
