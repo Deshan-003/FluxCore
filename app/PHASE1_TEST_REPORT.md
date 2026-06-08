@@ -86,3 +86,76 @@ Test Files  5 passed (5)
 
 Coverage highlights:
 
+- **Format helpers** — null/undefined render as `Unavailable` / `—`, never `0 B` or `0%`;
+  unit boundaries; health thresholds at 75/90; the VRAM tile maps to the `vramUsedBytes`
+  series and never to `memoryPercent`.
+- **Process filtering** — case-insensitive name search, PID substring search, CPU sort with
+  unavailable readings last, memory sort, 100-row cap, input not mutated.
+- **Store** — `toHistory` preserves null percentages and sums only *dedicated* VRAM; disk-rate
+  aggregation stays null when no counter exists; `updateSettings` persists accepted values and
+  **rolls back** (state + localStorage) with a surfaced rejection message when the backend
+  refuses.
+- **Components** — empty state, sensor notices, resource bar (null → 0% width, clamping),
+  switch semantics of toggles, label/value rendering incl. "Unavailable" values.
+- **App render states** — browser preview shows the desktop-required state and fabricates no
+  metrics; the GPU page shows VRAM usage (50% of dedicated), memory-controller activity,
+  driver version and class separately from system RAM (the 62.5% RAM figure appears nowhere on
+  the page); a GPU with no telemetry renders `Unavailable` for every sensor and never `0 MHz`.
+
+Tauri IPC is mocked in these tests; they verify frontend logic and rendering, not the Rust
+collectors (covered in sections 1–2).
+
+## 4. Frontend build and lint — executed, exit 0
+
+Commands (host): `npm run build` (`tsc -b && vite build`), `npm run lint`
+
+Logs: `tools/frontend-build2.log`, `tools/frontend-lint.log`
+
+```
+BUILD_EXIT=0   (2131 modules transformed; dist bundle emitted; only a chunk-size >500 kB advisory)
+LINT_EXIT=0    (no ESLint errors)
+```
+
+`tsc -b` runs in strict mode with `noUnusedLocals`/`noUnusedParameters`, so the nullable-
+percent contract is type-enforced across every component.
+
+## 5. Benchmark — executed
+
+Command (container, debug profile): `cargo run --manifest-path /work/src-tauri/Cargo.toml
+--example benchmark -- 25`
+
+Log: `tools/test-native4.log` (tail)
+
+```
+[phase 1] collector pass          avg     4957 µs
+[phase 2] first engine tick       once       76 µs  (cold: counters + full scan)
+[phase 2] steady engine tick      avg       110 µs
+[phase 2] collect in pipeline     avg     3637 µs
+[combined] collect + tick         avg     3747 µs  (engine overhead 2.2% of Phase 1 baseline)
+[footprint] fluxcore benchmark    resident 5.2 MiB · peak resident 5.2 MiB (non-Windows platform)
+benchmark database removed; no system state was modified
+```
+
+A warm re-run of the identical code measured 2407 µs collector / 1964 µs combined / 1.8%
+overhead / 5.3 MiB (`tools/test-native3.log`) — run-to-run variance in the shared-memory WSL2
+container, but per-tick cost stays two orders of magnitude below the 1 s collection budget.
+These figures bound engine overhead on the Linux logic path; they are not on-target Windows
+measurements (GPU/IOCTL/PDH collectors are stubbed there). The benchmark never modifies system
+state and removes its throwaway database.
+
+## Summary
+
+| Suite | Result | Log |
+|---|---|---|
+| Rust unit tests (container, native execution) | 66 passed / 0 failed | `tools/test-native4.log` |
+| windows-gnu `cargo check --all-targets` (container) | exit 0, no errors | `tools/check-docker10.log` |
+| Frontend vitest (host) | 40 passed / 0 failed | `tools/frontend-tests.log` |
+| `tsc -b && vite build` (host) | exit 0 | `tools/frontend-build2.log` |
+| ESLint (host) | exit 0 | `tools/frontend-lint.log` |
+| Benchmark (container) | executed, no system state modified | `tools/test-native4.log` |
+
+**Remaining gaps:** no Windows-host runtime execution (Smart App Control; wine infeasible in
+container), so live NVML/PDH/IOCTL sensor output has not been observed in this environment —
+API usage is compile-verified and derivation logic unit-tested. On-target measurements on the
+Lenovo IdeaPad Gaming 3 15ACH6 (Ryzen 5 5500H, RTX 2050 4 GB, 8 GB RAM, 512 GB NVMe) require a
+machine where the app can be built/run (e.g. SAC disabled by the owner or a standard dev box).
