@@ -536,3 +536,182 @@ pub struct BenchmarkRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkSummary {
+    pub id: i64,
+    pub created_at: String,
+    pub workload_id: String,
+    pub input_size: usize,
+    pub backend: BackendKind,
+    pub cpu_median_ms: f64,
+    pub gpu_median_ms: Option<f64>,
+    pub transfer_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub verdict: String,
+}
+
+// ---------------------------------------------------------------------------
+// §6 — submit request
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitTaskRequest {
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub priority: TaskPriority,
+    pub backend: Option<BackendKind>,
+    pub client_ref: Option<String>,
+    pub require_gpu: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Freeze §3 additions — provider-side shared data (moved here to avoid a
+// providers <-> scheduler circular dependency).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    Cpu,
+    Cuda,
+    Wgpu,
+    Other,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuDeviceInfo {
+    pub device_id: String,
+    pub name: String,
+    pub vendor: String,
+    pub backend: String,
+    pub monitor_gpu_index: Option<usize>,
+    pub dedicated_total_bytes: Option<u64>,
+    pub dedicated_free_bytes: Option<u64>,
+    pub compute_capability: Option<String>,
+    pub driver_version: Option<String>,
+    pub max_workgroup_size: Option<u32>,
+    pub max_storage_buffer_bytes: Option<u64>,
+    pub is_discrete: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilities {
+    pub compute_ready: bool,
+    pub unavailable_reason: Option<String>,
+    pub max_threads_per_workgroup: Option<u32>,
+    pub max_workgroup_size_x: Option<u32>,
+    pub max_workgroup_size_y: Option<u32>,
+    pub max_workgroup_size_z: Option<u32>,
+    pub max_buffer_bytes: Option<u64>,
+    pub allocation_alignment: u64,
+    pub backend_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSupport {
+    pub workload_id: String,
+    pub max_elements: u64,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuMemoryInfo {
+    pub total_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub allocated_bytes: u64,
+}
+
+/// Cooperative cancellation, usable by providers without depending on the
+/// scheduler. Cloning shares the same flag.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        CancelToken {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkloadRequirement {
+    pub workload_id: String,
+    pub input_size: usize,
+    pub device_bytes: u64,
+    pub transfer_bytes: u64,
+    pub timeout: std::time::Duration,
+}
+
+/// The ONLY request object passed into a provider (freeze §3 shape; adds the
+/// `validate` flag over architecture §3.1).
+#[derive(Clone, Debug)]
+pub struct ExecutionRequest {
+    pub request_id: u64,
+    pub workload_id: String,
+    pub device_id: String,
+    pub params: WorkloadParams,
+    pub timeout: std::time::Duration,
+    pub cancel: CancelToken,
+    pub validate: bool,
+}
+
+/// Result of one execution attempt. Freeze §3 shape: `timing: TimingBreakdown`
+/// replaces architecture §3.1's three `Duration` fields.
+#[derive(Clone, Debug)]
+pub struct ExecutionOutcome {
+    pub backend: String,
+    pub provider_id: String,
+    pub device_id: String,
+    pub timing: TimingBreakdown,
+    pub peak_device_bytes: u64,
+    pub notes: Vec<String>,
+    pub output_digest: String,
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityReport {
+    pub collected_at: String,
+    pub providers: Vec<ProviderStatus>,
+    pub environment: AccelerationEnvironment,
+    pub notes: Vec<String>,
+}
+
+/// Deterministic input buffers shared by the CPU reference and every GPU
+/// provider. Row-major f32, `y` empty for VectorScale and RowSum.
+#[derive(Clone, Debug)]
+pub struct WorkloadInputs {
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// WorkloadParams — the shared computation contract.
+// ---------------------------------------------------------------------------
+
+impl WorkloadParams {
+    pub fn workload_id(&self) -> &'static str {
+        match *self {
+            WorkloadParams::VectorAxpy { .. } => "vector_axpy",
+            WorkloadParams::VectorScale { .. } => "vector_scale",
