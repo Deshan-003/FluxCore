@@ -263,3 +263,92 @@ impl ResourceManager {
     /// Checks budget, remaining, safety gates and concurrency. Reserves on success.
     pub fn admit(&self, task_id: u64, req: &WorkloadRequirement, config: &AccelerationConfig) -> AdmissionDecision;
     /// Idempotent per task id; a double release must not corrupt accounting.
+    pub fn reserve(&self, task_id: u64, bytes: u64) -> bool;
+    pub fn release(&self, task_id: u64);
+    pub fn running_gpu_tasks(&self) -> usize;
+    pub fn validate_config(config: &AccelerationConfig) -> Result<(), String>;
+}
+```
+
+Budget = `min(dedicated_total * pct/100, cap_mb*MiB when cap>0)`, floor at 0. Gates per §7.6 read
+from the single snapshot: GPU utilization, temperature, system RAM available %. Power is recorded as a
+note, not a blocker. `validate_config` enforces §5.4 ranges and returns the exact validation message.
+
+## 7. `persistence.rs` (Subagent 4) — exact public surface (free functions)
+
+```rust
+pub fn record_task(db: &Database, task: &GpuTask) -> Result<i64, String>;
+pub fn recent_tasks(db: &Database, limit: usize, workload: Option<&str>) -> Result<Vec<GpuTask>, String>;
+pub fn record_benchmark(db: &Database, record: &BenchmarkRecord) -> Result<i64, String>;
+pub fn recent_benchmarks(db: &Database, limit: usize, workload: Option<&str>) -> Result<Vec<BenchmarkRecord>, String>;
+pub fn clear_benchmarks(db: &Database) -> Result<usize, String>;
+pub fn save_config(db: &Database, config: &AccelerationConfig) -> Result<(), String>;
+pub fn load_config(db: &Database) -> Result<Option<AccelerationConfig>, String>;
+pub fn save_workload_settings(db: &Database, settings: &[WorkloadSetting]) -> Result<(), String>;
+pub fn load_workload_settings(db: &Database) -> Result<Vec<WorkloadSetting>, String>;
+pub fn upsert_provider(db: &Database, status: &ProviderStatus) -> Result<(), String>;
+```
+
+All SQL runs through the main-agent-provided helper (already added to `database.rs`):
+
+```rust
+pub fn with_connection<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>) -> Result<T, String>;
+```
+
+Tables are exactly those created by migration 0004 (see `migrations/0004_gpu_acceleration.sql`), which
+uses `payload` JSON columns for task/benchmark records. `recent_tasks`/`recent_benchmarks` decode the
+`payload` column; the narrow SQL columns exist for indexing/filtering only. `GpuTask.id` is the
+in-memory id and is stored in `task_ref`; SQLite uses its own `id`.
+
+## 8. `profiler.rs` (Subagent 3) — exact public surface
+
+```rust
+pub fn registry() -> &'static [WorkloadDef];
+pub fn find(id: &str) -> Option<&'static WorkloadDef>;
+pub fn validate_params(params: &WorkloadParams) -> Result<(), String>;  // §7.1 caps
+pub fn default_params(workload_id: &str, size: usize) -> Option<WorkloadParams>; // re-export models::
+pub struct ClassifyInputs<'a> {
+    pub config: &'a AccelerationConfig,
+    pub providers: &'a [ProviderStatus],
+    pub resources: &'a ResourceBudgetStatus,
+    pub benchmarks: &'a [BenchmarkSummary],
+    pub gpu_enabled: bool,
+}
+/// Deterministic, side-effect-free. Decision order is EXACTLY §7.2.
+pub fn classify(params: &WorkloadParams, inputs: &ClassifyInputs<'_>) -> SuitabilityAssessment;
+```
+
+`classify` must never use GPU utilization percentage as a reason to route to the GPU; utilization is a
+*safety gate* only (`blockers`). Conservative when data is missing: `EstimateSource::Model`,
+`CpuRecommended`, with a reason stating what was missing. Measured estimates come only from a
+`BenchmarkSummary` whose `input_size` matches.
+
+## 9. `scheduler.rs` (Subagent 3) — exact public surface
+
+```rust
+pub type TaskObserver = std::sync::Arc<dyn Fn(&GpuTask) + Send + Sync>;
+
+pub struct Scheduler { /* priority queue, task map, GPU + CPU worker threads */ }
+impl Scheduler {
+    pub fn new(
+        providers: Vec<std::sync::Arc<dyn GpuProvider>>,
+        resources: std::sync::Arc<ResourceManager>,
+        observer: TaskObserver,
+        config: AccelerationConfig,
+    ) -> Self;
+    pub fn submit(&self, request: SubmitTaskRequest, assessment: SuitabilityAssessment) -> Result<GpuTask, String>;
+    pub fn cancel(&self, task_id: u64) -> Result<GpuTask, String>;
+    pub fn list(&self, limit: usize, status: Option<TaskStatus>) -> Vec<GpuTask>;
+    pub fn clear_finished(&self) -> usize;
+    pub fn set_config(&self, config: AccelerationConfig);
+    pub fn set_providers(&self, providers: Vec<std::sync::Arc<dyn GpuProvider>>);
+}
+impl Drop for Scheduler { /* cancel all, join workers */ }
+```
+
+Semantics: §7.5. Two worker threads (1 GPU serialised, CPU up to `max_concurrent_cpu_tasks`),
+priority queue, backpressure at `max_queue_length`, cooperative `CancelToken`, wall-clock timeout per
+attempt, `resources.admit` on submit / `resources.release` on **every** exit path (guard struct),
+CPU fallback unless `require_gpu`, `observer(&task)` on every state change. Worker calls
+`execution::execute_task(...)` (below). Never blocks a Tauri command.
+
