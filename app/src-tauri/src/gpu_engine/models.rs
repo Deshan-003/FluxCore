@@ -357,3 +357,182 @@ pub struct GpuTask {
     pub requested_backend: Option<BackendKind>,
     pub selected_backend: Option<BackendKind>,
     pub assessment: Option<SuitabilityAssessment>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub queue_ms: Option<u64>,
+    pub progress_percent: Option<f32>,
+    pub cpu_time_ms: Option<f64>,
+    pub gpu_time_ms: Option<f64>,
+    pub transfer_time_ms: Option<f64>,
+    pub total_time_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub vram_used_bytes: Option<u64>,
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+    pub fell_back: bool,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// §5.4 — configuration (persisted)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccelerationConfig {
+    pub mode: AccelerationMode,
+    pub workload_settings: Vec<WorkloadSetting>,
+    pub provider_priority: Vec<String>,
+    pub preferred_devices: Vec<DevicePreference>,
+    pub vram_budget_percent: f32,
+    pub vram_budget_cap_mb: u64,
+    pub max_gpu_utilization_percent: f32,
+    pub max_temperature_c: f32,
+    pub max_concurrent_gpu_tasks: usize,
+    pub max_concurrent_cpu_tasks: usize,
+    pub max_queue_length: usize,
+    pub task_timeout_ms: u64,
+    pub min_system_ram_available_percent: f32,
+    pub persist_history: bool,
+    pub retention_days: u32,
+    pub auto_benchmark: bool,
+    pub validate_results: bool,
+    pub emit_events: bool,
+}
+
+impl Default for AccelerationConfig {
+    fn default() -> Self {
+        AccelerationConfig {
+            mode: AccelerationMode::IntelligentAuto,
+            workload_settings: Vec::new(),
+            provider_priority: vec![
+                "cuda".to_string(),
+                "wgpu".to_string(),
+                "cpu".to_string(),
+            ],
+            preferred_devices: Vec::new(),
+            // Main-agent arbitration (conflict C3 from Subagent 1): this field is
+            // a PERCENT (0-100), not a 0-1 fraction. §5.4's validation range
+            // (1..=90) and §7.6's "/100" budget formula are authoritative; the
+            // UI also renders it as a percentage. Default = 50 % of dedicated VRAM.
+            vram_budget_percent: 50.0,
+            vram_budget_cap_mb: 1024,
+            max_gpu_utilization_percent: 85.0,
+            max_temperature_c: 85.0,
+            max_concurrent_gpu_tasks: 1,
+            max_concurrent_cpu_tasks: 2,
+            max_queue_length: 32,
+            task_timeout_ms: 10_000,
+            min_system_ram_available_percent: 15.0,
+            persist_history: true,
+            retention_days: 30,
+            auto_benchmark: true,
+            validate_results: true,
+            emit_events: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSetting {
+    pub workload_id: String,
+    pub mode: AccelerationMode,
+    pub backend: BackendKind,
+    pub enabled: bool,
+    pub selected_size: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePreference {
+    pub provider_id: String,
+    pub device_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// §5.5 — resource / safety status
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceBudgetStatus {
+    pub total_vram_bytes: Option<u64>,
+    pub free_vram_bytes: Option<u64>,
+    pub budget_bytes: u64,
+    pub reserved_bytes: u64,
+    pub allocated_bytes: u64,
+    pub remaining_budget_bytes: u64,
+    pub running_gpu_tasks: usize,
+    pub queued_gpu_tasks: usize,
+    pub max_concurrent_gpu_tasks: usize,
+    pub gpu_utilization_percent: Option<f32>,
+    pub temperature_c: Option<f32>,
+    pub power_watts: Option<f32>,
+    pub safety_level: SafetyLevel,
+    pub gates: Vec<String>,
+    pub system_ram_available_percent: Option<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// §5.6 — benchmarks
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkRequest {
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub warmup_runs: u32,
+    pub measured_runs: u32,
+    pub validate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingStats {
+    pub runs: u32,
+    pub min_ms: f64,
+    pub median_ms: f64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+    pub stddev_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkComparison {
+    pub cpu: TimingStats,
+    pub gpu: Option<TimingStats>,
+    pub transfer_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub verdict: String,
+    pub gpu_available: bool,
+    pub gpu_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkRecord {
+    pub id: i64,
+    pub created_at: String,
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub backend: BackendKind,
+    pub provider_id: String,
+    pub device_id: String,
+    pub cpu: TimingStats,
+    pub gpu: Option<TimingStats>,
+    pub transfer_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub vram_used_bytes: Option<u64>,
+    pub validated: bool,
+    pub max_abs_error: Option<f32>,
+    pub verdict: String,
+    pub environment: AccelerationEnvironment,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
