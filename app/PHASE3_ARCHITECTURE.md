@@ -713,3 +713,241 @@ pub struct AccelerationConfig {
     pub max_gpu_utilization_percent: f32,
     /// Refuse to start a GPU task above this temperature (°C). Default 85.
     pub max_temperature_c: f32,
+    /// Maximum GPU tasks executing at once (1-2). Default 1.
+    pub max_concurrent_gpu_tasks: usize,
+    /// Maximum CPU tasks executing at once (1-4). Default 2.
+    pub max_concurrent_cpu_tasks: usize,
+    /// Maximum queue length before submissions are rejected (backpressure). Default 32.
+    pub max_queue_length: usize,
+    /// Per-task hard timeout. Default 10 s (TDR-safe).
+    pub task_timeout_ms: u64,
+    /// Allow GPU execution when system RAM available is below this % (safety).
+    pub min_system_ram_available_percent: f32,
+    /// Persist task history / benchmarks.
+    pub persist_history: bool,
+    /// History retention.
+    pub retention_days: u32,
+    /// Run a quick benchmark when a workload is first used (default true).
+    pub auto_benchmark: bool,
+    /// Validate every GPU result against the CPU reference (default true).
+    pub validate_results: bool,
+    /// Emit `fluxcore-gpu-task` events.
+    pub emit_events: bool,
+}
+impl Default for AccelerationConfig { /* values above */ }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSetting {
+    pub workload_id: String,
+    pub mode: AccelerationMode,     // only Manual is honoured per workload
+    pub backend: BackendKind,       // used when mode == Manual
+    pub enabled: bool,
+    pub selected_size: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePreference { pub provider_id: String, pub device_id: String }
+```
+
+Validation for `update_gpu_resource_config` (mirrors `MemoryEngine::set_config`): percentages in
+`1.0..=90.0`; `vram_budget_cap_mb <= 4096`; `max_gpu_utilization_percent` in `10.0..=100.0`;
+`max_temperature_c` in `40.0..=110.0`; concurrency `1..=2` GPU / `1..=4` CPU; `max_queue_length` `1..=256`;
+`task_timeout_ms` `500..=60000`; `min_system_ram_available_percent` `1.0..=50.0`; `retention_days` `1..=90`.
+Rejected configs return `Err(String)` and leave the stored config untouched.
+
+### 5.5 Resource / safety status
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceBudgetStatus {
+    pub total_vram_bytes: Option<u64>,
+    pub free_vram_bytes: Option<u64>,
+    /// FluxCore's configured ceiling.
+    pub budget_bytes: u64,
+    /// Bytes reserved by running/queued GPU tasks.
+    pub reserved_bytes: u64,
+    /// Bytes currently allocated by our providers.
+    pub allocated_bytes: u64,
+    pub remaining_budget_bytes: u64,
+    pub running_gpu_tasks: usize,
+    pub queued_gpu_tasks: usize,
+    pub max_concurrent_gpu_tasks: usize,
+    pub gpu_utilization_percent: Option<f32>,
+    pub temperature_c: Option<f32>,
+    pub power_watts: Option<f32>,
+    pub safety_level: SafetyLevel,
+    /// Active gates, e.g. "GPU utilisation 91% above limit 85%".
+    pub gates: Vec<String>,
+    pub system_ram_available_percent: Option<f32>,
+}
+```
+
+### 5.6 Benchmarks
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkRequest {
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub warmup_runs: u32,       // clamped 0..=10, default 2
+    pub measured_runs: u32,     // clamped 1..=50, default 5
+    pub validate: bool,         // default true
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingStats {
+    pub runs: u32,
+    pub min_ms: f64,
+    pub median_ms: f64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+    pub stddev_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkComparison {
+    pub cpu: TimingStats,
+    /// Null when the GPU path was unavailable or failed.
+    pub gpu: Option<TimingStats>,
+    pub transfer_ms: Option<f64>,
+    /// gpu_median / cpu_median; null when no GPU run succeeded.
+    pub speedup: Option<f64>,
+    /// Honest verdict string, e.g. "GPU was 1.8x slower at this size".
+    pub verdict: String,
+    pub gpu_available: bool,
+    /// Reason the GPU run was skipped/failed, if so.
+    pub gpu_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkRecord {
+    pub id: i64,
+    pub created_at: String,
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub backend: BackendKind,
+    pub provider_id: String,
+    pub device_id: String,
+    pub cpu: TimingStats,
+    pub gpu: Option<TimingStats>,
+    pub transfer_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub vram_used_bytes: Option<u64>,
+    pub validated: bool,
+    pub max_abs_error: Option<f32>,
+    pub verdict: String,
+    pub environment: AccelerationEnvironment,
+}
+
+/// One row of the comparison table (UI-friendly subset).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkSummary {
+    pub id: i64,
+    pub created_at: String,
+    pub workload_id: String,
+    pub input_size: usize,
+    pub backend: BackendKind,
+    pub cpu_median_ms: f64,
+    pub gpu_median_ms: Option<f64>,
+    pub transfer_ms: Option<f64>,
+    pub speedup: Option<f64>,
+    pub verdict: String,
+}
+```
+
+Benchmark honesty rules (Subagent 6):
+
+- Always run warm-ups; discard them.
+- Report `median` as the headline number; keep `min/mean/max/stddev`.
+- `speedup = cpu_median / gpu_total_median` where `gpu_total` includes transfer + launch. Report `< 1.0`
+  as a slowdown with the same prominence.
+- If the GPU path fails or is unavailable, `gpu: None` + a reason — never fabricate a GPU time.
+- `BenchmarkRecord.environment` records CPU, GPU, driver, wgpu version/backend, CUDA path, OS.
+- Benchmarks run one at a time, are cancellable, and are bounded by `task_timeout_ms` * (warmup + runs).
+
+---
+
+## 6. Command contract (Tauri)
+
+All commands return `Result<T, String>`; `Err` is a user-presentable message (no stack traces).
+All JSON is camelCase via `#[serde(rename_all = "camelCase")]`.
+Command names are exactly the snake_case below; frontend wrappers map 1:1.
+
+| # | Command | Params (Rust) | Returns | Errors |
+| --- | --- | --- | --- | --- |
+| 1 | `get_gpu_acceleration_state` | `state: State<'_, AppState>` | `GpuAccelerationState` | never — degrades to `available:false` + reason when no provider works |
+| 2 | `set_acceleration_mode` | `mode: AccelerationMode` | `GpuAccelerationState` (fresh) | `"unknown mode"` |
+| 3 | `update_gpu_resource_config` | `config: AccelerationConfig` | `AccelerationConfig` (stored) | validation message (see §5.4) |
+| 4 | `get_gpu_resource_config` | — | `AccelerationConfig` | never (defaults on first run) |
+| 5 | `list_gpu_providers` | — | `Vec<ProviderStatus>` | never (unavailable providers are reported, not errors) |
+| 6 | `probe_gpu_providers` | `force: bool` | `CapabilityReport`-lite → `Vec<ProviderStatus>` + `environment` as `GpuAccelerationState`? **Use `Vec<ProviderStatus>`** | never; each provider's failure is in its own `detail` |
+| 7 | `list_supported_workloads` | — | `Vec<WorkloadView>` | never |
+| 8 | `get_workload_recommendations` | `size: Option<usize>`, `workload_id: Option<String>` | `Vec<SuitabilityAssessment>` | `"unknown workload id: …"` |
+| 9 | `submit_workload_task` | `request: SubmitTaskRequest` | `GpuTask` | queue full / unknown workload / unsupported params / GPU disabled when `require_gpu` |
+| 10 | `cancel_task` | `task_id: u64` | `GpuTask` | `"unknown task id: …"` / `"task already finished"` |
+| 11 | `list_tasks` | `limit: Option<usize>`, `status: Option<TaskStatus>` | `Vec<GpuTask>` | never |
+| 12 | `clear_finished_tasks` | — | `usize` (removed count) | never |
+| 13 | `get_task_history` | `limit: Option<usize>`, `workload_id: Option<String>` | `Vec<GpuTask>` (from SQLite) | never |
+| 14 | `run_benchmark` | `request: BenchmarkRequest` | `BenchmarkRecord` | provider/timeout/validation errors |
+| 15 | `get_benchmark_history` | `limit: Option<usize>`, `workload_id: Option<String>` | `Vec<BenchmarkRecord>` | never |
+| 16 | `clear_benchmark_history` | — | `usize` | never |
+| 17 | `get_gpu_environment` | — | `AccelerationEnvironment` | never |
+
+`SubmitTaskRequest`:
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitTaskRequest {
+    pub workload_id: String,
+    pub params: WorkloadParams,
+    pub priority: TaskPriority,
+    /// Force a backend (Manual). `None` = engine decides.
+    pub backend: Option<BackendKind>,
+    /// For benchmark tasks; ordinary tasks ignore it.
+    pub client_ref: Option<String>,
+    /// Reject instead of falling back to CPU when the GPU is requested.
+    pub require_gpu: bool,
+    /// Override the default timeout.
+    pub timeout_ms: Option<u64>,
+}
+```
+
+Behaviour notes:
+
+- `submit_workload_task` never blocks on GPU execution. It validates params against the `WorkloadDef`
+  (size bounds, element counts), runs `profiler::classify` for the assessment, applies `resources`
+  admission, and returns a `Queued`/`Rejected` task.
+- If `mode == CpuOnly` and `require_gpu == true` → `Err("GPU acceleration is disabled")`.
+- If the assessment says `InsufficientGpuResources` and `require_gpu == true` → task `Rejected` with the
+  reason; otherwise it is queued for the CPU path.
+- `cancel_task` on a running task sets the `CancelToken`; the worker returns `Cancelled` at the next
+  cooperative checkpoint. The command returns immediately with `status: Cancelled` once the worker
+  acknowledges (or `Running` with a note when the checkpoint is inside a driver call).
+- `run_benchmark` bypasses the queue but still takes the GPU worker slot; it is subject to the same
+  safety gates and timeout.
+
+Events (Tauri `emit`, only when `emit_events` is true):
+
+- `fluxcore-gpu-task` — payload `GpuTask` (on enqueue, start, progress, finish).
+- `fluxcore-gpu-capabilities` — payload `Vec<ProviderStatus>` (after `probe_gpu_providers` or a change).
+
+`lib.rs` registration (main agent):
+
+```rust
+pub mod gpu_engine;
+struct AppState { engine: Arc<MonitorEngine>, memory: Arc<MemoryEngine>, gpu: Arc<gpu_engine::GpuEngine> }
+// in run(): let gpu = Arc::new(gpu_engine::GpuEngine::new(Arc::clone(&database), Arc::clone(&engine)));
+// .manage(AppState { engine, memory, gpu })
+// .setup(|app| { let s = app.state::<AppState>(); s.engine.set_app_handle(app.handle().clone());
+//                s.gpu.set_app_handle(app.handle().clone()); Ok(()) })
+```
+
