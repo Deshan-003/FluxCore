@@ -35,3 +35,39 @@ impl GpuError {
     pub fn provider(&self) -> &str {
         match self {
             GpuError::DriverUnavailable { provider, .. }
+            | GpuError::InitializationFailed { provider, .. }
+            | GpuError::Unsupported { provider, .. }
+            | GpuError::ResourceExhausted { provider, .. }
+            | GpuError::ExecutionFailed { provider, .. }
+            | GpuError::CorrectnessFailed { provider, .. }
+            | GpuError::Cancelled { provider }
+            | GpuError::Timeout { provider }
+            | GpuError::Internal { provider, .. } => provider,
+        }
+    }
+
+    /// Short machine-readable kind, for logs and UI badges.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            GpuError::DriverUnavailable { .. } => "driver-unavailable",
+            GpuError::InitializationFailed { .. } => "initialization-failed",
+            GpuError::Unsupported { .. } => "unsupported",
+            GpuError::ResourceExhausted { .. } => "resource-exhausted",
+            GpuError::ExecutionFailed { .. } => "execution-failed",
+            GpuError::CorrectnessFailed { .. } => "correctness-failed",
+            GpuError::Cancelled { .. } => "cancelled",
+            GpuError::Timeout { .. } => "timeout",
+            GpuError::Internal { .. } => "internal",
+        }
+    }
+
+    /// True when retrying the same task could plausibly succeed later
+    /// (execution failures, timeouts, transient resource exhaustion).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            GpuError::ExecutionFailed { .. } | GpuError::Timeout { .. } | GpuError::ResourceExhausted { .. }
+        )
+    }
+}
+
