@@ -86,3 +86,92 @@ resolve contract gaps. `models.rs` is a **leaf module**: it may depend only on `
 
 ```rust
 // --- provider-side shared data (from architecture §3.1, MOVED here so providers
+//     and scheduler can both use them without a circular dependency) ---
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind { Cpu, Cuda, Wgpu, Other }
+
+#[derive(Clone, Debug, Serialize, Deserialize)] #[serde(rename_all="camelCase")]
+pub struct GpuDeviceInfo { /* exact §3.1 fields, all public */ }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)] #[serde(rename_all="camelCase")]
+pub struct ProviderCapabilities { /* exact §3.1 fields */ }
+#[derive(Clone, Debug, Serialize, Deserialize)] #[serde(rename_all="camelCase")]
+pub struct WorkloadSupport { pub workload_id: String, pub max_elements: u64, pub notes: Vec<String> }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)] #[serde(rename_all="camelCase")]
+pub struct GpuMemoryInfo { /* exact §3.1 fields */ }
+
+/// Cooperative cancellation, usable by providers without depending on the scheduler.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken { /* Arc<AtomicBool> */ }
+impl CancelToken {
+    pub fn new() -> Self;
+    pub fn cancel(&self);
+    pub fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkloadRequirement {
+    pub workload_id: String,
+    pub input_size: usize,
+    pub device_bytes: u64,
+    pub transfer_bytes: u64,
+    pub timeout: std::time::Duration,
+}
+
+/// The ONLY request object passed into a provider.
+#[derive(Clone, Debug)]
+pub struct ExecutionRequest {
+    pub request_id: u64,
+    pub workload_id: String,
+    pub device_id: String,
+    pub params: WorkloadParams,
+    pub timeout: std::time::Duration,
+    pub cancel: CancelToken,
+    /// When true, GPU providers MUST validate their output against the CPU reference
+    /// and return GpuError::CorrectnessFailed on mismatch.
+    pub validate: bool,
+}
+
+/// REPLACES §3.1's ExecutionOutcome (the three Durations were insufficient for
+/// an honest transfer-in / compute / transfer-out breakdown).
+#[derive(Clone, Debug)]
+pub struct ExecutionOutcome {
+    pub backend: String,          // "cpu" | "cuda" | "wgpu"
+    pub provider_id: String,
+    pub device_id: String,
+    pub timing: TimingBreakdown,  // §5.3
+    pub peak_device_bytes: u64,
+    pub notes: Vec<String>,
+    pub output_digest: String,
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)] #[serde(rename_all="camelCase")]
+pub struct CapabilityReport {
+    pub collected_at: String,
+    pub providers: Vec<ProviderStatus>,
+    pub environment: AccelerationEnvironment,
+    pub notes: Vec<String>,
+}
+
+/// Deterministic input buffers shared by the CPU reference and every GPU provider.
+/// Layout: for axpy x=x, y=y; scale x=x, y=[]; matmul x=A(m*k), y=B(k*n);
+/// row_sum x=A(rows*cols), y=[]. All f32, all row-major.
+#[derive(Clone, Debug)]
+pub struct WorkloadInputs { pub x: Vec<f32>, pub y: Vec<f32> }
+```
+
+`WorkloadParams` MUST implement **all** of the following (this is real logic, not a type stub):
+
+```rust
+impl WorkloadParams {
+    pub fn workload_id(&self) -> &'static str;
+    pub fn input_size(&self) -> usize;
+    pub fn secondary_size(&self) -> Option<usize>;
+    pub fn total_elements(&self) -> u64;
+    pub fn transfer_bytes(&self) -> u64;
+    pub fn device_bytes(&self) -> u64;
+    pub fn work_units(&self) -> f64;
+    pub fn seed(&self) -> u64;
+    pub fn output_len(&self) -> usize;
