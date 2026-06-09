@@ -175,3 +175,91 @@ impl WorkloadParams {
     pub fn work_units(&self) -> f64;
     pub fn seed(&self) -> u64;
     pub fn output_len(&self) -> usize;
+    pub fn make_inputs(&self) -> WorkloadInputs;              // deterministic, bounded values
+    /// CPU reference. `out.len()` must equal `output_len()`.
+    pub fn run_cpu(&self, inputs: &WorkloadInputs, out: &mut [f32]) -> Result<(), String>;
+    /// Returns max absolute error; Err when lengths differ or error > tolerance.
+    /// Tolerance rule: 1e-3 * max(1.0, |reference|) per element (R16).
+    pub fn validate(&self, reference: &[f32], candidate: &[f32], tolerance: f32) -> Result<f32, String>;
+    pub fn digest(&self, values: &[f32]) -> String;           // stable hex of f32 bits
+}
+impl AccelerationConfig { /* Default per §5.4 */ }
+impl AccelerationMode { pub fn as_str(&self) -> &'static str; pub fn parse(&str) -> Option<Self>; }
+impl BackendKind { pub fn as_str(&self) -> &'static str; pub fn parse(&str) -> Option<Self>; }
+```
+
+`WorkloadParams` uses `#[serde(tag="kind", rename_all="camelCase")]` exactly as in §5.3, so the TS
+mirror is a discriminated union on `kind`.
+
+Also provide `pub fn default_params(workload_id: &str, size: usize) -> Option<WorkloadParams>` so the
+frontend and benchmark example can build valid params without duplicating the size catalogue.
+
+## 4. `providers/mod.rs` (Subagent 2) — exact public surface
+
+```rust
+pub use crate::gpu_engine::models::{ /* provider-side types */ };
+pub use crate::gpu_engine::error::{GpuError, GpuResult};
+
+pub trait GpuProvider: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn label(&self) -> &'static str;
+    fn kind(&self) -> ProviderKind;
+    fn initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>>;   // idempotent, <= ~2 s
+    fn is_available(&self) -> bool;
+    fn devices(&self) -> Vec<GpuDeviceInfo>;
+    fn capabilities(&self) -> ProviderCapabilities;
+    fn supported_workloads(&self) -> Vec<WorkloadSupport>;
+    fn memory_info(&self) -> Option<GpuMemoryInfo>;
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()>;
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome>;
+    fn shutdown(&self);
+    fn last_error(&self) -> Option<String>;
+}
+
+/// Constructs CPU + CUDA + wgpu providers (not yet initialized).
+pub fn all_providers() -> Vec<std::sync::Arc<dyn GpuProvider>>;
+/// Calls initialize() on each and returns ALL of them, including unavailable ones
+/// (unavailable providers must still be reported in the UI).
+pub fn initialize_all() -> Vec<std::sync::Arc<dyn GpuProvider>>;
+pub fn backend_for_provider(id: &str) -> BackendKind;
+pub fn provider_for_backend(backend: BackendKind) -> &'static str;
+```
+
+Provider rules: never `unwrap()` a driver call; map every nonzero CUDA/wgpu error to a `GpuError`;
+**never report success for a backend that did not run**; never silently substitute another backend;
+each GPU provider must call `request.params.make_inputs()`, `request.params.run_cpu(...)` (when
+`validate == true`) and `request.params.validate(...)` and return `CorrectnessFailed` with the real
+`max_abs_error` on mismatch. CPU provider sets `validated = false`, `max_abs_error = None`.
+All providers honour `cancel.is_cancelled()` between chunks and honour `request.timeout`.
+
+## 5. `capability.rs` (Subagent 2)
+
+```rust
+pub fn detect_providers(providers: &[std::sync::Arc<dyn GpuProvider>]) -> CapabilityReport;
+pub fn environment(providers: &[std::sync::Arc<dyn GpuProvider>]) -> AccelerationEnvironment;
+pub fn status_of(provider: &dyn GpuProvider) -> ProviderStatus;
+```
+
+`environment()` must record real detected facts only: CUDA toolkit presence via `CUDA_PATH`/`nvcc`
+lookup, `nvcuda.dll`/`nvml.dll` presence, driver version from the CUDA driver API (`cuDriverGetVersion`)
+or NVML when available, OS via `std::env::consts::OS`, CPU name/logical processors/RAM from
+`monitoring::SystemSnapshot` where possible, GPU name/VRAM from the snapshot, Vulkan/DX12 presence as
+`Option`-backed booleans only when actually probed (never hardcoded `true`).
+
+## 6. `resources.rs` (Subagent 4) — exact public surface
+
+```rust
+#[derive(Clone, Debug)]
+pub struct AdmissionDecision { pub allowed: bool, pub reason: Option<String>, pub reserved_bytes: u64 }
+
+pub struct ResourceManager { /* Arc<MonitorEngine>, Mutex<HashMap<u64,u64>> */ }
+impl ResourceManager {
+    pub fn new(monitor: std::sync::Arc<crate::monitoring::MonitorEngine>) -> Self;
+    /// Reads exactly ONE MonitorEngine snapshot. Never spawns a polling thread.
+    pub fn status(&self, config: &AccelerationConfig) -> ResourceBudgetStatus;
+    pub fn budget_bytes(&self, config: &AccelerationConfig) -> u64;
+    pub fn remaining_bytes(&self, config: &AccelerationConfig) -> u64;
+    pub fn gates(&self, config: &AccelerationConfig) -> Vec<String>;
+    /// Checks budget, remaining, safety gates and concurrency. Reserves on success.
+    pub fn admit(&self, task_id: u64, req: &WorkloadRequirement, config: &AccelerationConfig) -> AdmissionDecision;
+    /// Idempotent per task id; a double release must not corrupt accounting.
