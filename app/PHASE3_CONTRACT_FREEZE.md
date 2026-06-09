@@ -352,3 +352,91 @@ attempt, `resources.admit` on submit / `resources.release` on **every** exit pat
 CPU fallback unless `require_gpu`, `observer(&task)` on every state change. Worker calls
 `execution::execute_task(...)` (below). Never blocks a Tauri command.
 
+## 10. `execution.rs` (Subagent 3) — exact public surface
+
+```rust
+/// One task attempt: backend selection, provider dispatch, timing, validation and CPU fallback.
+/// Called ONLY from scheduler worker threads and benchmark.rs. Mutates task fields in place.
+pub fn execute_task(
+    task: &mut GpuTask,
+    providers: &[std::sync::Arc<dyn GpuProvider>],
+    config: &AccelerationConfig,
+    cancel: &CancelToken,
+    require_gpu: bool,
+) -> GpuResult<ExecutionRecord>;
+```
+
+`GpuProvider::execute` already performs correctness validation internally, so `execution.rs` maps
+`ExecutionOutcome` → `ExecutionRecord`, fills `cpu_time_ms` / `gpu_time_ms` / `transfer_time_ms` /
+`total_time_ms` / `speedup` / `vram_used_bytes` / `max_abs_error` / `validated` / `fell_back`, and on
+`ExecutionFailed | ResourceExhausted | CorrectnessFailed | Unsupported | DriverUnavailable` re-runs on
+the CPU provider when `require_gpu == false`. `speedup` is measured CPU-total / GPU-total for the same
+attempt when both timings exist; otherwise `None`. Never fabricate a GPU time.
+
+## 11. `benchmark.rs` (Subagent 6) — exact public surface
+
+```rust
+pub struct BenchmarkContext {
+    pub providers: Vec<std::sync::Arc<dyn GpuProvider>>,
+    pub environment: AccelerationEnvironment,
+    pub config: AccelerationConfig,
+    pub timeout: std::time::Duration,
+    pub cancel: CancelToken,
+    pub preferred_backend: Option<BackendKind>,
+}
+/// Warm-ups discarded, N measured runs, medians, honest verdict. Honours cancel and timeout.
+pub fn run_benchmark(request: &BenchmarkRequest, ctx: &BenchmarkContext) -> Result<BenchmarkRecord, String>;
+/// One timing sample on one backend (used by hot loops and by the standalone example).
+pub fn run_once(provider: &dyn GpuProvider, params: &WorkloadParams, device_id: &str,
+                timeout: std::time::Duration, cancel: &CancelToken, validate: bool)
+    -> GpuResult<ExecutionOutcome>;
+```
+
+`speedup = cpu.median_ms / (gpu.median_ms + transfer_ms)` where `gpu.median_ms` is the GPU *total*
+(end-to-end) median. `gpu: None` + `gpu_unavailable_reason` when no GPU path actually ran. Verdict
+strings must state slowdowns with equal prominence. No benchmark may be invented.
+`examples/gpu_benchmark.rs` calls `providers::initialize_all()` + `run_benchmark` and prints a real
+report; it must work without a Tauri app and without a database.
+
+## 12. `mod.rs` (main agent) — command-facing methods
+
+`GpuEngine::new(db, monitor)`, `set_app_handle`, plus exactly these methods used by `lib.rs`:
+`state()`, `providers()`, `probe(force)`, `config()`, `update_config(config)`, `set_mode(mode)`,
+`workloads()`, `recommendations(size, workload_id)`, `submit(request)`, `cancel(id)`, `list_tasks`,
+`clear_finished()`, `task_history(limit, workload)`, `run_benchmark(request)`,
+`benchmark_history(limit, workload)`, `clear_benchmarks()`, `environment()`.
+
+## 13. Tauri commands (main agent, `lib.rs`) — exact names, camelCase JSON
+
+`get_gpu_acceleration_state`, `set_acceleration_mode`, `get_gpu_resource_config`,
+`update_gpu_resource_config`, `list_gpu_providers`, `probe_gpu_providers`, `list_supported_workloads`,
+`get_workload_recommendations`, `submit_workload_task`, `cancel_task`, `list_tasks`,
+`clear_finished_tasks`, `get_task_history`, `run_benchmark`, `get_benchmark_history`,
+`clear_benchmark_history`, `get_gpu_environment`. All return `Result<T, String>`.
+Events: `fluxcore-gpu-task` (`GpuTask`), `fluxcore-gpu-capabilities` (`Vec<ProviderStatus>`).
+
+## 14. Frontend (Subagent 5) — exact service names
+
+`types/gpu.ts` mirrors §5 + this document verbatim (camelCase, nullable numbers as `number | null`,
+no `any`). `services/gpu.ts` exports the 17 camelCase wrappers matching the commands above plus
+`onGpuTaskEvent`. `stores/gpu.ts` exports `useGpuStore`. `pages/GpuAcceleration.tsx` default-exports
+`GpuAccelerationPage` with tabs `Overview | Workload Intelligence | Acceleration Center | Task Monitor |
+Performance Comparison`. No static/demo metrics in production code; mocks only in `*.test.tsx`.
+`App.tsx` nav wiring is done by the main agent.
+
+## 15. Build / verification commands (main agent)
+
+```
+C:/Users/hdgan/.cargo/bin/cargo.exe check --manifest-path app/src-tauri/Cargo.toml
+C:/Users/hdgan/.cargo/bin/cargo.exe test  --manifest-path app/src-tauri/Cargo.toml
+npm --prefix app run build
+npm --prefix app run test:frontend
+C:/Users/hdgan/.cargo/bin/cargo.exe run --release --manifest-path app/src-tauri/Cargo.toml --example gpu_benchmark
+```
+
+During the parallel implementation wave only Subagent 2 may run `cargo check` (wgpu's first build is
+heavy on this 8 GB machine); all other subagents write code only. The main agent runs the final
+integration build, tests and benchmarks.
+
+---
+_Frozen by the main agent. End of contract._
