@@ -715,3 +715,182 @@ impl WorkloadParams {
         match *self {
             WorkloadParams::VectorAxpy { .. } => "vector_axpy",
             WorkloadParams::VectorScale { .. } => "vector_scale",
+            WorkloadParams::Matmul { .. } => "matmul",
+            WorkloadParams::RowSum { .. } => "row_sum",
+        }
+    }
+
+    /// Primary element count / dimension.
+    pub fn input_size(&self) -> usize {
+        match *self {
+            WorkloadParams::VectorAxpy { n, .. }
+            | WorkloadParams::VectorScale { n, .. } => n,
+            WorkloadParams::Matmul { m, .. } => m,
+            WorkloadParams::RowSum { rows, .. } => rows,
+        }
+    }
+
+    pub fn secondary_size(&self) -> Option<usize> {
+        match *self {
+            WorkloadParams::VectorAxpy { .. }
+            | WorkloadParams::VectorScale { .. } => None,
+            WorkloadParams::Matmul { n, .. } => Some(n),
+            WorkloadParams::RowSum { cols, .. } => Some(cols),
+        }
+    }
+
+    /// (x length, y length, out length) in elements. Saturating products keep
+    /// this panic-free even for hostile, directly-constructed params.
+    fn layout(&self) -> (usize, usize, usize) {
+        match *self {
+            WorkloadParams::VectorAxpy { n, .. } => (n, n, n),
+            WorkloadParams::VectorScale { n, .. } => (n, 0, n),
+            WorkloadParams::Matmul { m, k, n } => (
+                m.saturating_mul(k),
+                k.saturating_mul(n),
+                m.saturating_mul(n),
+            ),
+            WorkloadParams::RowSum { rows, cols } => {
+                (rows.saturating_mul(cols), 0, rows)
+            }
+        }
+    }
+
+    /// Total f32 values across all buffers (inputs + output).
+    pub fn total_elements(&self) -> u64 {
+        let (x, y, out) = self.layout();
+        (x as u64)
+            .saturating_add(y as u64)
+            .saturating_add(out as u64)
+    }
+
+    /// Host<->device bytes, both directions (inputs uploaded + output
+    /// downloaded), 4 bytes per f32.
+    pub fn transfer_bytes(&self) -> u64 {
+        self.total_elements().saturating_mul(4)
+    }
+
+    /// Bytes of all device buffers (inputs + output resident at once).
+    pub fn device_bytes(&self) -> u64 {
+        self.total_elements().saturating_mul(4)
+    }
+
+    pub fn work_units(&self) -> f64 {
+        match *self {
+            WorkloadParams::VectorAxpy { n, .. }
+            | WorkloadParams::VectorScale { n, .. } => n as f64,
+            WorkloadParams::Matmul { m, k, n } => {
+                (m as f64) * (k as f64) * (n as f64)
+            }
+            WorkloadParams::RowSum { rows, cols } => {
+                (rows as f64) * (cols as f64)
+            }
+        }
+    }
+
+    /// Deterministic, non-zero seed derived from the parameters.
+    pub fn seed(&self) -> u64 {
+        let mut h = FNV_OFFSET;
+        match *self {
+            WorkloadParams::VectorAxpy { n, a } => {
+                fnv_mix(&mut h, 1);
+                fnv_mix(&mut h, n as u64);
+                fnv_mix(&mut h, a.to_bits() as u64);
+            }
+            WorkloadParams::VectorScale { n, a } => {
+                fnv_mix(&mut h, 2);
+                fnv_mix(&mut h, n as u64);
+                fnv_mix(&mut h, a.to_bits() as u64);
+            }
+            WorkloadParams::Matmul { m, k, n } => {
+                fnv_mix(&mut h, 3);
+                fnv_mix(&mut h, m as u64);
+                fnv_mix(&mut h, k as u64);
+                fnv_mix(&mut h, n as u64);
+            }
+            WorkloadParams::RowSum { rows, cols } => {
+                fnv_mix(&mut h, 4);
+                fnv_mix(&mut h, rows as u64);
+                fnv_mix(&mut h, cols as u64);
+            }
+        }
+        h | 1
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.layout().2
+    }
+
+    /// Deterministic, bounded input buffers. `x` first, then `y`, on one PRNG
+    /// stream so CPU and GPU see identical bits.
+    pub fn make_inputs(&self) -> WorkloadInputs {
+        let (x_len, y_len, _) = self.layout();
+        let mut rng = XorShift64::new(self.seed());
+        let x = (0..x_len).map(|_| rng.next_f32()).collect::<Vec<f32>>();
+        let y = (0..y_len).map(|_| rng.next_f32()).collect::<Vec<f32>>();
+        WorkloadInputs { x, y }
+    }
+
+    /// CPU reference. `out.len()` must equal `output_len()`; input buffers
+    /// must be at least the expected lengths.
+    pub fn run_cpu(
+        &self,
+        inputs: &WorkloadInputs,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let (x_len, y_len, out_len) = self.layout();
+        if out.len() != out_len {
+            return Err(format!(
+                "output length {} does not match required {}",
+                out.len(),
+                out_len
+            ));
+        }
+        if inputs.x.len() < x_len || inputs.y.len() < y_len {
+            return Err(format!(
+                "input lengths x={} y={} are below required x={} y={}",
+                inputs.x.len(),
+                inputs.y.len(),
+                x_len,
+                y_len
+            ));
+        }
+        let x = &inputs.x[..x_len];
+        let y = &inputs.y[..y_len];
+
+        match *self {
+            WorkloadParams::VectorAxpy { n, a } => {
+                for i in 0..n {
+                    out[i] = a * x[i] + y[i];
+                }
+            }
+            WorkloadParams::VectorScale { n, a } => {
+                for i in 0..n {
+                    out[i] = a * x[i];
+                }
+            }
+            WorkloadParams::Matmul { m, k, n } => {
+                // A = x (m*k), B = y (k*n), out = m*n. Ascending t.
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for t in 0..k {
+                            sum += x[i * k + t] * y[t * n + j];
+                        }
+                        out[i * n + j] = sum;
+                    }
+                }
+            }
+            WorkloadParams::RowSum { rows, cols } => {
+                // A = x (rows*cols). Ascending column accumulation.
+                for i in 0..rows {
+                    let mut sum = 0.0f32;
+                    for c in 0..cols {
+                        sum += x[i * cols + c];
+                    }
+                    out[i] = sum;
+                }
+            }
+        }
+        Ok(())
+    }
