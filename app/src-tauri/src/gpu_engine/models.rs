@@ -177,3 +177,183 @@ pub enum EstimateSource {
 
 // ---------------------------------------------------------------------------
 // §5.1 — capability / provider state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuAccelerationState {
+    pub collected_at: String,
+    pub mode: AccelerationMode,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub providers: Vec<ProviderStatus>,
+    pub workloads: Vec<WorkloadView>,
+    pub resources: ResourceBudgetStatus,
+    pub tasks: Vec<GpuTask>,
+    pub safety_notes: Vec<String>,
+    pub environment: AccelerationEnvironment,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatus {
+    pub id: String,
+    pub label: String,
+    pub kind: ProviderKind,
+    pub available: bool,
+    pub compute_ready: bool,
+    pub detail: String,
+    pub devices: Vec<GpuDeviceInfo>,
+    pub capabilities: ProviderCapabilities,
+    pub supported_workloads: Vec<WorkloadSupport>,
+    pub selected_device: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccelerationEnvironment {
+    pub os_name: String,
+    pub os_version: String,
+    pub cpu_name: String,
+    pub logical_processors: usize,
+    pub system_ram_bytes: u64,
+    pub gpu_name: String,
+    pub gpu_vram_bytes: Option<u64>,
+    pub driver_version: Option<String>,
+    pub cuda_toolkit_present: bool,
+    pub cuda_runtime_api_present: bool,
+    pub cuda_compute_path: String,
+    pub wgpu_version: String,
+    pub wgpu_backend: Option<String>,
+    pub vulkan_present: bool,
+    pub dx12_present: bool,
+    pub recorded_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// §5.2 — workload catalogue and per-workload view
+// ---------------------------------------------------------------------------
+
+/// Immutable description of a supported workload (declared by `profiler`).
+/// Not JSON-facing: it holds `&'static` metadata.
+#[derive(Clone, Debug)]
+pub struct WorkloadDef {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    pub category: &'static str,
+    pub element_type: &'static str,
+    pub sizes: &'static [usize],
+    pub default_size: usize,
+    pub secondary_sizes: &'static [usize],
+    pub memory_formula: &'static str,
+    pub cpu_model: CostModel,
+    pub gpu_model: CostModel,
+    pub beneficial_speedup: f64,
+    pub requires_gpu_path: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CostModel {
+    pub intercept_ns: f64,
+    pub scale_ns_per_unit: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadView {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub category: String,
+    pub sizes: Vec<usize>,
+    pub selected_size: usize,
+    pub mode: AccelerationMode,
+    pub pinned: bool,
+    pub assessment: SuitabilityAssessment,
+    pub last_benchmark: Option<BenchmarkSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuitabilityAssessment {
+    pub workload_id: String,
+    pub input_size: usize,
+    pub secondary_size: Option<usize>,
+    pub classification: Suitability,
+    pub reason: String,
+    pub estimated_cpu_ms: Option<f64>,
+    pub estimated_gpu_ms: Option<f64>,
+    pub estimated_gpu_total_ms: Option<f64>,
+    pub transfer_overhead_ms: Option<f64>,
+    pub transfer_bytes: u64,
+    pub estimated_vram_bytes: u64,
+    pub required_vram_bytes: u64,
+    pub available_vram_bytes: Option<u64>,
+    pub gpu_budget_bytes: u64,
+    pub estimate_source: EstimateSource,
+    pub selected_backend: BackendKind,
+    pub gpu_enabled: bool,
+    pub blockers: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// §5.3 — workload parameters, results, tasks
+// ---------------------------------------------------------------------------
+
+/// Discriminated union on `kind`. The freeze §3 describes this as a single
+/// `#[serde(tag = "kind", rename_all = "camelCase")]` attribute; keeping it
+/// consolidated avoids a duplicate `rename_all` attribute (the architecture
+/// §5.3 showed two attributes carrying the same value).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkloadParams {
+    /// out = a*x + y
+    VectorAxpy { n: usize, a: f32 },
+    /// out = a*x
+    VectorScale { n: usize, a: f32 },
+    /// out = A(m,k) * B(k,n)
+    Matmul { m: usize, k: usize, n: usize },
+    /// out[i] = sum(row i of A(rows, cols))
+    RowSum { rows: usize, cols: usize },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingBreakdown {
+    pub setup_ns: u64,
+    pub transfer_in_ns: u64,
+    pub compute_ns: u64,
+    pub transfer_out_ns: u64,
+    pub validation_ns: u64,
+    pub total_ns: u64,
+    pub transferred_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionRecord {
+    pub backend: BackendKind,
+    pub provider_id: String,
+    pub device_id: String,
+    pub timing: TimingBreakdown,
+    pub peak_vram_bytes: u64,
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuTask {
+    pub id: u64,
+    pub client_ref: Option<String>,
+    pub workload_id: String,
+    pub title: String,
+    pub params: WorkloadParams,
+    pub status: TaskStatus,
+    pub priority: TaskPriority,
+    pub requested_backend: Option<BackendKind>,
+    pub selected_backend: Option<BackendKind>,
+    pub assessment: Option<SuitabilityAssessment>,
