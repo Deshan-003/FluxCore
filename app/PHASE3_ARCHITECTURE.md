@@ -1189,3 +1189,242 @@ if v4_applied == 0 {
          CREATE TABLE IF NOT EXISTS gpu_acceleration_settings (
            id INTEGER PRIMARY KEY CHECK (id=1),
            mode TEXT NOT NULL,
+           payload TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gpu_workload_settings (
+           workload_id TEXT PRIMARY KEY,
+           mode TEXT NOT NULL,
+           backend TEXT NOT NULL,
+           enabled INTEGER NOT NULL,
+           selected_size INTEGER NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gpu_task_history (
+           id INTEGER PRIMARY KEY,
+           task_ref TEXT,
+           workload_id TEXT NOT NULL,
+           backend TEXT NOT NULL,
+           provider_id TEXT NOT NULL,
+           device_id TEXT NOT NULL,
+           status TEXT NOT NULL,
+           priority TEXT NOT NULL,
+           queued_at TEXT NOT NULL,
+           started_at TEXT,
+           finished_at TEXT,
+           duration_ms INTEGER,
+           queue_ms INTEGER,
+           cpu_time_ms REAL,
+           gpu_time_ms REAL,
+           transfer_time_ms REAL,
+           total_time_ms REAL,
+           speedup REAL,
+           vram_used_bytes INTEGER,
+           max_abs_error REAL,
+           validated INTEGER NOT NULL,
+           fell_back INTEGER NOT NULL,
+           error TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_gpu_tasks_finished_at ON gpu_task_history(finished_at);
+         CREATE INDEX IF NOT EXISTS idx_gpu_tasks_workload ON gpu_task_history(workload_id, finished_at);
+         CREATE TABLE IF NOT EXISTS gpu_benchmark_results (
+           id INTEGER PRIMARY KEY,
+           created_at TEXT NOT NULL,
+           workload_id TEXT NOT NULL,
+           workload_params TEXT NOT NULL,
+           backend TEXT NOT NULL,
+           provider_id TEXT NOT NULL,
+           device_id TEXT NOT NULL,
+           warmup_runs INTEGER NOT NULL,
+           measured_runs INTEGER NOT NULL,
+           cpu_min_ms REAL NOT NULL, cpu_median_ms REAL NOT NULL,
+           cpu_mean_ms REAL NOT NULL, cpu_max_ms REAL NOT NULL, cpu_stddev_ms REAL NOT NULL,
+           gpu_min_ms REAL, gpu_median_ms REAL, gpu_mean_ms REAL, gpu_max_ms REAL, gpu_stddev_ms REAL,
+           transfer_ms REAL,
+           speedup REAL,
+           vram_used_bytes INTEGER,
+           validated INTEGER NOT NULL,
+           max_abs_error REAL,
+           verdict TEXT NOT NULL,
+           environment TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_gpu_bench_workload ON gpu_benchmark_results(workload_id, created_at);
+         INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+         COMMIT;"
+    ).map_err(|error| format!("apply database migration 4: {error}"))?;
+}
+```
+
+Retention (in `prune_memory_data`, appended by the main agent, one extra statement):
+
+```rust
+pruned += connection.execute(
+    "DELETE FROM gpu_task_history WHERE finished_at < datetime('now', ?1)
+       AND rowid NOT IN (SELECT rowid FROM gpu_task_history ORDER BY rowid DESC LIMIT 5000)",
+    params![cutoff],
+)?;
+pruned += connection.execute(
+    "DELETE FROM gpu_benchmark_results WHERE created_at < datetime('now', ?1)
+       AND rowid NOT IN (SELECT rowid FROM gpu_benchmark_results ORDER BY rowid DESC LIMIT 2000)",
+    params![cutoff],
+)?;
+```
+
+Rules: `gpu_task_history.id` is SQLite's own id (the in-memory `GpuTask.id` is separate and stored in
+`task_ref`); `workload_params` and `environment` are `serde_json` text; every table is additive; existing
+tables and rows are untouched; migration is idempotent (`INSERT OR IGNORE`, `IF NOT EXISTS`).
+
+`persistence.rs` (Subagent 4) exposes exactly:
+
+```rust
+pub fn record_task(db: &Database, task: &GpuTask) -> Result<i64, String>;
+pub fn recent_tasks(db: &Database, limit: usize, workload: Option<&str>) -> Result<Vec<GpuTask>, String>;
+pub fn record_benchmark(db: &Database, record: &BenchmarkRecord) -> Result<i64, String>;
+pub fn recent_benchmarks(db: &Database, limit: usize, workload: Option<&str>) -> Result<Vec<BenchmarkRecord>, String>;
+pub fn clear_benchmarks(db: &Database) -> Result<usize, String>;
+pub fn save_config(db: &Database, config: &AccelerationConfig) -> Result<(), String>;
+pub fn load_config(db: &Database) -> Result<Option<AccelerationConfig>, String>;
+pub fn save_workload_settings(db: &Database, settings: &[WorkloadSetting]) -> Result<(), String>;
+pub fn load_workload_settings(db: &Database) -> Result<Vec<WorkloadSetting>, String>;
+pub fn upsert_provider(db: &Database, status: &ProviderStatus) -> Result<(), String>;
+pub fn recent_providers(db: &Database) -> Result<Vec<ProviderStatus>, String>;
+```
+
+Config persistence uses the `gpu_acceleration_settings` row (single-row JSON) — the same pattern as
+`optimization_policies`. Frontend preferences that are *not* safety-relevant (selected size, last tab) live
+in localStorage under `fluxcore.gpu.preferences.v1`.
+
+---
+
+## 10. Frontend integration plan
+
+Files owned by Subagent 5. The main agent wires `App.tsx` and the nav only.
+
+```
+app/src/types/gpu.ts        — TS mirrors of every type in §5/§6 (SensorValue-style nullable numbers where
+                              the backend can return null; no `any`).
+app/src/services/gpu.ts     — invoke wrappers:
+                                getGpuAccelerationState, setAccelerationMode, updateGpuResourceConfig,
+                                getGpuResourceConfig, listGpuProviders, probeGpuProviders,
+                                listSupportedWorkloads, getWorkloadRecommendations, submitWorkloadTask,
+                                cancelTask, listTasks, clearFinishedTasks, getTaskHistory, runBenchmark,
+                                getBenchmarkHistory, clearBenchmarkHistory, getGpuEnvironment
+                              + onGpuTaskEvent(): UnlistenFn  (wraps listen('fluxcore-gpu-task'))
+app/src/stores/gpu.ts       — zustand: state/mode/providers/workloads/resources/tasks/benchmarks/
+                              environment/error; refresh(), setMode(), saveConfig(), submit(), cancel(),
+                              clearFinished(), runBenchmark(), probe(); localStorage
+                              'fluxcore.gpu.preferences.v1' for { lastTab, selectedSizes, autoRefresh }.
+                              Mirrors stores/memory.ts (no polling faster than the monitor interval).
+app/src/pages/GpuAcceleration.tsx — tab shell (shadcn Tabs) + 5 views:
+                                Overview | Workload Intelligence | Acceleration Center |
+                                Task Monitor | Performance Comparison
+app/src/components/gpu/GpuStatusCard.tsx        — device info, utilization, VRAM used/available, budget bar
+app/src/components/gpu/BackendBadge.tsx         — cuda/wgpu/cpu/unsupported badge with reason tooltip
+app/src/components/gpu/WorkloadRecommendationRow.tsx — classification pill, reason, estimates, size picker,
+                                                "Run" button
+app/src/components/gpu/TaskMonitorTable.tsx     — task rows (status, backend, progress, timings, error),
+                                                cancel action
+app/src/components/gpu/BenchmarkComparisonChart.tsx — recharts grouped bar: CPU median vs GPU median +
+                                                transfer, speedup label, honest verdict
+app/src/components/gpu/ResourceBudgetPanel.tsx  — budget/reserved/allocated/remaining + safety gates
+app/src/components/gpu/UnsupportedState.tsx     — "No GPU compute backend" empty/unsupported state
+app/src/components/gpu/gpu.test.tsx             — vitest + @testing-library/react (loading/error/empty/
+                                                unsupported/decision rendering)
+```
+
+Design rules: reuse `Panel`, `EmptyState`, `Detail`, `GpuMetric`, `ResourceBar`, `SensorNotice`, `Toggle`,
+`SettingRow` from `components/monitoring` and `components/ui/*`; extend `App.css` with a small
+`gpu-*` section only if existing classes cannot express a view (no new design language). Every number must
+come from the backend; no demo data. Show `—`/`Unavailable` when the backend returns null, never a guessed 0.
+Class names for the new page: `gpu-page`, `gpu-grid`, `gpu-metric`, `gpu-task-table`, `gpu-bench-chart`.
+
+Nav (main agent): `{ label: 'GPU Acceleration', icon: MonitorCog, group: 'GPU INTELLIGENCE' }` and a route
+in `pageContent` → `<GpuAccelerationPage />`. `grouped` array gains `'GPU INTELLIGENCE'`.
+
+Store refresh cadence: refresh on tab focus and every `max(2000, refreshIntervalMs)` while the page is
+visible (same pattern as `MemoryIntelligence`), and immediately on a `fluxcore-gpu-task` event.
+
+---
+
+## 11. Dependencies to add (main agent, `app/src-tauri/Cargo.toml`)
+
+```toml
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["wgsl", "dx12", "vulkan"] }
+# pollster = "1"   # only if the custom block_on in providers/wgpu.rs proves unreliable
+# bytemuck = { version = "1", features = ["derive"] }  # optional, for buffer casts
+
+[dev-dependencies]
+tempfile = "3"      # already present
+```
+
+Notes:
+
+- `libloading` and `windows` are already present; CUDA/NVML FFI needs nothing new.
+- wgpu 30 requires rustc ≥ 1.87 (we have 1.99.1). Expect a long first build on an 8 GB machine
+  (single-digit minutes); keep `default-features = false` to cut build time.
+- Do **not** add `cust`, `cuda-sys`, `rustacuda`, or any crate that needs `nvcc` at build time.
+- No new npm dependencies: recharts, zustand, lucide-react, shadcn/ui are already installed.
+
+---
+
+## 12. Milestones / execution order
+
+| # | Milestone | Owner | Done when |
+| --- | --- | --- | --- |
+| M0 | Contract frozen (this document reviewed by main agent) | Subagent 1 + main | main agent signs off; no open type questions |
+| M1 | `models.rs` + `error.rs` + migration 0004 applied; `gpu_engine` compiles as an empty module registered in `AppState` | Main + Subagent 1 | `cargo check` passes; Phase 1/2 tests green |
+| M2 | Provider trait + CPU provider + registry; all four CPU paths pass correctness tests | Subagent 2 | `cargo test gpu_engine::` green (CPU) |
+| M3 | wgpu provider: device discovery, 4 WGSL kernels, correctness vs CPU | Subagent 2 | `cargo test gpu_engine::providers::wgpu` green on real HW |
+| M4 | CUDA provider: driver API probe, PTX load, axpy + scale kernels, correctness vs CPU; graceful "compute unavailable" when PTX fails | Subagent 2 | state shows `compute_ready` on RTX 2050; or documented unavailable reason |
+| M5 | Profiler + classifier + scheduler + cancellation/timeout/fallback | Subagent 3 | scheduler tests green (auto, cpu-only, insufficient VRAM, cancel, concurrency) |
+| M6 | Resource manager: budget, gates, cleanup, config persistence | Subagent 4 | safety tests green (budget, thermal block, cleanup after error) |
+| M7 | Commands wired into `lib.rs`; state/history/benchmark commands return real data | Main + Subagent 2 | manual `invoke` smoke test via the app |
+| M8 | Frontend page + components + store + vitest | Subagent 5 | `npm run test:frontend` green; page renders real backend data |
+| M9 | Benchmark engine + example + benchmark report | Subagent 6 | `cargo run --release --example gpu_benchmark` produces a real report |
+| M10 | Full test pass, regression (Phase 1/2), docs, production build | Subagent 6 + 7 + main | `npm run build`, `cargo build --release`, all tests green |
+
+Parallelism: M2 → M3/M4 in parallel; M5 and M6 in parallel (different files); M8 can start as soon as M0 is
+signed off, against the frozen types with a mocked service layer (mock only in `*.test.tsx`, never in
+production code). M9 depends on M3/M4.
+
+---
+
+## 13. Risk register
+
+| # | Risk | Likelihood | Impact | Mitigation |
+| --- | --- | --- | --- | --- |
+| R1 | **WDDM TDR** (driver resets after ~2 s GPU hang) during long kernels or benchmark runs | Medium | High | Hard caps on `m,k,n ≤ 2048` and `n ≤ 64 M`; chunked launches (≤ 1 M elements/chunk); per-launch timeout well under TDR; default timeout 10 s enforced by the worker; never run unbounded loops on the GPU |
+| R2 | **4 GB VRAM** exhausted by other apps (browser, games) → allocation failure | High | Medium | Budget = 50 % of dedicated VRAM (2 GB) with a 1 GB cap; check `cuMemGetInfo`/NVML free before launch; `InsufficientGpuResources` with a clear reason; release on every exit path |
+| R3 | **No CUDA toolkit** → PTX authoring errors block the CUDA path | Medium | High | PTX is hand-written for `sm_75` and validated by a unit test that loads every module and asserts launch success; if PTX load fails, the provider reports `Unsupported` with the driver error string and the app still works via wgpu/CPU |
+| R4 | **PTX `sm_75`-only** → future NVIDIA GPUs with different arch still work via driver JIT (PTX is forward-compatible); pre-`sm_75` devices would fail | Low | Medium | Report CC; mark unsupported on CC < 7.5 with a documented reason; wgpu remains the fallback |
+| R5 | **wgpu compile time** on 8 GB RAM / 4-core CPU (single-digit minutes, possible OOM) | Medium | Medium | `default-features = false` (dx12 + vulkan + wgsl only); no `metal`/`gles`/`webgpu`; build once in CI-like step; dev builds incremental afterwards |
+| R6 | **wgpu 30 API drift** (`Instance::new` by value, `PollType::Wait { .. }`) | Medium | Low | Documented exact signatures in §8.3; Subagent 2 verifies with `cargo check` before writing kernels |
+| R7 | **Async/blocking mismatch** — calling `block_on` on the Tauri command thread deadlocks | Medium | High | All GPU work runs on the dedicated worker threads; commands only enqueue/read state; `block_on` is used inside the worker only |
+| R8 | **CUDA + NVML both loaded** causing conflicts (WDDM + primary context) | Low | Medium | CUDA provider creates only a primary context per device, pushes/pops per task, destroys on shutdown; NVML stays read-only telemetry (owned by Phase 1) |
+| R9 | **Double accounting of VRAM** (NVML total includes FluxCore's own allocations) | High | Low | `resources.rs` reports `reserved/allocated` separately from NVML `used`; UI shows "FluxCore budget" and "total GPU usage" as distinct numbers with an explanatory note |
+| R10 | **Incorrect benchmark claims** (reporting speedup without measurement) | Medium | High | `EstimateSource` marks model vs measured; verdict strings are generated from measured medians only; `gpu: None` when the GPU path did not run; docs state limitations |
+| R11 | **Scheduler starvation** of CPU tasks by a flood of GPU tasks | Low | Medium | Separate worker threads and separate concurrency caps; priority queue; benchmark blocks the GPU slot only |
+| R12 | **Frontend/backend type drift** | Medium | Medium | This document is the contract; Subagent 5 writes `types/gpu.ts` from §5 verbatim; main agent runs `tsc -b` in the build step |
+| R13 | **Regression in Phase 1/2** (monitor loop timing, DB lock contention) | Medium | High | GPU engine reads snapshots only; DB access is short and off the monitor thread; Phase 1/2 tests must stay green; GPU history writes are rate-limited (on task finish, not per tick) |
+| R14 | **DB migration failure** leaves the app unable to start | Low | High | Additive DDL only; `INSERT OR IGNORE` / `IF NOT EXISTS`; wrapped in `BEGIN/COMMIT`; test in M1 with a legacy 0001-0003 database (reuse the pattern of `migration_three_preserves_legacy_rows`) |
+| R15 | **Cancellation cannot interrupt a driver call** | Medium | Low | Cooperative checkpoints between chunks; a task stuck in a driver call is reported `Running` until the call returns; the timeout marks it `TimedOut` and releases accounting; provider is marked degraded after repeated stalls |
+| R16 | **`f32` validation tolerance** rejects valid GPU output (different summation order) | Medium | Low | Tolerance = `1e-3 * max(1, |ref|)`; reductions use the same accumulation order per row; matmul compares with a relative tolerance; failures are reported as `CorrectnessFailed` with the actual error, never silently ignored |
+
+---
+
+## 14. Acceptance mapping (requirement → design)
+
+| Requirement (§ of the Phase 3 brief) | Where it is satisfied |
+| --- | --- |
+| Provider abstraction, device discovery, capabilities, cleanup, errors (§3) | `providers/mod.rs` trait, `capability.rs`, `ProviderStatus` |
+| CUDA prioritised, toolkit absence detected (§3, §8) | `providers/cuda.rs`, `AccelerationEnvironment.cuda_*`, `GpuError::DriverUnavailable` |
+| AMD/Intel adapter readiness without false claims (§3) | `ProviderKind::Other` reserved; wgpu covers DX12/Vulkan adapters; no vendor claims beyond tested status |
+| Profiling & classification with reasons (§4) | `profiler.rs`, `SuitabilityAssessment`, six-variant `Suitability` |
+| Real workloads with CPU path, GPU path, validation, timing, transfer (§5) | four workloads, `ExecutionRecord`, `TimingBreakdown`, `validate_results` |
+| Warm-up + N runs, medians, honest speedups (§5, §13) | `benchmark.rs`, `BenchmarkRecord.verdict` |
+| Decision engine + four execution modes (§6) | `AccelerationMode`, `classify()`, `WorkloadSetting` |
+| VRAM management, no RAM claims (§7) | `resources.rs`, `ResourceBudgetStatus`, UI note in `GpuStatusCard` |
+| Configurable limits, concurrency, cancellation, backpressure, cleanup (§9) | `AccelerationConfig`, `scheduler.rs`, `resources.rs` |
+| Reuse Phase 1/2 monitoring (§10) | reads `MonitorEngine::snapshot()`, `MemoryEngine::intelligence()`, NVML only in Phase 1 |
+| SQLite persistence + retention (§11) | migration 0004, `persistence.rs`, `prune_memory_data` |
