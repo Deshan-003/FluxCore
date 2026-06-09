@@ -236,3 +236,242 @@ pub struct ProviderCapabilities {
     pub max_workgroup_size_z: Option<u32>,
     pub max_buffer_bytes: Option<u64>,
     /// Allocation granularity / alignment the provider needs (bytes).
+    pub allocation_alignment: u64,
+    pub backend_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSupport {
+    pub workload_id: String,
+    /// Max element count this provider will attempt for this workload.
+    pub max_elements: u64,
+    /// Extra per-workload notes, e.g. "matmul limited to N<=1024 due to 4 GB VRAM".
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuMemoryInfo {
+    pub total_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    /// Bytes currently reserved by this provider (tracked by resources.rs).
+    pub allocated_bytes: u64,
+}
+
+/// One execution attempt. `request_id` links it to the owning task.
+#[derive(Clone, Debug)]
+pub struct ExecutionRequest {
+    pub request_id: u64,
+    pub workload_id: String,
+    pub device_id: String,
+    pub params: WorkloadParams,
+    pub timeout: Duration,
+    pub cancel: CancelToken,
+}
+
+/// Result of one execution attempt on one backend.
+#[derive(Clone, Debug)]
+pub struct ExecutionOutcome {
+    pub backend: String,
+    /// Provider-reported device time (may be an estimate for CPU).
+    pub device_time: Duration,
+    /// Host<->device transfer time measured around the copies.
+    pub transfer_time: Duration,
+    /// Total wall time inside the provider call.
+    pub total_time: Duration,
+    /// Bytes moved across PCIe (both directions).
+    pub transferred_bytes: u64,
+    /// Peak bytes this execution held on the device (for accounting).
+    pub peak_device_bytes: u64,
+    /// Human-readable notes (e.g. "PTX JIT compiled in 3 ms").
+    pub notes: Vec<String>,
+    /// Serialised output checksum/digest for logging; not used for correctness.
+    pub output_digest: String,
+}
+```
+
+### 3.2 `GpuError` (uniform error reporting)
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GpuError {
+    /// Provider library/driver missing (e.g. nvcuda.dll not found).
+    DriverUnavailable { provider: String, detail: String },
+    /// Driver present but initialization failed (CUDA_ERROR_NO_DEVICE, etc.).
+    InitializationFailed { provider: String, code: Option<i32>, detail: String },
+    /// Device exists but cannot run this workload (CC too low, missing PTX, limits).
+    Unsupported { provider: String, detail: String },
+    /// Allocation or module load failed.
+    ResourceExhausted { provider: String, detail: String },
+    /// Kernel launch / execution error, incl. WDDM TDR (CUDA_ERROR_LAUNCH_TIMEOUT).
+    ExecutionFailed { provider: String, code: Option<i32>, detail: String },
+    /// Output did not match the CPU reference within tolerance.
+    CorrectnessFailed { provider: String, max_abs_error: f64, tolerance: f64 },
+    /// Task cancelled by the user or by timeout.
+    Cancelled { provider: String },
+    /// Timeout expired while waiting for the device.
+    Timeout { provider: String },
+    /// Anything else; keep `detail` user-presentable.
+    Internal { provider: String, detail: String },
+}
+```
+
+Rules for providers: never `unwrap()` on driver calls; map every nonzero CUDA/NVML return code to a
+`GpuError`; never report success for a backend that did not actually run; never silently substitute another
+backend — substitution is the scheduler's job (§7).
+
+---
+
+## 4. File ownership map
+
+`app/src-tauri/src/gpu_engine/` (new directory; every file owned by exactly one agent, except where noted).
+
+| File | Owner | Contents | Depends on |
+| --- | --- | --- | --- |
+| `gpu_engine/mod.rs` | **Main agent** (integration) | `GpuEngine` struct, `new()`, `set_app_handle`, config get/set, state assembly (`GpuAccelerationState`), history/benchmark read APIs, `Drop`. Re-exports. | all |
+| `gpu_engine/models.rs` | **Subagent 1 (contract)** | Every type in §5, §6, §7, §8. No logic beyond `Default`/`as_str`. | serde, chrono |
+| `gpu_engine/error.rs` | Subagent 1 (contract) | `GpuError` + `GpuResult<T>` + `From<GpuError> for String`. | serde |
+| `gpu_engine/capability.rs` | Subagent 2 | Provider discovery, `CapabilityReport` assembly, environment record (driver/toolkit/OS), `detect_providers()`. | providers, models |
+| `gpu_engine/providers/mod.rs` | Subagent 2 | `GpuProvider` trait, shared helpers (`round_up`, `align`, `div_ceil`), registry `all_providers()`. | models, error |
+| `gpu_engine/providers/cpu.rs` | Subagent 2 | `CpuProvider`: reference implementations of all workloads, single-threaded and rayon-free. | models, error |
+| `gpu_engine/providers/cuda.rs` | Subagent 2 | CUDA driver API FFI (`nvcuda.dll`), embedded PTX kernels, module load, launch, buffers, `cuMemGetInfo_v2`. | models, error |
+| `gpu_engine/providers/wgpu.rs` | Subagent 2 | wgpu 30 instance/adapter/device, WGSL kernels, buffer upload/download, `block_on`. | models, error |
+| `gpu_engine/resources.rs` | **Subagent 4** | `ResourceManager`: budget accounting, thermal/power/utilisation gates, `AdmissionDecision`. | models, monitoring, database |
+| `gpu_engine/profiler.rs` | **Subagent 3** | `WorkloadDef`, `WorkloadRegistry`, cost models, `classify()` -> `SuitabilityAssessment`. | models, capability |
+| `gpu_engine/scheduler.rs` | **Subagent 3** | Queue, priorities, concurrency, cancellation, timeout, backpressure, worker threads, `CancelToken`. | models, resources, execution |
+| `gpu_engine/execution.rs` | **Subagent 2 + 3** (shared) | Task lifecycle, backend selection, run + validate + time, fallback, `GpuTask` transitions, event emission. | providers, profiler, resources, benchmark, persistence |
+| `gpu_engine/benchmark.rs` | **Subagent 6** | `BenchmarkPlan`/`BenchmarkReport`, warm-up, N runs, median, honest speedup, env record. | providers, execution |
+| `gpu_engine/persistence.rs` | **Subagent 4** | Thin wrappers around `Database` for migration 0004 (records, pruning, provider cache). | models, database |
+| `app/src-tauri/src/database.rs` | **Main agent** | Migration 0004 DDL + Phase 3 read/write methods (one block appended; no edits to existing SQL). | models |
+| `app/src-tauri/src/lib.rs` | **Main agent** | `pub mod gpu_engine;`, `AppState.gpu`, ~14 commands, `generate_handler!`. | gpu_engine |
+| `app/src/types/gpu.ts` | **Subagent 5** | TS mirrors of all camelCase JSON. | — |
+| `app/src/services/gpu.ts` | Subagent 5 | invoke wrappers + `listen('fluxcore-gpu-task')` helper. | types |
+| `app/src/stores/gpu.ts` | Subagent 5 | zustand store + localStorage `fluxcore.gpu.preferences.v1`. | services, types |
+| `app/src/pages/GpuAcceleration.tsx` + `app/src/components/gpu/*.tsx` | Subagent 5 | 5 views, loading/error/empty/unsupported states. | stores, ui, recharts |
+| `app/src/App.tsx` | **Main agent** | nav entry `{ label: 'GPU Acceleration', icon: MonitorCog, group: 'GPU INTELLIGENCE' }` + route. | page |
+| `app/src-tauri/Cargo.toml` | **Main agent** | deps (§11). | — |
+| `app/src-tauri/migrations/0004_gpu_acceleration.sql` | Subagent 4 (author) / Main (apply) | DDL text. **Not auto-loaded by database.rs** — pasted into `open_at` by main agent. | — |
+| `app/src-tauri/tests/gpu_*.rs` | **Subagent 6** | Integration tests. | all |
+| `app/src-tauri/examples/gpu_benchmark.rs` | Subagent 6 | `cargo run --release --example gpu_benchmark`. | gpu_engine |
+| Docs `PHASE3_IMPLEMENTATION.md`, `GPU_COMPATIBILITY.md`, `GPU_ACCELERATION_GUIDE.md`, `GPU_SAFETY.md`, `PHASE3_TEST_REPORT.md` | Subagent 7 | — | — |
+
+No two agents edit the same file. The only shared file, `gpu_engine/execution.rs`, is split by function:
+Subagent 2 owns provider dispatch and timing; Subagent 3 owns decision/fallback control flow. They must
+coordinate the `run_task()` signature before coding (see §8.4) — the main agent arbitrates.
+
+---
+
+## 5. Shared model contract — `gpu_engine/models.rs`
+
+```rust
+use serde::{Deserialize, Serialize};
+
+/// Execution mode, persisted. Mirrors Phase 2's `OptimizationMode` style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccelerationMode {
+    /// Every workload runs on the CPU. GPU is still monitored.
+    CpuOnly,
+    /// Supported workloads run on the GPU when it is available and safe.
+    GpuAcceleration,
+    /// The engine decides per workload from size/benchmark data (default).
+    IntelligentAuto,
+    /// The user picks the backend per workload (`WorkloadSetting.mode`).
+    Manual,
+}
+impl Default for AccelerationMode { fn default() -> Self { AccelerationMode::IntelligentAuto } }
+impl AccelerationMode { pub fn as_str(&self) -> &'static str { /* "cpuOnly" | ... */ } }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendKind { Cpu, Cuda, Wgpu }
+
+impl BackendKind {
+    pub fn as_str(&self) -> &'static str { /* "cpu" | "cuda" | "wgpu" */ }
+    pub fn parse(value: &str) -> Option<BackendKind> { /* inverse */ }
+}
+
+/// Result of the CPU-vs-GPU decision for one workload at one input size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Suitability {
+    GpuRecommended,
+    CpuRecommended,
+    GpuAvailableNotBeneficial,
+    InsufficientGpuResources,
+    UnsupportedWorkload,
+    AccelerationUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskStatus { Queued, Running, Succeeded, Failed, Cancelled, TimedOut, Rejected }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskPriority { Low, Normal, High }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SafetyLevel { Ok, Caution, Blocked }
+```
+
+### 5.1 Capability / provider state
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuAccelerationState {
+    pub collected_at: String,
+    pub mode: AccelerationMode,
+    /// Top-level verdict for the UI banner.
+    pub available: bool,
+    /// Null when acceleration is available; otherwise a user-presentable reason.
+    pub unavailable_reason: Option<String>,
+    pub providers: Vec<ProviderStatus>,
+    /// Workload catalogue with live recommendations and per-workload settings.
+    pub workloads: Vec<WorkloadView>,
+    pub resources: ResourceBudgetStatus,
+    pub tasks: Vec<GpuTask>,
+    pub safety_notes: Vec<String>,
+    pub environment: AccelerationEnvironment,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatus {
+    pub id: String,                  // "cuda" | "wgpu" | "cpu"
+    pub label: String,
+    pub kind: ProviderKind,
+    pub available: bool,
+    pub compute_ready: bool,
+    /// User-presentable explanation when not available/ready.
+    pub detail: String,
+    pub devices: Vec<GpuDeviceInfo>,
+    pub capabilities: ProviderCapabilities,
+    pub supported_workloads: Vec<WorkloadSupport>,
+    /// Selected device for this provider ("" when none).
+    pub selected_device: String,
+    /// Errors observed during the last probe.
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccelerationEnvironment {
+    pub os_name: String,
+    pub os_version: String,
+    pub cpu_name: String,
+    pub logical_processors: usize,
+    pub system_ram_bytes: u64,
+    pub gpu_name: String,
+    pub gpu_vram_bytes: Option<u64>,
+    pub driver_version: Option<String>,
+    pub cuda_toolkit_present: bool,
+    pub cuda_runtime_api_present: bool,
+    /// e.g. "CUDA driver API via nvcuda.dll (no toolkit)".
+    pub cuda_compute_path: String,
+    pub wgpu_version: String,
