@@ -1074,3 +1074,182 @@ mod tests {
         let s = WorkloadParams::VectorScale { n: 8, a: 2.0 };
         assert!(s.make_inputs().y.is_empty());
         let r = WorkloadParams::RowSum { rows: 4, cols: 4 };
+        assert!(r.make_inputs().y.is_empty());
+        // Different params produce different data (seed depends on `a`).
+        let q = WorkloadParams::VectorAxpy { n: 64, a: 2.5 };
+        assert_ne!(a.x, q.make_inputs().x);
+    }
+
+    #[test]
+    fn validate_accepts_and_rejects() {
+        let p = WorkloadParams::VectorScale { n: 4, a: 2.0 };
+        let reference = vec![1.0f32, 2.0, 3.0, 4.0];
+
+        let good = vec![1.0f32 + 1.0e-4, 2.0, 3.0, 4.0];
+        let err = p.validate(&reference, &good, 0.0).unwrap();
+        assert!(err <= 1.0e-3);
+
+        let bad = vec![1.0f32, 2.0, 3.0, 100.0];
+        assert!(p.validate(&reference, &bad, 0.0).is_err());
+
+        assert!(p.validate(&reference, &[1.0f32, 2.0], 0.0).is_err());
+
+        let nan = vec![1.0f32, f32::NAN, 3.0, 4.0];
+        assert!(p.validate(&reference, &nan, 0.0).is_err());
+
+        // A larger explicit tolerance admits a larger error.
+        let loose = vec![1.0f32, 2.0, 3.0, 4.5];
+        assert!(p.validate(&reference, &loose, 1.0).is_ok());
+        assert!(p.validate(&reference, &loose, 0.0).is_err());
+    }
+
+    #[test]
+    fn digest_is_stable() {
+        let p = WorkloadParams::VectorScale { n: 3, a: 2.0 };
+        let values = vec![1.0f32, -2.5, 0.0];
+        let d1 = p.digest(&values);
+        let d2 = p.digest(&values);
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 16);
+        assert!(d1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(d1, p.digest(&[1.0f32, -2.5, 0.001]));
+        // Bit-level: -0.0 and 0.0 hash differently.
+        assert_ne!(p.digest(&[0.0f32]), p.digest(&[-0.0f32]));
+    }
+
+    #[test]
+    fn workload_params_serde_tagged_roundtrip() {
+        let cases = vec![
+            WorkloadParams::VectorAxpy { n: 8, a: 1.5 },
+            WorkloadParams::VectorScale { n: 16, a: 2.0 },
+            WorkloadParams::Matmul { m: 4, k: 4, n: 4 },
+            WorkloadParams::RowSum { rows: 8, cols: 8 },
+        ];
+        for p in cases {
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(json.contains("\"kind\":"), "missing tag: {json}");
+            let back: WorkloadParams = serde_json::from_str(&json).unwrap();
+            assert_eq!(p, back);
+        }
+        let axpy =
+            serde_json::to_string(&WorkloadParams::VectorAxpy { n: 1, a: 1.5 }).unwrap();
+        assert!(axpy.contains("\"kind\":\"vectorAxpy\""), "unexpected: {axpy}");
+        let rs =
+            serde_json::to_string(&WorkloadParams::RowSum { rows: 1, cols: 1 }).unwrap();
+        assert!(rs.contains("\"kind\":\"rowSum\""), "unexpected: {rs}");
+    }
+
+    #[test]
+    fn default_params_catalogue_and_arbitrary() {
+        const K: usize = 1024;
+        const M: usize = 1024 * 1024;
+        for &size in &[64 * K, 256 * K, M, 4 * M, 16 * M] {
+            let axpy = default_params("vector_axpy", size).unwrap();
+            assert_eq!(axpy.workload_id(), "vector_axpy");
+            assert_eq!(axpy.input_size(), size);
+            assert!(matches!(
+                axpy,
+                WorkloadParams::VectorAxpy { a, .. } if a == 1.5
+            ));
+            let scale = default_params("vector_scale", size).unwrap();
+            assert!(matches!(
+                scale,
+                WorkloadParams::VectorScale { a, .. } if a == 2.0
+            ));
+        }
+        for &size in &[256usize, 512, 1024] {
+            let p = default_params("matmul", size).unwrap();
+            assert_eq!(p.workload_id(), "matmul");
+            assert_eq!(p.input_size(), size);
+            assert_eq!(p.secondary_size(), Some(size));
+            assert!(matches!(
+                p,
+                WorkloadParams::Matmul { m, k, n }
+                    if m == size && k == size && n == size
+            ));
+        }
+        let rs = default_params("row_sum", 1024).unwrap();
+        assert!(matches!(
+            rs,
+            WorkloadParams::RowSum { rows: 1024, cols: 1024 }
+        ));
+        assert_eq!(rs.input_size(), 1024);
+        assert_eq!(rs.secondary_size(), Some(1024));
+
+        // Arbitrary smaller positive sizes.
+        assert!(matches!(
+            default_params("vector_axpy", 1024),
+            Some(WorkloadParams::VectorAxpy { n: 1024, .. })
+        ));
+        assert!(matches!(
+            default_params("matmul", 32),
+            Some(WorkloadParams::Matmul { m: 32, k: 32, n: 32 })
+        ));
+        assert!(matches!(
+            default_params("row_sum", 128),
+            Some(WorkloadParams::RowSum { rows: 128, cols: 128 })
+        ));
+
+        // Rejections.
+        assert!(default_params("unknown_id", 100).is_none());
+        assert!(default_params("vector_axpy", 0).is_none());
+        assert!(default_params("matmul", 0).is_none());
+        assert!(default_params("vector_axpy", 64 * M + 1).is_none());
+        assert!(default_params("matmul", 2049).is_none());
+        assert!(default_params("row_sum", 6000).is_none()); // 36M > 32M cap
+    }
+
+    #[test]
+    fn byte_accounting_is_consistent() {
+        let cases = vec![
+            WorkloadParams::VectorAxpy { n: 1024, a: 1.5 },
+            WorkloadParams::VectorScale { n: 1024, a: 2.0 },
+            WorkloadParams::Matmul { m: 32, k: 32, n: 32 },
+            WorkloadParams::RowSum { rows: 64, cols: 32 },
+        ];
+        for p in cases {
+            assert_eq!(p.transfer_bytes(), p.device_bytes());
+            assert_eq!(p.transfer_bytes(), p.total_elements() * 4);
+            assert!(p.transfer_bytes() > 0);
+            assert!((p.output_len() as u64) * 4 <= p.device_bytes());
+        }
+        let axpy = WorkloadParams::VectorAxpy { n: 10, a: 1.0 };
+        assert_eq!(axpy.total_elements(), 30); // x + y + out
+        assert_eq!(axpy.device_bytes(), 120);
+        let scale = WorkloadParams::VectorScale { n: 10, a: 1.0 };
+        assert_eq!(scale.total_elements(), 20); // x + out (y empty)
+        assert_eq!(scale.device_bytes(), 80);
+        assert!(scale.make_inputs().y.is_empty());
+    }
+
+    #[test]
+    fn cancel_token_is_shared_and_cooperative() {
+        let token = CancelToken::new();
+        assert!(!token.is_cancelled());
+        let clone = token.clone();
+        clone.cancel();
+        assert!(token.is_cancelled());
+        assert!(!CancelToken::default().is_cancelled());
+    }
+
+    #[test]
+    fn mode_and_backend_as_str_parse_roundtrip() {
+        for mode in [
+            AccelerationMode::CpuOnly,
+            AccelerationMode::GpuAcceleration,
+            AccelerationMode::IntelligentAuto,
+            AccelerationMode::Manual,
+        ] {
+            assert_eq!(AccelerationMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(AccelerationMode::default(), AccelerationMode::IntelligentAuto);
+        assert_eq!(AccelerationMode::parse("bogus"), None);
+        for backend in [BackendKind::Cpu, BackendKind::Cuda, BackendKind::Wgpu] {
+            assert_eq!(BackendKind::parse(backend.as_str()), Some(backend));
+        }
+        assert_eq!(BackendKind::parse("cuda"), Some(BackendKind::Cuda));
+        assert_eq!(BackendKind::parse("bogus"), None);
+    }
+}
