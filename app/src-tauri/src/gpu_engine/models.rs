@@ -894,3 +894,183 @@ impl WorkloadParams {
         }
         Ok(())
     }
+
+    /// Returns max absolute error; Err on length mismatch, non-finite values,
+    /// or error > max(1e-3 * max(1, |reference|), tolerance) per element.
+    pub fn validate(
+        &self,
+        reference: &[f32],
+        candidate: &[f32],
+        tolerance: f32,
+    ) -> Result<f32, String> {
+        if reference.len() != candidate.len() {
+            return Err(format!(
+                "output length mismatch: reference {} values, candidate {} values",
+                reference.len(),
+                candidate.len()
+            ));
+        }
+        let tol = if tolerance.is_finite() && tolerance >= 0.0 {
+            tolerance
+        } else {
+            0.0
+        };
+        let mut max_err = 0.0f32;
+        for (i, (&r, &c)) in reference.iter().zip(candidate.iter()).enumerate() {
+            if !r.is_finite() || !c.is_finite() {
+                return Err(format!(
+                    "non-finite value at element {i}: reference {r}, candidate {c}"
+                ));
+            }
+            let err = (r - c).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            let allowed = (1.0e-3f32 * r.abs().max(1.0f32)).max(tol);
+            if err > allowed {
+                return Err(format!(
+                    "correctness check failed at element {i}: |{r} - {c}| = {err:.6} exceeds tolerance {allowed:.6}"
+                ));
+            }
+        }
+        Ok(max_err)
+    }
+
+    /// Stable FNV-1a over `f32::to_bits()`, 16 lowercase hex chars.
+    pub fn digest(&self, values: &[f32]) -> String {
+        let mut h = FNV_OFFSET;
+        for &v in values {
+            for byte in v.to_bits().to_le_bytes() {
+                fnv_mix(&mut h, byte as u64);
+            }
+        }
+        format!("{:016x}", h)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free function — build valid params from a workload id + size.
+// ---------------------------------------------------------------------------
+
+/// Build `WorkloadParams` from §7.1's catalogue. Also accepts arbitrary
+/// smaller positive sizes (matmul -> (size,size,size), row_sum -> (size,size)).
+/// Returns `None` for unknown ids, zero size, or sizes above the hard caps.
+pub fn default_params(workload_id: &str, size: usize) -> Option<WorkloadParams> {
+    if size == 0 {
+        return None;
+    }
+    const VECTOR_MAX: usize = 64 * 1024 * 1024;
+    const MATMUL_MAX: usize = 2048;
+    const ROW_SUM_MAX_ELEMENTS: u64 = 32 * 1024 * 1024;
+
+    match workload_id {
+        "vector_axpy" => {
+            if size > VECTOR_MAX {
+                return None;
+            }
+            Some(WorkloadParams::VectorAxpy { n: size, a: 1.5f32 })
+        }
+        "vector_scale" => {
+            if size > VECTOR_MAX {
+                return None;
+            }
+            Some(WorkloadParams::VectorScale { n: size, a: 2.0f32 })
+        }
+        "matmul" => {
+            if size > MATMUL_MAX {
+                return None;
+            }
+            Some(WorkloadParams::Matmul {
+                m: size,
+                k: size,
+                n: size,
+            })
+        }
+        "row_sum" => {
+            // Square (size,size). §7.1's square entries (1024,1024) and
+            // (4096,4096) fall out naturally; the wide (4096,1024) entry is
+            // reachable via an explicit `WorkloadParams::RowSum` (see report).
+            let (rows, cols) = (size, size);
+            if (rows as u64).saturating_mul(cols as u64) > ROW_SUM_MAX_ELEMENTS {
+                return None;
+            }
+            Some(WorkloadParams::RowSum { rows, cols })
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_vector_paths() {
+        let axpy = WorkloadParams::VectorAxpy { n: 4, a: 1.5 };
+        let inputs = WorkloadInputs {
+            x: vec![1.0, 2.0, 3.0, 4.0],
+            y: vec![0.5, 0.5, 0.5, 0.5],
+        };
+        let mut out = vec![0.0f32; 4];
+        axpy.run_cpu(&inputs, &mut out).unwrap();
+        assert_eq!(out, vec![2.0, 3.5, 5.0, 6.5]);
+
+        let scale = WorkloadParams::VectorScale { n: 4, a: 2.0 };
+        let inputs2 = WorkloadInputs {
+            x: vec![1.0, -2.0, 3.0, 0.0],
+            y: vec![],
+        };
+        let mut out2 = vec![0.0f32; 4];
+        scale.run_cpu(&inputs2, &mut out2).unwrap();
+        assert_eq!(out2, vec![2.0, -4.0, 6.0, 0.0]);
+
+        // Wrong output length is an error, not a panic.
+        let mut too_short = vec![0.0f32; 2];
+        assert!(scale.run_cpu(&inputs2, &mut too_short).is_err());
+    }
+
+    #[test]
+    fn cpu_matrix_paths() {
+        // 2x2 * 2x2, ascending t accumulation.
+        let mm = WorkloadParams::Matmul { m: 2, k: 2, n: 2 };
+        let inputs = WorkloadInputs {
+            x: vec![1.0, 2.0, 3.0, 4.0], // A = [[1,2],[3,4]]
+            y: vec![5.0, 6.0, 7.0, 8.0], // B = [[5,6],[7,8]]
+        };
+        let mut out = vec![0.0f32; 4];
+        mm.run_cpu(&inputs, &mut out).unwrap();
+        assert_eq!(out, vec![19.0, 22.0, 43.0, 50.0]);
+
+        // 2x3 row-sum, ascending column accumulation.
+        let rs = WorkloadParams::RowSum { rows: 2, cols: 3 };
+        let inputs2 = WorkloadInputs {
+            x: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            y: vec![],
+        };
+        let mut out2 = vec![0.0f32; 2];
+        rs.run_cpu(&inputs2, &mut out2).unwrap();
+        assert_eq!(out2, vec![6.0, 15.0]);
+        assert_eq!(rs.output_len(), 2);
+    }
+
+    #[test]
+    fn make_inputs_is_deterministic() {
+        let p = WorkloadParams::VectorAxpy { n: 64, a: 1.5 };
+        let a = p.make_inputs();
+        let b = p.make_inputs();
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.y, b.y);
+        assert_eq!(a.x.len(), 64);
+        assert_eq!(a.y.len(), 64);
+        for &v in a.x.iter().chain(a.y.iter()) {
+            assert!(v.is_finite());
+            assert!(v >= -1.0 && v < 1.0, "value out of range: {v}");
+        }
+        // Scale and row-sum have an empty y buffer.
+        let s = WorkloadParams::VectorScale { n: 8, a: 2.0 };
+        assert!(s.make_inputs().y.is_empty());
+        let r = WorkloadParams::RowSum { rows: 4, cols: 4 };
