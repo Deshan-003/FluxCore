@@ -29,3 +29,35 @@ present, **no CUDA toolkit / no nvcc / no CUDA_PATH**.
 block=1. Handles are stored as `usize` so the driver state is `Send` behind a
 `Mutex` (required by `Arc<dyn GpuProvider>`). **No NVML calls** (Phase 1 owns
 telemetry). A single primary context on device 0 is retained; it is re-set
+current per worker thread at execute time (CUDA contexts are per-thread).
+
+## PTX kernels
+
+All four are embedded with `include_str!("../../../ptx/*.ptx")` (three `..`
+levels from `providers/` — verified by rustc). Each is passed to
+`cuModuleLoadData` as a NUL-terminated string and JIT-compiled by the driver:
+- `axpy` — `out=a*x+y`, non-fused `mul.f32`/`add.f32` to match CPU.
+- `scale` — `out=a*x`.
+- `matmul` — 2D grid (no integer division), ascending-`t` accumulation.
+- `rowsum` — one thread per row, ascending-column accumulation.
+
+**Which ones "load":** at `initialize()` the provider attempts all four. A
+workload is added to `supported_workloads()` **only if its module actually
+loads**; a failure is recorded as an honest `GpuError::Unsupported` reason from
+`cuGetErrorString` and never advertised. This is verified at runtime on the
+target GPU, not here. Vector launches are chunked to ≤1,000,000 elements with a
+cancel/timeout checkpoint between chunks (TDR safety).
+
+## WGSL kernels
+
+All four compiled at `initialize()` with `create_shader_module` +
+`create_compute_pipeline` behind one shared bind-group layout
+(binding 0 `x` read-storage, 1 `y` read-storage, 2 `out` read-write storage,
+3 `Params` uniform: `p0,p1,p2:u32, a:f32`, 16 bytes). Only pipelines that
+compile without an uncaptured validation error are advertised. An
+`on_uncaptured_error` handler captures validation/device-loss text instead of
+panicking; a real error drops the device so the next attempt re-initialises.
+Readback uses callback-based `map_async` + bounded
+`device.poll(PollType::Wait { submission_index, timeout })`, per wgpu 30.
+
+## What was actually verified
