@@ -951,3 +951,241 @@ struct AppState { engine: Arc<MonitorEngine>, memory: Arc<MemoryEngine>, gpu: Ar
 //                s.gpu.set_app_handle(app.handle().clone()); Ok(()) })
 ```
 
+---
+
+## 7. Decision engine, profiler and scheduler
+
+### 7.1 Workload registry (fixed set for Phase 3)
+
+| id | Title | Params | Sizes (elements) | GPU path |
+| --- | --- | --- | --- | --- |
+| `vector_axpy` | Vector AXPY | `n`, `a` | 64 K, 256 K, 1 M, 4 M, 16 M | CUDA PTX + WGSL |
+| `vector_scale` | Vector scale | `n`, `a` | 64 K, 256 K, 1 M, 4 M, 16 M | CUDA PTX + WGSL |
+| `matmul` | Matrix multiply (naive) | `m,k,n` | (256,256,256), (512,512,512), (1024,1024,1024) | CUDA PTX + WGSL |
+| `row_sum` | Row-wise reduction | `rows`, `cols` | (1024,1024), (4096,1024), (4096,4096) | CUDA PTX + WGSL |
+
+Caps (enforced by providers and profiler):
+
+- `vector_*`: `n <= 64 * 1024 * 1024` elements (256 MB per buffer at f32; 3 buffers = 768 MB > 4 GB budget
+  minus reserve, so `resources` will usually reject the top size on a 4 GB card).
+- `matmul`: `m,k,n <= 2048`; naive `O(n^3)` so 1024³ is the practical default max; providers reject
+  above 2048 to keep kernel time under the TDR window.
+- `row_sum`: `rows*cols <= 32 * 1024 * 1024`.
+
+### 7.2 Classification (decision order, first match wins)
+
+```
+1. workload id not in registry                 -> UnsupportedWorkload   ("no implementation registered")
+2. mode == CpuOnly                             -> CpuRecommended      ("GPU acceleration is disabled")
+3. no provider with compute_ready              -> AccelerationUnavailable ("no GPU compute backend is usable: <reason>")
+4. no provider implements this workload        -> UnsupportedWorkload  ("CUDA does not implement matmul")
+5. required_vram > remaining budget            -> InsufficientGpuResources ("needs 384 MB, budget leaves 210 MB")
+6. provider memory_info free < required        -> InsufficientGpuResources ("GPU reports 120 MB free")
+7. safety gate blocks (temp/power/util/ram)    -> InsufficientGpuResources? NO -> GpuAvailableNotBeneficial
+                                                  with blockers[] and reason "thermal/power gate: ..."
+8. estimated_gpu_total_ms * beneficial_speedup >= estimated_cpu_ms
+                                                -> CpuRecommended / GpuAvailableNotBeneficial
+                                                  ("transfer + launch overhead dominates at 64 K elements")
+9. otherwise                                   -> GpuRecommended
+```
+
+`GpuAvailableNotBeneficial` vs `CpuRecommended`: use `CpuRecommended` when the mode is `CpuOnly` or the
+user pinned the CPU; use `GpuAvailableNotBeneficial` when the GPU is usable but the model/measurements say
+it would not pay off. Both carry a `reason` string.
+
+`AccelerationUnavailable` is reserved for "no compute backend at all" — the GPU is still monitored.
+
+### 7.3 Cost model
+
+Per workload, `work_units` is chosen so the model is linear:
+
+- `vector_*`: `work_units = n` (bytes moved = `n*4*3` for axpy, `n*4*2` for scale).
+- `matmul`: `work_units = m*k*n` (FLOPs ≈ `2*m*k*n`).
+- `row_sum`: `work_units = rows*cols`.
+
+Estimates:
+
+```
+cpu_ms     = cpu_model.intercept_ms + cpu_model.scale_ms_per_unit * work_units
+gpu_ms     = gpu_model.intercept_ms + gpu_model.scale_ms_per_unit * work_units
+transfer_ms = transfer_bytes / PCIe_BW_BYTES_PER_MS   (default 10_000 MB/s ≈ 10 bytes/ns)
+gpu_total_ms = gpu_ms + transfer_ms + launch_overhead_ms (0.05 ms)
+```
+
+Where possible, the model coefficients are **replaced by the most recent benchmark at that exact size**
+(`EstimateSource::Measured` / `Mixed`). Initial coefficients are seeded from the first benchmark run and
+persisted in `gpu_benchmark_results`; until then they are conservative placeholders documented in
+`profiler.rs` (`EstimateSource::Model`) and the UI labels them as estimates.
+
+There is no GPU-utilization-percentage-based routing anywhere in the decision path (requirement §4).
+
+### 7.4 Live inputs
+
+`classify()` reads exactly one `MonitorEngine::snapshot()` for: the matched `GpuMetrics` (by
+`monitor_gpu_index`), CPU usage, and `MemoryEngine::intelligence().analysis.available_percent`. It is called
+from the command thread (state assembly, recommendations) and from the worker before starting a task.
+No background polling loop is added.
+
+### 7.5 Scheduler semantics
+
+- **Queues**: one priority queue (`BinaryHeap` on `(priority desc, queued_at asc, id)`), plus separate
+  running sets for GPU and CPU workers.
+- **Concurrency**: `max_concurrent_gpu_tasks` (1-2, default 1) and `max_concurrent_cpu_tasks` (default 2).
+  A task's worker is chosen by its `selected_backend`.
+- **Admission**: on submit, `resources.try_reserve(required_vram, safety)`; on finish/cancel/error,
+  `resources.release(task_id)` (id-keyed so a double release cannot corrupt accounting).
+- **Backpressure**: when `queued >= max_queue_length`, submit returns `Err("task queue is full ...")`.
+  Benchmarks do not enter the queue but take the GPU slot, so a running benchmark blocks GPU tasks
+  (reported as `GpuAvailableNotBeneficial` with reason "GPU busy with benchmark").
+- **Cancellation**: `CancelToken { cancelled: Arc<AtomicBool> }` passed into `ExecutionRequest`. Providers
+  check it before each chunk (per row-block for matmul, per 1/8 of the vector for axpy) and return
+  `GpuError::Cancelled`. The scheduler also enforces a wall-clock timeout on the worker thread; on timeout
+  it marks the task `TimedOut`, releases resources, and (for wgpu) drops the device to recover.
+- **Fallback**: only when `require_gpu == false`. A GPU `ExecutionFailed`/`ResourceExhausted`/
+  `CorrectnessFailed` re-runs the workload on the CPU path and records `fell_back = true`,
+  `selected_backend` stays the GPU (what was attempted) and `fell_back` tells the UI the result came from
+  the CPU. `CorrectnessFailed` marks the provider degraded: 3 consecutive correctness failures disable that
+  provider for the session and emit a capabilities update.
+- **Timeouts** are per attempt, default 10 s; matmul 1024³ is expected to fit in < 1 s on CC 7.5 with a
+  naive kernel, so 10 s is generous while still far below typical TDR (2 s) per *launch*.
+
+### 7.6 Resource manager (`resources.rs`, Subagent 4)
+
+- `budget_bytes = min(dedicated_total * vram_budget_percent/100, vram_budget_cap_mb*1MiB)` (cap applied only
+  when > 0).
+- `remaining = budget_bytes - reserved_bytes - allocated_bytes`.
+- Safety gates (all from the monitor snapshot, no new sensors):
+  - `utilization_percent > max_gpu_utilization_percent` → block new GPU tasks.
+  - `temperature_c > max_temperature_c` → block.
+  - `power_watts` above the device's board power (when known) is recorded but not blocking (we cannot
+    read the limit reliably through NVML without extra FFI; documented as a limitation).
+  - `system available RAM% < min_system_ram_available_percent` → block (prevents RAM pressure from pinned
+    host buffers on an 8 GB machine).
+- `AdmissionDecision { allowed: bool, reason: Option<String>, reserved_bytes: u64 }`.
+- Cleanup: `Drop for GpuEngine` → cancel all, join workers, `provider.shutdown()` for each, release all
+  reservations. Every error path in `execution.rs` releases in a guard struct (`ResourceGuard`) so a panic
+  or early return cannot leak a reservation.
+- No VRAM is ever "freed" from other processes; FluxCore only releases what it allocated. The UI must not
+  imply otherwise.
+
+---
+
+## 8. Backend implementation notes
+
+### 8.1 CPU provider (reference + fallback)
+
+`providers/cpu.rs` implements all four workloads with plain `f32` loops (chunked so `CancelToken` is
+honoured). This is the reference every GPU result is validated against. It also reports
+`ProviderKind::Cpu`, `compute_ready = true`, and `GpuMemoryInfo` with `allocated_bytes` tracked.
+
+### 8.2 CUDA provider — driver API + embedded PTX (no toolkit)
+
+- Load `"nvcuda.dll"` via `libloading` (same pattern as `NvmlSession`).
+- Resolve at minimum: `cuInit`, `cuDriverGetVersion`, `cuDeviceGetCount`, `cuDeviceGet`,
+  `cuDeviceGetName`, `cuDeviceGetAttribute` (CC major/minor, max threads per block, max shared mem),
+  `cuDevicePrimaryCtxRetain`, `cuCtxPushCurrent_v2`/`cuCtxSetCurrent`, `cuMemAlloc_v2`, `cuMemFree_v2`,
+  `cuMemcpyHtoD_v2`, `cuMemcpyDtoH_v2`, `cuMemGetInfo_v2`, `cuModuleLoadData`, `cuModuleGetFunction`,
+  `cuLaunchKernel`, `cuCtxSynchronize`, `cuGetErrorString`, `cuCtxDestroy_v2`/`cuDevicePrimaryCtxRelease`.
+  All are documented public driver API entry points.
+- **Kernels are embedded PTX text** (`include_str!("../ptx/axpy.ptx")` etc.) compiled once by hand for
+  `sm_75` and validated on the target device. `cuModuleLoadData` accepts PTX text and the driver JITs it
+  for the actual device. No `nvcc`, no `CUDA_PATH`, no build script.
+- PTX files live in `app/src-tauri/ptx/*.ptx` and are owned by Subagent 2. If a load fails (bad PTX,
+  unsupported arch), return `GpuError::Unsupported` with the driver error string and the state shows
+  "CUDA compute unavailable (PTX load failed: …)". **Never** fall back to pretending success.
+- The provider does **not** call NVML. It reads device memory totals from `cuMemGetInfo_v2` and prefers the
+  `GpuMetrics` values handed in by `resources.rs` for utilisation/temperature. `monitor_gpu_index` is
+  matched by device name.
+- Kernel launch configuration: `block = min(256, max_threads_per_block)`, `grid = ceil(n / block)`, chunked
+  in slices of ≤ 1 M elements with a `CancelToken` check between chunks, so a launch is always short.
+- If `cuInit` fails (e.g. no NVIDIA driver, session 0), `available = false`, `detail` = driver error
+  string, and `compute_ready = false`. Phase 1/2 features are unaffected.
+
+### 8.3 wgpu provider — WGSL compute (vendor-neutral)
+
+- Dependencies: `wgpu = "30"` with `default-features = false, features = ["wgsl", "dx12", "vulkan"]`
+  (no `metal`/`gles`/`webgpu` — Windows only, faster builds). `pollster` is **not** required: implement a
+  tiny `block_on` in `providers/wgpu.rs`:
+  ```rust
+  fn block_on<F: std::future::Future>(future: F) -> F::Output {
+      use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+      // noop waker; wgpu's futures are driven by the wgpu device/queue, not by IO
+      ...
+  }
+  ```
+  If the noop-waker approach proves unreliable for `request_adapter`, use `pollster = "1"` (main agent
+  adds it). Decision: **custom block_on first, pollster as fallback.**
+- `Instance::new(wgpu::InstanceDescriptor::from_env_or_default())` (wgpu 30 takes the descriptor **by value**;
+  `Instance::new(&desc)` is the 0.19-era signature and must not be used). Backends from the descriptor's
+  `backends` field (DX12 + Vulkan).
+- `instance.enumerate_adapters(Backends::all())` for discovery; `adapter.request_device(&desc, None)`;
+  `device.poll(PollType::Wait { submission_index: Some(index), timeout: Some(task_timeout) })` — note
+  wgpu 30's `PollType` has exactly `Wait { submission_index, timeout }` and `Poll` (no `WaitAndMaintain`).
+  Every submit is followed by a bounded `Wait` so a hung GPU cannot block the worker forever.
+- Buffers: `wgpu::Buffer` with `MAP_READ | COPY_DST | COPY_SRC` plus `wgpu::util::DeviceExt::create_buffer_init`
+  for uploads; download via `encoder.copy_buffer_to_buffer` + `buffer.slice(..).map_async(MapMode::Read)` +
+  `device.poll(Wait)` inside `block_on`.
+- WGSL kernels in `providers/wgsl/*.wgsl` (`include_str!`): `axpy.wgsl`, `scale.wgsl`, `matmul.wgsl`,
+  `rowsum.wgsl`. Same layout/semantics as §5.3. Matmul is the naive triple loop with a `vec4`-free scalar
+  kernel (simplest correct path; tiled matmul is out of scope).
+- `max_storage_buffer_bytes` / `max_buffer_size` recorded into `ProviderCapabilities` and enforced against
+  `WorkloadRequirement` (a 1024³ matmul needs ~12 MB per buffer, well within limits).
+- Device loss / validation errors → `GpuError::ExecutionFailed` with the wgpu error text; the scheduler
+  marks the provider degraded after 3 failures and drops the device to reset state.
+
+### 8.4 `execution.rs` shared seam (Subagents 2 + 3)
+
+```rust
+impl GpuEngine {
+    /// Decision + dispatch + timing + validation + fallback. Called by the
+    /// scheduler worker and by run_benchmark (with `force_backend`).
+    pub(crate) fn run_task(
+        &self,
+        task: &mut GpuTask,
+        force_backend: Option<BackendKind>,
+        timeout: Duration,
+        cancel: CancelToken,
+    ) -> Result<ExecutionRecord, GpuError>;
+}
+```
+
+- Subagent 2 owns: provider selection inside the function, `ExecutionRequest` construction, calling
+  `provider.execute`, converting `ExecutionOutcome` → `TimingBreakdown`, and `validate_results`.
+- Subagent 3 owns: the `force_backend` / fallback / re-run control flow and the `GpuTask` mutation.
+- The main agent freezes this signature before both start.
+
+---
+
+## 9. Database schema (migration 0004)
+
+`database.rs` does **not** load `.sql` files. Migrations are `execute_batch` blocks inside `open_at`, guarded
+by `schema_migrations`. The main agent will append this block after the migration-3 block, exactly matching
+the existing style:
+
+```rust
+// Migration 4: Phase 3 GPU acceleration tables. No existing table is touched.
+let v4_applied: i64 = connection
+    .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 4", [], |row| row.get(0))
+    .unwrap_or(0);
+if v4_applied == 0 {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS gpu_providers (
+           provider_id TEXT PRIMARY KEY,
+           label TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           available INTEGER NOT NULL,
+           compute_ready INTEGER NOT NULL,
+           detail TEXT NOT NULL,
+           device_count INTEGER NOT NULL,
+           capabilities TEXT NOT NULL,
+           last_seen TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gpu_provider_cache (
+           id INTEGER PRIMARY KEY CHECK (id=1),
+           payload TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gpu_acceleration_settings (
+           id INTEGER PRIMARY KEY CHECK (id=1),
+           mode TEXT NOT NULL,
