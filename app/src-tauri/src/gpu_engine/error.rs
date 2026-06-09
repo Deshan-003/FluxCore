@@ -71,3 +71,40 @@ impl GpuError {
     }
 }
 
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::DriverUnavailable { provider, detail } => {
+                write!(f, "{provider}: driver/library unavailable: {detail}")
+            }
+            GpuError::InitializationFailed { provider, code, detail } => {
+                write!(f, "{provider}: initialization failed{}: {detail}", code.map(|c| format!(" (code {c})")).unwrap_or_default())
+            }
+            GpuError::Unsupported { provider, detail } => write!(f, "{provider}: unsupported: {detail}"),
+            GpuError::ResourceExhausted { provider, detail } => {
+                write!(f, "{provider}: GPU resources exhausted: {detail}")
+            }
+            GpuError::ExecutionFailed { provider, code, detail } => {
+                write!(f, "{provider}: execution failed{}: {detail}", code.map(|c| format!(" (code {c})")).unwrap_or_default())
+            }
+            GpuError::CorrectnessFailed { provider, max_abs_error, tolerance } => {
+                write!(f, "{provider}: output validation failed: max abs error {max_abs_error:.3e} exceeds tolerance {tolerance:.3e}")
+            }
+            GpuError::Cancelled { provider } => write!(f, "{provider}: task cancelled"),
+            GpuError::Timeout { provider } => write!(f, "{provider}: task timed out"),
+            GpuError::Internal { provider, detail } => write!(f, "{provider}: internal error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+impl From<GpuError> for String {
+    fn from(error: GpuError) -> String {
+        error.to_string()
+    }
+}
+
+/// Convenience alias used across the engine for results produced by providers
+/// and by the execution path.
+pub type GpuResult<T> = Result<T, GpuError>;
