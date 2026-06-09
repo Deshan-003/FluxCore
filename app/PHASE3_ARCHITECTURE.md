@@ -1428,3 +1428,241 @@ production code). M9 depends on M3/M4.
 | Configurable limits, concurrency, cancellation, backpressure, cleanup (§9) | `AccelerationConfig`, `scheduler.rs`, `resources.rs` |
 | Reuse Phase 1/2 monitoring (§10) | reads `MonitorEngine::snapshot()`, `MemoryEngine::intelligence()`, NVML only in Phase 1 |
 | SQLite persistence + retention (§11) | migration 0004, `persistence.rs`, `prune_memory_data` |
+| Frontend pages (§5 of brief) | §10 component plan |
+| Testing incl. unsupported hardware, missing drivers, CUDA failure, low VRAM (§12) | `tests/gpu_*.rs` (Subagent 6): `gpu_provider_tests.rs`, `gpu_scheduler_tests.rs`, `gpu_safety_tests.rs`, `gpu_regression_tests.rs` |
+
+---
+
+## 15. Open questions for the main agent
+
+1. Approve `wgpu = "30"` + custom `block_on` (fallback `pollster = "1"`).
+2. Approve the per-workload size catalogue and caps in §7.1 (especially matmul ≤ 1024³ default).
+3. Confirm the `gpu_engine/execution.rs` split between Subagents 2 and 3, and freeze
+   `run_task()` (§8.4) before M2 starts.
+4. Confirm the frontend nav group name `'GPU INTELLIGENCE'` and page label `'GPU Acceleration'`.
+5. Confirm that `gpu_task_history` is written on task completion (not per tick) to avoid monitor-thread
+   DB contention.
+
+_End of Phase 3 architecture contract._
+
+---
+
+## 16. Architecture verification & implementation hand-off (Subagent 1)
+
+This section was written **after inspecting the real Phase 1/2 sources** (not from the
+contract text alone). It records what Phase 3 actually reuses, proves the module graph is
+acyclic, and hands off the verified integration constraints. Append-only; §§1–15 unchanged.
+
+### 16.1 Verified concrete Phase 1/2 interfaces
+
+| Inspected source | Real symbols (verified) | Phase 3 use |
+| --- | --- | --- |
+| `src-tauri/src/monitoring.rs:74` `GpuMetrics` | `utilization_percent: Option<f32>`, `dedicated_total_bytes: Option<u64>`, `dedicated_available_bytes: Option<u64>`, `dedicated_used_bytes`, `memory_utilization_percent`, `temperature_c: Option<f32>`, `power_watts: Option<f32>` | VRAM budget + safety gates |
+| `src-tauri/src/monitoring.rs:331` | `MonitorEngine::snapshot() -> Result<SystemSnapshot, String>` | single read per decision |
+| `src/types/monitoring.ts:35` `GpuMetrics` | `utilizationPercent`, `dedicatedTotalBytes`, `dedicatedAvailableBytes`, `dedicatedUsedBytes`, `temperatureC`, `powerWatts` — all `SensorValue` (nullable) | frontend mirrors; `null` → "—" |
+| `src-tauri/src/memory_engine/mod.rs:153` | `MemoryEngine::intelligence() -> Result<MemoryIntelligenceSnapshot, String>` | `analysis.available_percent` (RAM gate) |
+| `src-tauri/src/database.rs` | `schema_migrations` versions **1** (settings/hardware/performance_snapshots), **2** (memory_snapshots, memory_pressure_events, …), **3** (performance_snapshots_v3), **4** (`gpu_providers`, `gpu_provider_cache`, `gpu_acceleration_settings`, `gpu_workload_settings`, `gpu_task_history`, `gpu_benchmark_results`) | migration 0004 JSON `payload` columns; additive `IF NOT EXISTS` / `INSERT OR IGNORE` |
+| `src/App.tsx:33,196,180` | nav item `{ label: 'GPU Acceleration', icon: Zap, group: 'GPU INTELLIGENCE' }`; `grouped = ['WORKSPACE','MONITORS','MEMORY INTELLIGENCE','GPU INTELLIGENCE','SYSTEM']`; `pageContent` useMemo routes it | main-agent wiring already present |
+| `src/stores/monitoring.ts`, `src/stores/memory.ts` | zustand `create(...)` stores | Phase 3 adds `stores/gpu.ts` + localStorage `fluxcore.gpu.preferences.v1` |
+
+Note: the actual nav icon is `Zap` (§10 suggested `MonitorCog`; that icon is imported for the
+GPU monitor tile). Reported as observed, not "fixed".
+
+**REUSED telemetry (read-only, from the one existing snapshot):** GPU name,
+`dedicatedTotalBytes` / `dedicatedAvailableBytes` (VRAM), `utilizationPercent`, `temperatureC`,
+`powerWatts`, CPU/RAM usage, `MemoryEngine::intelligence().analysis.availablePercent`. These
+populate `ResourceBudgetStatus` and the thermal/util/RAM gates. `Option`/`null` is surfaced as
+*unavailable*, never estimated. **COMPUTED (Phase 3, never hardware telemetry):**
+`budget_bytes`, `reserved_bytes`/`allocated_bytes`, `remaining_budget_bytes`, `transfer_bytes`/
+`device_bytes` (from `WorkloadParams`), `estimated_*_ms`, `speedup`, `max_abs_error`,
+`output_digest`, and every `TimingBreakdown` field. **No second monitor thread is added** — GPU
+work runs only on the scheduler's worker threads, commands read at most one snapshot per
+decision (§7.4), and `gpu_task_history` is written on task completion only (freeze §1.5), never
+per monitor tick.
+
+### 16.2 Module dependency table (acyclic)
+
+| Module (owner) | Depends on | Direction |
+| --- | --- | --- |
+| `models.rs` (S1) | `serde`, `std` only | **leaf**, no `gpu_engine` deps |
+| `error.rs` | `serde` | leaf |
+| `providers/*` (S2) | `models`, `error`, `monitoring` (types) | never `scheduler`/`execution`/`mod` |
+| `capability.rs` (S2) | `models`, `providers` | ↓ |
+| `profiler.rs` (S3) | `models`, `capability` | ↓ |
+| `resources.rs` (S4) | `models`, `monitoring`, `database` | ↓ |
+| `persistence.rs` (S4) | `models`, `database` | ↓ |
+| `execution.rs` (S3) | `models`, `providers`, `profiler`, `resources`, `persistence` | ↓ |
+| `benchmark.rs` (S6) | `models`, `providers` (`run_once` lives here) | ↓ |
+| `scheduler.rs` (S3) | `models`, `resources`, `execution`, `providers` (trait) | ↓ |
+| `mod.rs` (Main) | all of the above | top |
+
+Every arrow points toward `models.rs`/leaf crates; there is no back-edge, so the graph is a
+DAG. Two cycles that the architecture §2.2 could have allowed are explicitly broken by the
+frozen contract:
+
+- **providers ↔ scheduler:** both need cooperative cancellation and shared exec types.
+  `CancelToken`, `WorkloadRequirement`, `ExecutionRequest`, `ExecutionOutcome` and
+  `WorkloadInputs` are placed in `models.rs` (the leaf). Providers depend on `models`; the
+  scheduler depends on `models` *and* `providers` (trait object), but **providers never import
+  the scheduler** (`cancel.is_cancelled()` is checked inside providers). No cycle.
+- **execution ↔ benchmark:** §2.2 drew arrows both ways. The freeze resolves it by putting the
+  single-run helper `run_once` in `benchmark.rs` (§11) and keeping `execution::execute_task`
+  (§10) independent; `execution.rs` maps `ExecutionOutcome` → `ExecutionRecord` itself. No cycle.
+
+### 16.3 Layered data flow
+
+```mermaid
+flowchart TB
+  subgraph FE["React frontend (app/src)"]
+    UI["GpuAccelerationPage + components/gpu/*"]
+    ST["stores/gpu.ts (zustand)"]
+    SV["services/gpu.ts (invoke wrappers)"]
+    UI --> ST --> SV
+  end
+  subgraph CMD["Tauri commands (lib.rs)"]
+    C["17 commands -> Result&lt;T,String&gt;"]
+  end
+  subgraph ENG["GpuEngine (mod.rs), Arc in AppState"]
+    M["state/config/probe/submit/benchmark"]
+    CAP["capability.rs"]; PRO["profiler.rs"]; RES["resources.rs"]
+    SCH["scheduler.rs"]; EXE["execution.rs"]; BEN["benchmark.rs"]; PER["persistence.rs"]
+    M --> CAP
+    M --> PRO
+    M --> RES
+    M --> SCH
+    M --> BEN
+    M --> PER
+    SCH --> EXE
+  end
+  subgraph IO["Phase 1/2 (already running)"]
+    MON["MonitorEngine::snapshot()"]
+    MEM["MemoryEngine::intelligence()"]
+    DB["Database (migrations 1-4, WAL)"]
+  end
+  subgraph GPU["Compute providers (S2)"]
+    P["GpuProvider: CPU | CUDA PTX-JIT | wgpu WGSL"]
+  end
+  SV --> C --> M
+  RES -->|one snapshot| MON
+  CAP -->|name/VRAM/driver| MON
+  PRO -->|availablePercent| MEM
+  PER -->|records| DB
+  EXE --> P
+  BEN --> P
+```
+
+### 16.4 Task lifecycle state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> Queued: submit_workload_task (returns immediately)
+  Queued --> Running: GPU/CPU worker dequeues
+  Queued --> Rejected: queue full / require_gpu with no GPU / insufficient VRAM + require_gpu
+  Queued --> Cancelled: cancel_task
+  Running --> Succeeded: execute_task Ok (or GPU failed -> CPU fallback, fell_back=true)
+  Running --> Failed: execution error, no fallback
+  Running --> Cancelled: cooperative CancelToken checkpoint
+  Running --> TimedOut: wall-clock timeout per attempt
+  Succeeded --> [*]
+  Failed --> [*]
+  Cancelled --> [*]
+  TimedOut --> [*]
+  Rejected --> [*]
+```
+
+### 16.5 CPU/GPU decision flowchart — §7.2 exact first-match-wins order
+
+```mermaid
+flowchart TD
+  S["classify(params, ClassifyInputs)"] --> R1{"1. id in registry?"}
+  R1 -->|no| O1["UnsupportedWorkload"]
+  R1 -->|yes| R2{"2. mode == CpuOnly?"}
+  R2 -->|yes| O2["CpuRecommended"]
+  R2 -->|no| R3{"3. any provider compute_ready?"}
+  R3 -->|no| O3["AccelerationUnavailable"]
+  R3 -->|yes| R4{"4. provider implements workload?"}
+  R4 -->|no| O4["UnsupportedWorkload"]
+  R4 -->|yes| R5{"5. required_vram > remaining budget?"}
+  R5 -->|yes| O5["InsufficientGpuResources"]
+  R5 -->|no| R6{"6. free VRAM < required?"}
+  R6 -->|yes| O6["InsufficientGpuResources"]
+  R6 -->|no| R7{"7. safety gate blocked (temp/util/ram)?"}
+  R7 -->|yes| O7["GpuAvailableNotBeneficial + blockers[]"]
+  R7 -->|no| R8{"8. gpu_total * beneficial_speedup >= cpu?"}
+  R8 -->|yes| O8["CpuRecommended / GpuAvailableNotBeneficial"]
+  R8 -->|no| O9["GpuRecommended"]
+```
+Utilisation is a **safety gate only** (step 7); it is never a reason to route to the GPU.
+
+### 16.6 Integration requirements (for main agent / S2–S7)
+
+- `serde` (derive), `serde_json`, `chrono`, `wgpu 30`, `pollster 1` are already in `Cargo.toml`; `models.rs` imports only `serde` + `std`.
+- `providers/mod.rs` re-exports `models::*`; `GpuProvider::execute` returns the **freeze §3** `ExecutionOutcome` (`timing: TimingBreakdown`, `validated`, `max_abs_error`, `output_digest`, `peak_device_bytes`), not §3.1's three-`Duration` shape.
+- GPU providers call `params.make_inputs()`, `params.run_cpu(&inputs, ..)` when `request.validate`, and `params.validate(..)`, returning `CorrectnessFailed` with the real `max_abs_error`; CPU provider sets `validated=false`, `max_abs_error=None`. Never `unwrap()` a driver call; never report success for a backend that did not run.
+- `profiler.rs` re-exports `models::default_params`; `BenchmarkSummary.input_size` is `record.params.input_size()`. `AccelerationConfig` persists as single-row JSON; the observer writes `gpu_task_history` on completion and emits `fluxcore-gpu-task` only when `emit_events`.
+- `BackendKind::parse("cuda"|"wgpu"|"cpu")` and `AccelerationMode::as_str/parse` are the string boundaries used by `mod.rs` (`provider_priority`, `set_acceleration_mode`).
+
+### 16.7 Honest limitations (carried into the UI copy)
+
+- **No CUDA toolkit** (`nvcc`/`CUDA_PATH` absent): CUDA is driver-API (`libloading` + `nvcuda.dll`) with **embedded PTX JIT**, not compiled CUDA; PTX load failure → `Unsupported`, never pretend success. `wgpu`/CPU remain.
+- **4 GB (4096 MiB) VRAM, 8 GB RAM:** default 50 % budget + 1024 MiB cap; 16 M-element vector / 1024³ matmul sizes are frequently rejected as `InsufficientGpuResources` — expected, not a failure.
+- **WDDM TDR (~2 s):** kernels chunked (≤1 M elements/launch), per-task timeout 10 s; a task stuck in a driver call stays `Running` until it returns (cooperative cancel).
+- **AMD/Intel untested:** `wgpu` DX12/Vulkan discovery only; no vendor claim beyond exercised hardware (freeze §0); `ProviderKind::Other` reserved.
+- **No VRAM→RAM claim:** VRAM is GPU memory; FluxCore never migrates process memory to VRAM, never "frees" other processes' VRAM, and the UI separates "FluxCore budget" from total GPU usage (§7.6, R9).
+- Power is a recorded note, not a blocking gate (board-power limit not reliably readable via NVML); all `Option` telemetry degrades to "Unavailable".
+
+### 16.8 Contract-deviations note (reported, not silently applied)
+
+1. **`run_cpu` / `make_inputs`:** freeze §3 (authoritative for signatures) defines
+   `run_cpu(&self, inputs: &WorkloadInputs, out)` + `make_inputs()`; architecture §5.3 showed
+   `run_cpu(&self, out)` with no inputs. Implemented the freeze shape; `WorkloadInputs` added.
+2. **`ExecutionOutcome` / `ExecutionRequest`:** freeze §3 shape used (`timing: TimingBreakdown`;
+   `ExecutionRequest` gained `validate: bool`), superseding architecture §3.1.
+3. **`WorkloadParams` serde:** §5.3 listed two attributes (`rename_all` + `tag/rename_all`);
+   consolidated to one `#[serde(tag="kind", rename_all="camelCase")]` (identical value, avoids a
+   duplicate `rename_all` attribute) — matches freeze §3's single-attribute description.
+   Derived `PartialEq` (not `Eq`, because of `f32 a`) and `Copy` (all fields `Copy`).
+4. **`vram_budget_percent` CONFLICT:** §5.4 field comment says *"Fraction (0.1–0.8), Default
+   0.5"*, but §7.6 computes `budget = dedicated_total * pct/100` and §5.4 validation says
+   *"percentages in 1.0..=90.0"* — a 0–100 percent scale implies default **50.0**, and 0.5 would
+   be *invalid* under that validation. `Default` uses the literal §5.4 value **0.5**; flagged for
+   main-agent arbitration before `resources.rs::validate_config` / `budget_bytes` are finalised.
+5. **Defaults not stated in §5.4** chosen in-range: `min_system_ram_available_percent = 15.0`
+   (1–50), `retention_days = 30` (1–90), `persist_history`/`emit_events = true`,
+   `provider_priority = ["cuda","wgpu","cpu"]`, empty `workload_settings`/`preferred_devices`.
+6. **`default_params("row_sum", size)`:** implemented square `(size,size)`, which yields §7.1's
+   (1024,1024) and (4096,4096). The wide **(4096,1024)** entry cannot be keyed by a single
+   `size` (both 4096-row entries share `rows=4096`); it is reachable via a directly-constructed
+   `WorkloadParams::RowSum{rows:4096, cols:1024}`. Reported as an ambiguity, not hidden.
+7. `transfer_bytes()` and `device_bytes()` are both `(inputs + output) * 4` by construction
+   (inputs uploaded + output downloaded == all resident buffers), hence equal — documented so
+   the consistency is intentional, not a bug.
+
+---
+
+## 17. As-built continuation record (2026-11-17, append-only)
+
+The continuation wave completed the four placeholder modules (`resources.rs`, `scheduler.rs`,
+`persistence.rs`, `benchmark.rs`), the entire frontend (`types/gpu.ts`, `services/gpu.ts`,
+`stores/gpu.ts`, `pages/GpuAcceleration.tsx`, `components/gpu/*`), the integration tests
+(`tests/gpu_*.rs`) and `examples/gpu_benchmark.rs`. §§1–16 behaviour is unchanged. As-built deviations
+from the freeze, all reported in `PHASE3_REMAINING_WORK.md`:
+
+1. **Admission at dequeue, not submit** (freeze §9): reserving VRAM at submit would let the concurrency
+   gate reject queueing; dequeue-time admission keeps the queue usable while enforcing budget, gates
+   and concurrency before any GPU execution. Release on every exit path is unchanged.
+2. **`ResourceManager::set_queued_gpu_tasks`** (additive) publishes queue depth for truthful UI.
+3. **`ResourceManager::set_device_vram_total`** (additive): when the Phase 1 monitor snapshot has no GPU
+   (NVML absent / non-Windows verification host), the budget falls back to the compute provider's
+   reported dedicated VRAM total. On Windows with NVML the monitor value wins.
+4. **`allocated_bytes` mirrors `reserved_bytes`** (R9): reservations release exactly when the matching
+   buffers free; subtracting both would double-count.
+5. **`providers/wgpu.rs` instance construction** corrected to the real wgpu 30.0.2 API
+   (`InstanceDescriptor::new_without_display_handle_from_env`); the previous call did not exist and
+   blocked compilation of the entire crate.
+6. **`providers/cpu.rs::can_execute`** now enforces the advertised `max_elements` caps (§7.1), matching
+   `cuda.rs`.
+
+Verification: `cargo check --all-targets` and `cargo test` green in WSL (121 tests, 0 failures);
+native Windows `tsc -b && vite build`, `vitest` 48/48 and `eslint` clean; real-driver GPU execution via
+mingw-cross-built Windows binaries (see `PHASE3_TEST_REPORT.md` §5 and `PHASE3_BENCHMARK_REPORT.md`).
