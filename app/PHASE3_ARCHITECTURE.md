@@ -475,3 +475,241 @@ pub struct AccelerationEnvironment {
     /// e.g. "CUDA driver API via nvcuda.dll (no toolkit)".
     pub cuda_compute_path: String,
     pub wgpu_version: String,
+    pub wgpu_backend: Option<String>,   // adapter backend name from wgpu
+    pub vulkan_present: bool,
+    pub dx12_present: bool,
+    pub recorded_at: String,
+}
+```
+
+### 5.2 Workload catalogue and per-workload view
+
+```rust
+/// Immutable description of a supported workload. Declared once in
+/// `profiler::registry()`; providers and the UI both read it.
+#[derive(Clone, Debug)]
+pub struct WorkloadDef {
+    pub id: &'static str,              // "vector_axpy" | "vector_scale" | "matmul" | "row_sum"
+    pub title: &'static str,
+    pub description: &'static str,
+    pub category: &'static str,        // "vector" | "matrix" | "reduction"
+    pub element_type: &'static str,    // "f32"
+    /// Element counts the UI offers (last entry is the hard maximum).
+    pub sizes: &'static [usize],
+    pub default_size: usize,
+    /// Multi-input workloads (matmul) need a second dimension.
+    pub secondary_sizes: &'static [usize],
+    /// Human-readable VRAM formula, e.g. "3 * n * 4 bytes".
+    pub memory_formula: &'static str,
+    /// Roughly linear cost model coefficients (see §7.3).
+    pub cpu_model: CostModel,
+    pub gpu_model: CostModel,
+    /// Minimum speedup before GPU is called beneficial (default 1.15).
+    pub beneficial_speedup: f64,
+    /// The provider must implement this id to claim support.
+    pub requires_gpu_path: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CostModel {
+    /// time ≈ intercept_ns + scale_ns * work_units
+    pub intercept_ns: f64,
+    pub scale_ns_per_unit: f64,
+}
+```
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadView {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub category: String,
+    pub sizes: Vec<usize>,
+    pub selected_size: usize,
+    /// Per-workload execution mode override (Manual mode uses this).
+    pub mode: AccelerationMode,
+    /// True when the user explicitly pinned this workload.
+    pub pinned: bool,
+    /// The live recommendation for `selected_size`.
+    pub assessment: SuitabilityAssessment,
+    /// Last known measured numbers, if a benchmark exists for this size.
+    pub last_benchmark: Option<BenchmarkSummary>,
+}
+
+/// Full decision record: inputs, both cost estimates, and the reason.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuitabilityAssessment {
+    pub workload_id: String,
+    pub input_size: usize,
+    pub secondary_size: Option<usize>,
+    pub classification: Suitability,
+    /// User-presentable one-liner, e.g. "GPU is ~3.4x faster at 4M elements (measured)".
+    pub reason: String,
+    pub estimated_cpu_ms: Option<f64>,
+    pub estimated_gpu_ms: Option<f64>,
+    /// Predicted total GPU time including transfer + launch overhead.
+    pub estimated_gpu_total_ms: Option<f64>,
+    pub transfer_overhead_ms: Option<f64>,
+    /// Estimated bytes that must cross PCIe (both directions).
+    pub transfer_bytes: u64,
+    pub estimated_vram_bytes: u64,
+    pub required_vram_bytes: u64,
+    /// Free VRAM after the budget reserve, from the monitor snapshot.
+    pub available_vram_bytes: Option<u64>,
+    pub gpu_budget_bytes: u64,
+    /// True when the estimate comes from a stored benchmark at this size
+    /// rather than the analytic model.
+    pub estimate_source: EstimateSource,
+    /// Which backend the decision would select.
+    pub selected_backend: BackendKind,
+    /// False when the user disabled GPU acceleration globally.
+    pub gpu_enabled: bool,
+    /// Safety gates that blocked GPU execution, if any.
+    pub blockers: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EstimateSource { Model, Measured, Mixed }
+```
+
+### 5.3 Workload parameters, results, tasks
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkloadParams {
+    /// out = a*x + y
+    VectorAxpy { n: usize, a: f32 },
+    /// out = a*x
+    VectorScale { n: usize, a: f32 },
+    /// out = A(m,k) * B(k,n)
+    Matmul { m: usize, k: usize, n: usize },
+    /// out[i] = sum(row i of A(rows, cols))
+    RowSum { rows: usize, cols: usize },
+}
+
+impl WorkloadParams {
+    pub fn workload_id(&self) -> &'static str;
+    pub fn input_size(&self) -> usize;          // primary element count
+    pub fn secondary_size(&self) -> Option<usize>;
+    pub fn total_elements(&self) -> u64;
+    /// Bytes that must be transferred host->device and device->host.
+    pub fn transfer_bytes(&self) -> u64;
+    /// Bytes of device memory the workload needs (inputs + output).
+    pub fn device_bytes(&self) -> u64;
+    pub fn work_units(&self) -> f64;            // for cost models
+    pub fn seed(&self) -> u64;                  // deterministic test data
+    /// CPU reference implementation. Providers must match it.
+    pub fn run_cpu(&self, out: &mut [f32]) -> Result<(), String>;
+    /// Byte-exact-ish comparison used to validate GPU output.
+    pub fn validate(&self, reference: &[f32], candidate: &[f32], tolerance: f32) -> Result<f32, String>;
+    /// Stable digest of the output, for logging/history.
+    pub fn digest(&self, values: &[f32]) -> String;
+}
+```
+
+Layout rules the provider and CPU paths must agree on (contract):
+
+- `VectorAxpy` / `VectorScale`: `x`, `y`, `out` are `f32` slices of length `n`.
+- `Matmul`: `a` is row-major `m*k`, `b` is row-major `k*n`, `out` is row-major `m*n`.
+- `RowSum`: `a` is row-major `rows*cols`, `out` has length `rows`.
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingBreakdown {
+    /// Time to build/validate inputs on the host.
+    pub setup_ns: u64,
+    /// Host->device bytes transfer.
+    pub transfer_in_ns: u64,
+    /// Kernel/dispatch time (device-measured where possible).
+    pub compute_ns: u64,
+    /// Device->host transfer.
+    pub transfer_out_ns: u64,
+    /// Result validation against the CPU reference.
+    pub validation_ns: u64,
+    /// End-to-end wall time of the execution attempt.
+    pub total_ns: u64,
+    pub transferred_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionRecord {
+    pub backend: BackendKind,
+    pub provider_id: String,
+    pub device_id: String,
+    pub timing: TimingBreakdown,
+    pub peak_vram_bytes: u64,
+    /// Max absolute error vs the CPU reference, when validated.
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuTask {
+    pub id: u64,
+    /// Client-supplied id for idempotency (optional).
+    pub client_ref: Option<String>,
+    pub workload_id: String,
+    pub title: String,
+    pub params: WorkloadParams,
+    pub status: TaskStatus,
+    pub priority: TaskPriority,
+    /// What the engine decided, and why.
+    pub requested_backend: Option<BackendKind>,
+    pub selected_backend: Option<BackendKind>,
+    pub assessment: Option<SuitabilityAssessment>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    /// Wall time in ms (queued time excluded).
+    pub duration_ms: Option<u64>,
+    /// Queue wait in ms.
+    pub queue_ms: Option<u64>,
+    pub progress_percent: Option<f32>,
+    pub cpu_time_ms: Option<f64>,
+    pub gpu_time_ms: Option<f64>,
+    pub transfer_time_ms: Option<f64>,
+    pub total_time_ms: Option<f64>,
+    /// Speedup vs the measured CPU path; honest: <1.0 means the GPU was slower.
+    pub speedup: Option<f64>,
+    pub vram_used_bytes: Option<u64>,
+    pub max_abs_error: Option<f32>,
+    pub validated: bool,
+    /// True when the GPU path failed and the CPU reference produced the result.
+    pub fell_back: bool,
+    pub error: Option<String>,
+    /// Fields the user should know about (TDR risk, memory pressure, ...).
+    pub warnings: Vec<String>,
+}
+```
+
+### 5.4 Configuration (persisted)
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccelerationConfig {
+    pub mode: AccelerationMode,
+    /// Per-workload override; only consulted when mode == Manual.
+    pub workload_settings: Vec<WorkloadSetting>,
+    /// Preferred provider order; the first available one is used.
+    pub provider_priority: Vec<String>,     // e.g. ["cuda", "wgpu", "cpu"]
+    /// Manual device selection per provider ("" = auto).
+    pub preferred_devices: Vec<DevicePreference>,
+    /// Fraction of dedicated VRAM FluxCore may use (0.1 - 0.8). Default 0.5.
+    pub vram_budget_percent: f32,
+    /// Hard cap in MiB on top of the percentage (0 = no extra cap). Default 1024.
+    pub vram_budget_cap_mb: u64,
+    /// Refuse to start a GPU task above this GPU utilisation (%). Default 85.
+    pub max_gpu_utilization_percent: f32,
+    /// Refuse to start a GPU task above this temperature (°C). Default 85.
+    pub max_temperature_c: f32,
