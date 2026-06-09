@@ -61,3 +61,34 @@ Readback uses callback-based `map_async` + bounded
 `device.poll(PollType::Wait { submission_index, timeout })`, per wgpu 30.
 
 ## What was actually verified
+
+- Every wgpu 30 signature used was read from the cached crate source
+  (`Instance::new` by value, `enumerate_adapters`, `request_device`,
+  `PollType::Wait { submission_index, timeout }`, `queue.submit → SubmissionIndex`,
+  callback `map_async`, `BufferView: Deref<[u8]>`, descriptors, `Limits` fields).
+- All 5 Rust files **parse** (`rustfmt --check`, syntax only).
+- All 5 Rust files **type-check cleanly, exit 0, zero warnings** against a
+  standalone harness that stubs the external crate APIs with those exact
+  signatures and strips the serde derives from copies of `models.rs`/`error.rs`.
+  This also verified every `include_str!` path resolves and that all three
+  providers satisfy `GpuProvider: Send + Sync`.
+
+## Honest limitations / what is unsupported
+
+- `cargo check --manifest-path app/src-tauri/Cargo.toml` **could not be run to
+  completion in this session**: the machine has no MSVC linker/import libs and a
+  system-wide Windows "Application Control policy" (os error 4551) blocks
+  executing freshly built build scripts / loading proc-macro DLLs. This is an
+  environment constraint, not a code error; the standalone `rustc
+  --emit=metadata` harness above was used instead. PTX/WGSL JIT compile and
+  real GPU execution were therefore **not** runtime-exercised here.
+- CUDA PTX is hand-authored for `sm_75`; pre-`sm_75` devices would fail JIT
+  (reported honestly as `Unsupported`), newer devices JIT it forward.
+- No workload is reported as supported unless its real kernel module loaded /
+  compiled; execution never returns success without running the kernel.
+- wgpu reports no VRAM free/total (the API does not expose it) —
+  `GpuMemoryInfo`/`gpu_vram_bytes` stay `None`/`0` for that path; CUDA reports
+  real `cuMemGetInfo_v2` values.
+- `cuda_runtime_api_present` is inferred from toolkit presence (cudart ships
+  with the toolkit); `vulkan_present`/`dx12_present` reflect adapters actually
+  discovered by wgpu, never hardcoded `true`.
