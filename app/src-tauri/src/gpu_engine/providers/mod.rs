@@ -162,3 +162,57 @@ pub(crate) fn validate_gpu(
         } else {
             max_err = f32::INFINITY;
             break;
+        }
+    }
+
+    let tolerance = 1.0e-3f32;
+    match params.validate(&reference, out, tolerance) {
+        Ok(_) => Ok((max_err, start.elapsed().as_nanos() as u64)),
+        Err(_detail) => Err(GpuError::CorrectnessFailed {
+            provider: provider.to_string(),
+            max_abs_error: max_err as f64,
+            tolerance: tolerance as f64,
+        }),
+    }
+}
+
+/// Build an `ExecutionOutcome` from measured pieces, computing the stable
+/// output digest and assembling the `TimingBreakdown`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_outcome(
+    backend: &str,
+    provider_id: &str,
+    device_id: String,
+    params: &WorkloadParams,
+    out: &[f32],
+    timing: TimingBreakdown,
+    peak_device_bytes: u64,
+    notes: Vec<String>,
+    validated: bool,
+    max_abs_error: Option<f32>,
+) -> ExecutionOutcome {
+    ExecutionOutcome {
+        backend: backend.to_string(),
+        provider_id: provider_id.to_string(),
+        device_id,
+        timing,
+        peak_device_bytes,
+        notes,
+        output_digest: params.digest(out),
+        max_abs_error,
+        validated,
+    }
+}
+
+/// Resolve which device a request targets, falling back to the first available
+/// device id. `request.device_id` may be empty (scheduler does not always set
+/// it); providers honour it when it matches one of their devices.
+pub(crate) fn pick_device_id(devices: &[GpuDeviceInfo], requested: &str) -> (String, bool) {
+    if !requested.is_empty() && devices.iter().any(|d| d.device_id == requested) {
+        (requested.to_string(), false)
+    } else if let Some(first) = devices.first() {
+        (first.device_id.clone(), !requested.is_empty())
+    } else {
+        (requested.to_string(), false)
+    }
+}
