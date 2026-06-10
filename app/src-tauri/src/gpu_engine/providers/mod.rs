@@ -52,3 +52,58 @@ pub trait GpuProvider: Send + Sync {
     /// Workload ids this provider can actually execute, with per-impl limits.
     fn supported_workloads(&self) -> Vec<WorkloadSupport>;
     /// Memory snapshot as the provider sees it (may be `None` for CPU).
+    fn memory_info(&self) -> Option<GpuMemoryInfo>;
+    /// Optimistic admission check against real device limits.
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()>;
+    /// Execute one workload on one device. Blocking; called from a worker thread.
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome>;
+    /// Release device contexts/buffers. Safe to call repeatedly.
+    fn shutdown(&self);
+    /// Last unrecoverable error, if any (surfaced in the UI).
+    fn last_error(&self) -> Option<String>;
+}
+
+/// Constructs CPU + CUDA + wgpu providers (not yet initialized), in that order.
+pub fn all_providers() -> Vec<Arc<dyn GpuProvider>> {
+    let providers: Vec<Arc<dyn GpuProvider>> = vec![
+        Arc::new(CpuProvider::new()),
+        Arc::new(CudaProvider::new()),
+        Arc::new(WgpuProvider::new()),
+    ];
+    providers
+}
+
+/// Calls `initialize()` on each provider and returns ALL of them, including
+/// unavailable ones (which must still be reported in the UI). Never panics:
+/// a failed initialize is a reported state, not a propagated error.
+pub fn initialize_all() -> Vec<Arc<dyn GpuProvider>> {
+    let providers = all_providers();
+    for provider in &providers {
+        // `initialize` itself must be panic-free; guard the call anyway so a
+        // third-party driver surprise cannot take down `GpuEngine::new`.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = provider.initialize();
+        }));
+    }
+    providers
+}
+
+pub fn backend_for_provider(id: &str) -> BackendKind {
+    match id {
+        "cuda" => BackendKind::Cuda,
+        "wgpu" => BackendKind::Wgpu,
+        _ => BackendKind::Cpu,
+    }
+}
+
+pub fn provider_for_backend(backend: BackendKind) -> &'static str {
+    match backend {
+        BackendKind::Cpu => "cpu",
+        BackendKind::Cuda => "cuda",
+        BackendKind::Wgpu => "wgpu",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers used by the GPU backends.
+// ---------------------------------------------------------------------------
