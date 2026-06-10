@@ -107,3 +107,58 @@ pub fn provider_for_backend(backend: BackendKind) -> &'static str {
 // ---------------------------------------------------------------------------
 // Shared helpers used by the GPU backends.
 // ---------------------------------------------------------------------------
+
+/// Cooperative cancel/timeout checkpoint. Providers call this between chunks.
+/// Returns `Cancelled` first (a user cancellation outranks a timeout).
+pub(crate) fn check_interrupt(
+    provider: &str,
+    cancel: &CancelToken,
+    started: Instant,
+    timeout: Duration,
+) -> GpuResult<()> {
+    if cancel.is_cancelled() {
+        return Err(GpuError::Cancelled {
+            provider: provider.to_string(),
+        });
+    }
+    if started.elapsed() >= timeout {
+        return Err(GpuError::Timeout {
+            provider: provider.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a GPU result against the CPU reference (R16 tolerance rule).
+///
+/// Runs `params.run_cpu` (the authoritative reference) and `params.validate`
+/// with `tolerance = 1e-3`. On success returns `(max_abs_error, validation_ns)`
+/// where `max_abs_error` is the REAL measured maximum absolute difference. On
+/// failure returns `GpuError::CorrectnessFailed` carrying that same real error.
+pub(crate) fn validate_gpu(
+    provider: &str,
+    params: &WorkloadParams,
+    inputs: &WorkloadInputs,
+    out: &[f32],
+) -> GpuResult<(f32, u64)> {
+    let start = Instant::now();
+    let mut reference = vec![0.0f32; params.output_len()];
+    params.run_cpu(inputs, &mut reference).map_err(|e| {
+        GpuError::Internal {
+            provider: provider.to_string(),
+            detail: format!("CPU reference failed: {e}"),
+        }
+    })?;
+
+    // Compute the real measured error ourselves so it is available even when
+    // validate() rejects (validate returns only a String on failure).
+    let mut max_err = 0.0f32;
+    for (&r, &c) in reference.iter().zip(out.iter()) {
+        if r.is_finite() && c.is_finite() {
+            let err = (r - c).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        } else {
+            max_err = f32::INFINITY;
+            break;
