@@ -12,3 +12,16 @@
 )
 {
     .reg .pred %p<2>;
+    .reg .f32  %f<5>;
+    .reg .b32  %r<6>;
+    .reg .b64  %rd<6>;
+
+    ld.param.u64  %rd1, [pX];
+    ld.param.u64  %rd2, [pOut];
+    ld.param.f32  %f1,  [pA];
+    ld.param.u32  %r1,  [pN];
+
+    mov.u32       %r2, %ctaid.x;
+    mov.u32       %r3, %ntid.x;
+    mov.u32       %r4, %tid.x;
+    mad.lo.s32    %r5, %r2, %r3, %r4;   // i
