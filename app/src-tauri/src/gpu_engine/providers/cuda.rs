@@ -943,3 +943,161 @@ impl GpuProvider for CudaProvider {
 
     fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()> {
         if !self.available.load(Ordering::SeqCst) || !self.compute_ready.load(Ordering::SeqCst) {
+            return Err(GpuError::Unsupported {
+                provider: "cuda".to_string(),
+                detail: format!(
+                    "CUDA compute not available: {}",
+                    self.last_error()
+                        .unwrap_or_else(|| "not compute-ready".to_string())
+                ),
+            });
+        }
+        let supported = self.supported_workloads();
+        let sup = supported
+            .iter()
+            .find(|s| s.workload_id == requirement.workload_id)
+            .ok_or_else(|| GpuError::Unsupported {
+                provider: "cuda".to_string(),
+                detail: format!(
+                    "workload '{}' has no loaded PTX kernel on this device",
+                    requirement.workload_id
+                ),
+            })?;
+        if requirement.input_size as u64 > sup.max_elements {
+            return Err(GpuError::ResourceExhausted {
+                provider: "cuda".to_string(),
+                detail: format!(
+                    "{} needs {} elements, above the {} element CUDA cap",
+                    requirement.workload_id, requirement.input_size, sup.max_elements
+                ),
+            });
+        }
+        let caps = self.capabilities();
+        if let Some(max_buf) = caps.max_buffer_bytes {
+            if requirement.device_bytes > max_buf {
+                return Err(GpuError::ResourceExhausted {
+                    provider: "cuda".to_string(),
+                    detail: format!(
+                        "workload needs {} device bytes, above total VRAM {}",
+                        requirement.device_bytes, max_buf
+                    ),
+                });
+            }
+        }
+        let free = self.mem.read().map(|m| m.free_bytes).unwrap_or(None);
+        if let Some(free) = free {
+            if requirement.device_bytes > free {
+                return Err(GpuError::ResourceExhausted {
+                    provider: "cuda".to_string(),
+                    detail: format!(
+                        "workload needs {} device bytes, only {} free",
+                        requirement.device_bytes, free
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome> {
+        let start = Instant::now();
+        if !self.available.load(Ordering::SeqCst) || !self.compute_ready.load(Ordering::SeqCst) {
+            return Err(GpuError::DriverUnavailable {
+                provider: "cuda".to_string(),
+                detail: self
+                    .last_error()
+                    .unwrap_or_else(|| "CUDA provider is not initialized".to_string()),
+            });
+        }
+
+        let driver_guard = self.driver.lock().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "driver state lock poisoned".to_string(),
+        })?;
+        let drv = driver_guard.as_ref().ok_or_else(|| GpuError::DriverUnavailable {
+            provider: "cuda".to_string(),
+            detail: "CUDA driver state missing".to_string(),
+        })?;
+
+        let params = &request.params;
+        let inputs = params.make_inputs();
+        let run = run_cuda(drv, params, &inputs, &request.cancel, request.timeout, start)?;
+        let free_mib = drv.free_bytes / (1024 * 1024);
+        let total_mib = drv.total_bytes / (1024 * 1024);
+        drop(driver_guard);
+
+        // GPU providers MUST validate against the CPU reference.
+        let (validated, max_abs_error, validation_ns) = if request.validate {
+            let (err, ns) = validate_gpu("cuda", params, &inputs, &run.out)?;
+            (true, Some(err), ns)
+        } else {
+            (false, None, 0)
+        };
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+        let timing = TimingBreakdown {
+            setup_ns: run.setup_ns,
+            transfer_in_ns: run.transfer_in_ns,
+            compute_ns: run.compute_ns,
+            transfer_out_ns: run.transfer_out_ns,
+            validation_ns,
+            total_ns,
+            transferred_bytes: params.transfer_bytes(),
+        };
+
+        let devices = self.devices();
+        let (device_id, substituted) = pick_device_id(&devices, &request.device_id);
+        let mut notes = run.notes;
+        notes.push(format!(
+            "cuMemGetInfo_v2: {free_mib} MiB free / {total_mib} MiB total VRAM"
+        ));
+        if let Some(err) = max_abs_error {
+            notes.push(format!("validated vs CPU reference (max abs error {err:.3e})"));
+        }
+        if substituted {
+            notes.push(format!(
+                "requested device '{}' not found; used cuda-0",
+                request.device_id
+            ));
+        }
+
+        Ok(build_outcome(
+            "cuda",
+            "cuda",
+            device_id,
+            params,
+            &run.out,
+            timing,
+            run.peak_bytes,
+            notes,
+            validated,
+            max_abs_error,
+        ))
+    }
+
+    fn shutdown(&self) {
+        let mut guard = match self.driver.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(drv) = guard.take() {
+            if let Some(release) = drv.api.cu_device_primary_ctx_release {
+                unsafe {
+                    (release)(drv.device_ordinal);
+                }
+            }
+            // Dropping `drv` drops the Library and invalidates the retained
+            // context handle; the primary-context refcount was released above.
+        }
+        self.available.store(false, Ordering::SeqCst);
+        self.compute_ready.store(false, Ordering::SeqCst);
+        // Idempotent: a second call sees `None` and is a no-op.
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error
+            .read()
+            .map(|e| (*e).clone())
+            .unwrap_or(None)
+    }
+}
