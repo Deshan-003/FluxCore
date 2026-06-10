@@ -166,3 +166,88 @@ impl GpuProvider for CpuProvider {
     fn id(&self) -> &'static str {
         "cpu"
     }
+
+    fn label(&self) -> &'static str {
+        "CPU reference (scalar)"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Cpu
+    }
+
+    fn initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        self.ready.store(true, Ordering::SeqCst);
+        Ok(vec![Self::device()])
+    }
+
+    fn is_available(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    fn devices(&self) -> Vec<GpuDeviceInfo> {
+        vec![Self::device()]
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            compute_ready: true,
+            unavailable_reason: None,
+            max_threads_per_workgroup: None,
+            max_workgroup_size_x: None,
+            max_workgroup_size_y: None,
+            max_workgroup_size_z: None,
+            max_buffer_bytes: Some(MAX_CPU_BYTES),
+            allocation_alignment: 64,
+            backend_notes: vec![
+                "Scalar Rust loops; chunked for cooperative cancellation.".to_string(),
+                "No device memory is used (VRAM is never converted into RAM).".to_string(),
+            ],
+        }
+    }
+
+    fn supported_workloads(&self) -> Vec<WorkloadSupport> {
+        vec![
+            WorkloadSupport {
+                workload_id: "vector_axpy".to_string(),
+                max_elements: 64 * 1024 * 1024,
+                notes: vec!["n <= 64M (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "vector_scale".to_string(),
+                max_elements: 64 * 1024 * 1024,
+                notes: vec!["n <= 64M (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "matmul".to_string(),
+                max_elements: 2048,
+                notes: vec!["m,k,n <= 2048 (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "row_sum".to_string(),
+                max_elements: 32 * 1024 * 1024,
+                notes: vec!["rows*cols <= 32M (catalogue cap)".to_string()],
+            },
+        ]
+    }
+
+    fn memory_info(&self) -> Option<GpuMemoryInfo> {
+        None
+    }
+
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()> {
+        if !SUPPORTED.contains(&requirement.workload_id.as_str()) {
+            return Err(GpuError::Unsupported {
+                provider: "cpu".to_string(),
+                detail: format!("unknown workload id '{}'", requirement.workload_id),
+            });
+        }
+        if let Some(support) = self
+            .supported_workloads()
+            .into_iter()
+            .find(|support| support.workload_id == requirement.workload_id)
+        {
+            if requirement.input_size as u64 > support.max_elements {
+                return Err(GpuError::Unsupported {
+                    provider: "cpu".to_string(),
+                    detail: format!(
+                        "workload '{}' size {} above the provider cap {}",
