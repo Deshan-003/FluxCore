@@ -313,3 +313,161 @@ fn dev_download(api: &CudaApi, p: u64, out: &mut [f32]) -> GpuResult<()> {
     if code != 0 {
         return Err(exec_err(api, code, "cuMemcpyDtoH_v2"));
     }
+    Ok(())
+}
+
+fn launch(
+    api: &CudaApi,
+    function: usize,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    params: &mut Vec<*mut c_void>,
+) -> GpuResult<()> {
+    let code = unsafe {
+        (api.cu_launch_kernel)(
+            function as *mut c_void,
+            grid.0,
+            grid.1,
+            grid.2,
+            block.0,
+            block.1,
+            block.2,
+            0,
+            std::ptr::null_mut(),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(exec_err(api, code, "cuLaunchKernel"));
+    }
+    Ok(())
+}
+
+fn synchronize(api: &CudaApi) -> GpuResult<()> {
+    let code = unsafe { (api.cu_ctx_synchronize)() };
+    if code != 0 {
+        return Err(exec_err(api, code, "cuCtxSynchronize (possible WDDM TDR)"));
+    }
+    Ok(())
+}
+
+fn ceil_div(a: usize, b: usize) -> u32 {
+    ((a + b - 1) / b) as u32
+}
+
+// --- raw compute -----------------------------------------------------------
+
+fn run_cuda(
+    drv: &CudaDriver,
+    params: &WorkloadParams,
+    inputs: &WorkloadInputs,
+    cancel: &CancelToken,
+    timeout: Duration,
+    start: Instant,
+) -> GpuResult<CudaRun> {
+    let api = &drv.api;
+    let setup_start = Instant::now();
+
+    // CUDA contexts are per-thread. The primary context was made current on
+    // the initialize() thread, but execute() runs on a scheduler worker, so
+    // set it current here before any allocation/module work on this thread.
+    let code = unsafe { (api.cu_ctx_set_current)(drv.context as *mut c_void) };
+    if code != 0 {
+        return Err(exec_err(api, code, "cuCtxSetCurrent (execute thread)"));
+    }
+
+    // Find the loaded function for this workload (honest: never runs a kernel
+    // that was not JIT-loaded at initialize()).
+    let function = drv
+        .modules
+        .iter()
+        .find(|m| m.workload_id == params.workload_id())
+        .map(|m| m.function)
+        .ok_or_else(|| {
+            let reason = drv
+                .ptx_errors
+                .iter()
+                .find(|(id, _)| id.as_str() == params.workload_id())
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| "no PTX module was loaded for this workload".to_string());
+            GpuError::Unsupported {
+                provider: "cuda".to_string(),
+                detail: format!("{}: {reason}", params.workload_id()),
+            }
+        })?;
+
+    let block = drv.max_threads_per_block.min(256).max(1);
+    let mut notes = vec![
+        format!("CUDA driver API (nvcuda.dll), sm_75 PTX JIT, blockDim={block}"),
+        "compute capability read via cuDeviceGetAttribute".to_string(),
+    ];
+
+    // Everything up to here is setup (function lookup + preparation).
+    let setup_ns = setup_start.elapsed().as_nanos() as u64;
+
+    let mut out = vec![0.0f32; params.output_len()];
+    // Assigned in every match arm (verified by definite-assignment analysis).
+    let transfer_in_ns: u64;
+    let transfer_out_ns: u64;
+    let peak_bytes: u64;
+    let mut compute_ns = 0u64;
+
+    match *params {
+        WorkloadParams::VectorAxpy { n, a } | WorkloadParams::VectorScale { n, a } => {
+            let is_axpy = matches!(*params, WorkloadParams::VectorAxpy { .. });
+            // Allocate full device buffers once, then launch chunked slices by
+            // offsetting the device pointers (<= 1M elements per launch).
+            let up_start = Instant::now();
+            let (x_dev, x_bytes) = dev_upload(api, &inputs.x, n)?;
+            let (y_dev, y_bytes) = if is_axpy {
+                dev_upload(api, &inputs.y, n)?
+            } else {
+                (0u64, 0u64)
+            };
+            let (out_dev, out_bytes) = dev_alloc(api, n * 4).map(|p| (p, (n * 4) as u64))?;
+            transfer_in_ns = up_start.elapsed().as_nanos() as u64;
+            peak_bytes = x_bytes + y_bytes + out_bytes;
+
+            let mut offset = 0usize;
+            while offset < n {
+                check_interrupt("cuda", cancel, start, timeout)?;
+                let len = (n - offset).min(VECTOR_CHUNK);
+                let byte_off = (offset * 4) as u64;
+                let px = x_dev + byte_off;
+                let po = out_dev + byte_off;
+                let n32 = len as u32;
+                let grid = (ceil_div(len, block as usize), 1, 1);
+                let blk = (block, 1, 1);
+                let compute_start = Instant::now();
+                if is_axpy {
+                    let py = y_dev + byte_off;
+                    let mut kp: Vec<*mut c_void> = vec![
+                        &px as *const u64 as *mut c_void,
+                        &py as *const u64 as *mut c_void,
+                        &po as *const u64 as *mut c_void,
+                        &a as *const f32 as *mut c_void,
+                        &n32 as *const u32 as *mut c_void,
+                    ];
+                    launch(api, function, grid, blk, &mut kp)?;
+                } else {
+                    let mut kp: Vec<*mut c_void> = vec![
+                        &px as *const u64 as *mut c_void,
+                        &po as *const u64 as *mut c_void,
+                        &a as *const f32 as *mut c_void,
+                        &n32 as *const u32 as *mut c_void,
+                    ];
+                    launch(api, function, grid, blk, &mut kp)?;
+                }
+                synchronize(api)?;
+                compute_ns += compute_start.elapsed().as_nanos() as u64;
+                offset += len;
+            }
+
+            let down_start = Instant::now();
+            dev_download(api, out_dev, &mut out)?;
+            transfer_out_ns = down_start.elapsed().as_nanos() as u64;
+
+            dev_free(api, x_dev);
+            if y_dev != 0 {
+                dev_free(api, y_dev);
