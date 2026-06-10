@@ -25,3 +25,17 @@
     mov.u32       %r3, %ntid.x;
     mov.u32       %r4, %tid.x;
     mad.lo.s32    %r5, %r2, %r3, %r4;   // i
+
+    setp.ge.s32   %p1, %r5, %r1;
+    @%p1 bra      DONE;
+
+    mul.wide.u32  %rd3, %r5, 4;
+    add.u64       %rd4, %rd1, %rd3;     // &x[i]
+    add.u64       %rd5, %rd2, %rd3;     // &out[i]
+    ld.global.f32 %f2, [%rd4];
+    mul.f32       %f3, %f1, %f2;        // a * x
+    st.global.f32 [%rd5], %f3;
+
+DONE:
+    ret;
+}
