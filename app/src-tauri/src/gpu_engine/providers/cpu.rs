@@ -251,3 +251,87 @@ impl GpuProvider for CpuProvider {
                     provider: "cpu".to_string(),
                     detail: format!(
                         "workload '{}' size {} above the provider cap {}",
+                        requirement.workload_id, requirement.input_size, support.max_elements
+                    ),
+                });
+            }
+        }
+        if requirement.device_bytes > MAX_CPU_BYTES {
+            return Err(GpuError::ResourceExhausted {
+                provider: "cpu".to_string(),
+                detail: format!(
+                    "workload needs {} host bytes, above the {} byte CPU cap",
+                    requirement.device_bytes, MAX_CPU_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome> {
+        let start = Instant::now();
+        let params = &request.params;
+
+        let setup_start = Instant::now();
+        let inputs = params.make_inputs();
+        let setup_ns = setup_start.elapsed().as_nanos() as u64;
+
+        let mut out = vec![0.0f32; params.output_len()];
+        let compute_start = Instant::now();
+        run_chunked(
+            params,
+            &inputs,
+            &mut out,
+            "cpu",
+            &request.cancel,
+            request.timeout,
+            start,
+        )?;
+        let compute_ns = compute_start.elapsed().as_nanos() as u64;
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+        let timing = TimingBreakdown {
+            setup_ns,
+            transfer_in_ns: 0,
+            compute_ns,
+            transfer_out_ns: 0,
+            validation_ns: 0,
+            total_ns,
+            transferred_bytes: 0,
+        };
+
+        let devices = self.devices();
+        let (device_id, substituted) = pick_device_id(&devices, &request.device_id);
+        let mut notes = vec![
+            "CPU scalar reference; output is bit-identical to WorkloadParams::run_cpu.".to_string(),
+            format!("chunked outer loop (budget {CHUNK} work elements/chunk)"),
+        ];
+        if substituted {
+            notes.push(format!(
+                "requested device '{}' not found; used CPU device",
+                request.device_id
+            ));
+        }
+
+        Ok(build_outcome(
+            "cpu",
+            "cpu",
+            device_id,
+            params,
+            &out,
+            timing,
+            0,
+            notes,
+            false,
+            None,
+        ))
+    }
+
+    fn shutdown(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+}
