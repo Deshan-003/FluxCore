@@ -1,0 +1,14 @@
+// scale: out[i] = a * x[i]
+// Param order: .u64 pX, .u64 pOut, .f32 pA, .u32 pN
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry scale(
+    .param .u64 pX,
+    .param .u64 pOut,
+    .param .f32 pA,
+    .param .u32 pN
+)
+{
+    .reg .pred %p<2>;
