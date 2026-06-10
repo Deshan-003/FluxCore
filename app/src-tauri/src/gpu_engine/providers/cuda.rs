@@ -156,3 +156,160 @@ impl CudaApi {
     /// Real driver error text via `cuGetErrorString`.
     fn error_string(&self, code: i32) -> String {
         let mut p: *const i8 = std::ptr::null();
+        let r = unsafe { (self.cu_get_error_string)(code, &mut p) };
+        if r == 0 && !p.is_null() {
+            // SAFETY: CUDA returns a pointer to a static, NUL-terminated string.
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().to_string()
+        } else {
+            format!("CUDA error code {code}")
+        }
+    }
+}
+
+// --- error mappers ---------------------------------------------------------
+
+fn init_err(api: &CudaApi, code: i32, ctx: &str) -> GpuError {
+    GpuError::InitializationFailed {
+        provider: "cuda".to_string(),
+        code: Some(code),
+        detail: format!("{ctx}: {}", api.error_string(code)),
+    }
+}
+fn exec_err(api: &CudaApi, code: i32, ctx: &str) -> GpuError {
+    GpuError::ExecutionFailed {
+        provider: "cuda".to_string(),
+        code: Some(code),
+        detail: format!("{ctx}: {}", api.error_string(code)),
+    }
+}
+fn resource_err(api: &CudaApi, code: i32, ctx: &str) -> GpuError {
+    GpuError::ResourceExhausted {
+        provider: "cuda".to_string(),
+        detail: format!("{ctx}: {}", api.error_string(code)),
+    }
+}
+
+/// Format a `cuDriverGetVersion` integer (e.g. 13010 -> "13.1").
+fn format_driver_version(v: i32) -> String {
+    format!("{}.{}", v / 1000, (v % 1000) / 10)
+}
+
+/// Lightweight, independent driver-version probe used by `capability.rs`.
+/// Loads nvcuda.dll, initializes, reads the version via `cuDriverGetVersion`
+/// and drops the library. Does not create a context or touch NVML.
+pub fn probe_driver_version() -> Option<String> {
+    let api = CudaApi::load().ok()?;
+    let code = unsafe { (api.cu_init)(0) };
+    if code != 0 {
+        return None;
+    }
+    let mut v: i32 = 0;
+    let code = unsafe { (api.cu_driver_get_version)(&mut v) };
+    (code == 0 && v > 0).then(|| format_driver_version(v))
+}
+
+// --- driver state ----------------------------------------------------------
+
+struct CudaModule {
+    workload_id: &'static str,
+    _module: usize,  // CUmodule handle (owned; released with the context)
+    function: usize, // CUfunction handle
+}
+
+/// All state that must stay alive between calls. Handles are stored as `usize`
+/// so this struct is `Send` (raw pointers are not), allowing it to live inside
+/// a `Mutex` behind `Arc<dyn GpuProvider>`.
+struct CudaDriver {
+    api: CudaApi,
+    context: usize, // CUcontext (primary context of device 0)
+    device_ordinal: i32,
+    modules: Vec<CudaModule>,
+    ptx_errors: Vec<(String, String)>, // (workload_id, driver error text)
+    max_threads_per_block: u32,
+    free_bytes: u64,
+    total_bytes: u64,
+}
+
+/// Result of the raw CUDA compute (before validation/outcome assembly).
+struct CudaRun {
+    out: Vec<f32>,
+    setup_ns: u64,
+    transfer_in_ns: u64,
+    compute_ns: u64,
+    transfer_out_ns: u64,
+    peak_bytes: u64,
+    notes: Vec<String>,
+}
+
+pub struct CudaProvider {
+    driver: Mutex<Option<CudaDriver>>,
+    available: AtomicBool,
+    compute_ready: AtomicBool,
+    devices: RwLock<Vec<GpuDeviceInfo>>,
+    caps: RwLock<ProviderCapabilities>,
+    supported: RwLock<Vec<WorkloadSupport>>,
+    mem: RwLock<GpuMemoryInfo>,
+    last_error: RwLock<Option<String>>,
+}
+
+impl CudaProvider {
+    pub fn new() -> Self {
+        CudaProvider {
+            driver: Mutex::new(None),
+            available: AtomicBool::new(false),
+            compute_ready: AtomicBool::new(false),
+            devices: RwLock::new(Vec::new()),
+            caps: RwLock::new(ProviderCapabilities::default()),
+            supported: RwLock::new(Vec::new()),
+            mem: RwLock::new(GpuMemoryInfo::default()),
+            last_error: RwLock::new(None),
+        }
+    }
+}
+
+impl Default for CudaProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// --- device-buffer helpers -------------------------------------------------
+
+fn dev_alloc(api: &CudaApi, bytes: usize) -> GpuResult<u64> {
+    let mut p: u64 = 0;
+    let code = unsafe { (api.cu_mem_alloc)(&mut p, bytes) };
+    if code != 0 {
+        return Err(resource_err(api, code, "cuMemAlloc_v2"));
+    }
+    Ok(p)
+}
+
+/// Allocate `floats` f32 values and upload `data` (which must be at least that
+/// long). Returns the device pointer plus the byte count.
+fn dev_upload(api: &CudaApi, data: &[f32], floats: usize) -> GpuResult<(u64, u64)> {
+    let bytes = (floats * 4) as u64;
+    let p = dev_alloc(api, bytes as usize)?;
+    let code = unsafe {
+        (api.cu_memcpy_hto_d)(p, data.as_ptr() as *const c_void, bytes as usize)
+    };
+    if code != 0 {
+        unsafe { (api.cu_mem_free)(p) };
+        return Err(exec_err(api, code, "cuMemcpyHtoD_v2"));
+    }
+    Ok((p, bytes))
+}
+
+fn dev_free(api: &CudaApi, p: u64) {
+    if p != 0 {
+        unsafe {
+            (api.cu_mem_free)(p);
+        }
+    }
+}
+
+fn dev_download(api: &CudaApi, p: u64, out: &mut [f32]) -> GpuResult<()> {
+    let bytes = out.len() * 4;
+    let code = unsafe { (api.cu_memcpy_dto_h)(out.as_mut_ptr() as *mut c_void, p, bytes) };
+    if code != 0 {
+        return Err(exec_err(api, code, "cuMemcpyDtoH_v2"));
+    }
