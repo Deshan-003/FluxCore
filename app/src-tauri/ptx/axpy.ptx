@@ -1,0 +1,18 @@
+// axpy: out[i] = a * x[i] + y[i]
+// Phase 3 / Subagent 2. Hand-authored PTX, JIT-compiled by the CUDA driver
+// (cuModuleLoadData) at runtime. No nvcc / CUDA toolkit required.
+//
+// Kernel param order MUST match cuda.rs launch_kernel's kernelParams array:
+//   .param .u64 pX, .param .u64 pY, .param .u64 pOut,
+//   .param .f32 pA, .param .u32 pN
+// Each pointer is a CUdeviceptr (already a global-space 64-bit address), so
+// ld.global / st.global can be used directly.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry axpy(
+    .param .u64 pX,
+    .param .u64 pY,
+    .param .u64 pOut,
+    .param .f32 pA,
