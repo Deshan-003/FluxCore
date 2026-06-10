@@ -628,3 +628,161 @@ impl CudaProvider {
                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
                     dev,
                 );
+                (api.cu_device_get_attribute)(
+                    &mut minor,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    dev,
+                );
+            }
+            let compute_capability = if major > 0 {
+                Some(format!("{major}.{minor}"))
+            } else {
+                None
+            };
+            if ordinal == 0 {
+                let mut mt: i32 = 0;
+                if unsafe {
+                    (api.cu_device_get_attribute)(
+                        &mut mt,
+                        CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                        dev,
+                    )
+                } == 0
+                    && mt > 0
+                {
+                    max_threads_per_block = mt as u32;
+                }
+            }
+            devices.push(GpuDeviceInfo {
+                device_id: format!("cuda-{ordinal}"),
+                name,
+                vendor: "NVIDIA".to_string(),
+                backend: "cuda-driver".to_string(),
+                monitor_gpu_index: None,
+                dedicated_total_bytes: None,
+                dedicated_free_bytes: None,
+                compute_capability,
+                driver_version: driver_version.clone(),
+                max_workgroup_size: Some(max_threads_per_block),
+                max_storage_buffer_bytes: None, // will be filled after cuMemGetInfo
+                is_discrete: true,
+                notes: vec!["Discovered via CUDA driver API (primary context).".to_string()],
+            });
+        }
+
+        if devices.is_empty() {
+            return Err(GpuError::InitializationFailed {
+                provider: "cuda".to_string(),
+                code: None,
+                detail: "no CUDA device could be queried with cuDeviceGet".to_string(),
+            });
+        }
+
+        // Retain device 0's primary context and make it current. This is the
+        // only context the provider ever creates (R8: no NVML conflicts).
+        let ordinal0: i32 = 0;
+        let mut dev0: i32 = -1;
+        let code = unsafe { (api.cu_device_get)(&mut dev0, ordinal0) };
+        if code != 0 {
+            return Err(init_err(&api, code, "cuDeviceGet(0)"));
+        }
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        let code = unsafe { (api.cu_device_primary_ctx_retain)(&mut ctx, dev0) };
+        if code != 0 {
+            return Err(init_err(&api, code, "cuDevicePrimaryCtxRetain"));
+        }
+        let code = unsafe { (api.cu_ctx_set_current)(ctx) };
+        if code != 0 {
+            return Err(init_err(&api, code, "cuCtxSetCurrent"));
+        }
+
+        // Free/total VRAM via the driver API (not NVML).
+        let mut free_b: usize = 0;
+        let mut total_b: usize = 0;
+        let mem_ok = unsafe { (api.cu_mem_get_info)(&mut free_b, &mut total_b) } == 0;
+        let (free_bytes, total_bytes) = if mem_ok {
+            (free_b as u64, total_b as u64)
+        } else {
+            (0, 0)
+        };
+        if let Some(d) = devices.first_mut() {
+            if total_bytes > 0 {
+                d.dedicated_total_bytes = Some(total_bytes);
+                d.dedicated_free_bytes = Some(free_bytes);
+                d.max_storage_buffer_bytes = Some(total_bytes);
+            }
+        }
+
+        // JIT-load each PTX module. Only successfully loaded modules are
+        // advertised. A load failure is recorded as an honest Unsupported
+        // reason and never faked as success (contract §8.2).
+        let mut modules: Vec<CudaModule> = Vec::new();
+        let mut ptx_errors: Vec<(String, String)> = Vec::new();
+        let mut supported: Vec<WorkloadSupport> = Vec::new();
+        for (workload_id, entry, ptx) in KERNELS.iter() {
+            let cstr = match CString::new(*ptx) {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("embedded PTX contains an interior NUL: {e}");
+                    ptx_errors.push((workload_id.to_string(), reason.clone()));
+                    continue;
+                }
+            };
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let code = unsafe {
+                (api.cu_module_load_data)(&mut module, cstr.as_ptr() as *const c_void)
+            };
+            if code != 0 {
+                let reason = format!("cuModuleLoadData (PTX JIT) failed: {}", api.error_string(code));
+                ptx_errors.push((workload_id.to_string(), reason));
+                continue;
+            }
+            let name = match CString::new(*entry) {
+                Ok(c) => c,
+                Err(_) => {
+                    ptx_errors.push((workload_id.to_string(), "bad entry-point name".to_string()));
+                    continue;
+                }
+            };
+            let mut function: *mut c_void = std::ptr::null_mut();
+            let code = unsafe {
+                (api.cu_module_get_function)(&mut function, module, name.as_ptr())
+            };
+            if code != 0 {
+                let reason = format!(
+                    "cuModuleGetFunction('{entry}') failed: {}",
+                    api.error_string(code)
+                );
+                ptx_errors.push((workload_id.to_string(), reason));
+                continue;
+            }
+            modules.push(CudaModule {
+                workload_id: *workload_id,
+                _module: module as usize,
+                function: function as usize,
+            });
+            let max_elements = match *workload_id {
+                "vector_axpy" | "vector_scale" => 64 * 1024 * 1024,
+                "matmul" => 2048,
+                _ => 32 * 1024 * 1024,
+            };
+            supported.push(WorkloadSupport {
+                workload_id: workload_id.to_string(),
+                max_elements,
+                notes: vec!["sm_75 PTX JIT-loaded successfully via cuModuleLoadData".to_string()],
+            });
+        }
+
+        let compute_ready = !modules.is_empty();
+        let ptx_error_note = if ptx_errors.is_empty() {
+            None
+        } else {
+            Some(
+                ptx_errors
+                    .iter()
+                    .map(|(id, r)| format!("{id}: {r}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        };
+
