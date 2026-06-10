@@ -471,3 +471,160 @@ fn run_cuda(
             dev_free(api, x_dev);
             if y_dev != 0 {
                 dev_free(api, y_dev);
+            }
+            dev_free(api, out_dev);
+            if offset != n {
+                notes.push(format!("processed {offset}/{n} elements"));
+            } else {
+                notes.push(format!("{n} elements in {} chunk(s)", ceil_div(n, VECTOR_CHUNK)));
+            }
+        }
+        WorkloadParams::Matmul { m, k, n } => {
+            check_interrupt("cuda", cancel, start, timeout)?;
+            let up_start = Instant::now();
+            let (a_dev, a_bytes) = dev_upload(api, &inputs.x, m * k)?;
+            let (b_dev, b_bytes) = dev_upload(api, &inputs.y, k * n)?;
+            let (c_dev, c_bytes) = dev_alloc(api, m * n * 4).map(|p| (p, (m * n * 4) as u64))?;
+            transfer_in_ns = up_start.elapsed().as_nanos() as u64;
+            peak_bytes = a_bytes + b_bytes + c_bytes;
+
+            // 2D grid: x -> columns (j), y -> rows (i). tile*tile <= maxThreads.
+            let mut tile = 16u32;
+            while tile * tile > drv.max_threads_per_block && tile > 1 {
+                tile /= 2;
+            }
+            let grid = (ceil_div(n, tile as usize), ceil_div(m, tile as usize), 1);
+            let blk = (tile, tile, 1);
+            let m32 = m as u32;
+            let k32 = k as u32;
+            let n32 = n as u32;
+            let compute_start = Instant::now();
+            let mut kp: Vec<*mut c_void> = vec![
+                &a_dev as *const u64 as *mut c_void,
+                &b_dev as *const u64 as *mut c_void,
+                &c_dev as *const u64 as *mut c_void,
+                &m32 as *const u32 as *mut c_void,
+                &k32 as *const u32 as *mut c_void,
+                &n32 as *const u32 as *mut c_void,
+            ];
+            launch(api, function, grid, blk, &mut kp)?;
+            synchronize(api)?;
+            compute_ns = compute_start.elapsed().as_nanos() as u64;
+
+            let down_start = Instant::now();
+            dev_download(api, c_dev, &mut out)?;
+            transfer_out_ns = down_start.elapsed().as_nanos() as u64;
+
+            dev_free(api, a_dev);
+            dev_free(api, b_dev);
+            dev_free(api, c_dev);
+            notes.push(format!("naive matmul {m}x{k}x{n}, 2D grid tile {tile}"));
+        }
+        WorkloadParams::RowSum { rows, cols } => {
+            check_interrupt("cuda", cancel, start, timeout)?;
+            let up_start = Instant::now();
+            let (a_dev, a_bytes) = dev_upload(api, &inputs.x, rows * cols)?;
+            let (o_dev, o_bytes) = dev_alloc(api, rows * 4).map(|p| (p, (rows * 4) as u64))?;
+            transfer_in_ns = up_start.elapsed().as_nanos() as u64;
+            peak_bytes = a_bytes + o_bytes;
+
+            let grid = (ceil_div(rows, block as usize), 1, 1);
+            let blk = (block, 1, 1);
+            let rows32 = rows as u32;
+            let cols32 = cols as u32;
+            let compute_start = Instant::now();
+            let mut kp: Vec<*mut c_void> = vec![
+                &a_dev as *const u64 as *mut c_void,
+                &o_dev as *const u64 as *mut c_void,
+                &rows32 as *const u32 as *mut c_void,
+                &cols32 as *const u32 as *mut c_void,
+            ];
+            launch(api, function, grid, blk, &mut kp)?;
+            synchronize(api)?;
+            compute_ns = compute_start.elapsed().as_nanos() as u64;
+
+            let down_start = Instant::now();
+            dev_download(api, o_dev, &mut out)?;
+            transfer_out_ns = down_start.elapsed().as_nanos() as u64;
+
+            dev_free(api, a_dev);
+            dev_free(api, o_dev);
+            notes.push(format!("row_sum {rows}x{cols}, one thread per row"));
+        }
+    }
+
+    check_interrupt("cuda", cancel, start, timeout)?;
+    Ok(CudaRun {
+        out,
+        setup_ns,
+        transfer_in_ns,
+        compute_ns,
+        transfer_out_ns,
+        peak_bytes,
+        notes,
+    })
+}
+
+// --- initialization --------------------------------------------------------
+
+impl CudaProvider {
+    fn do_initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        let api = CudaApi::load().map_err(|detail| GpuError::DriverUnavailable {
+            provider: "cuda".to_string(),
+            detail,
+        })?;
+
+        let code = unsafe { (api.cu_init)(0) };
+        if code != 0 {
+            return Err(init_err(&api, code, "cuInit(0)"));
+        }
+
+        let mut driver_version: Option<String> = None;
+        let mut v: i32 = 0;
+        if unsafe { (api.cu_driver_get_version)(&mut v) } == 0 && v > 0 {
+            driver_version = Some(format_driver_version(v));
+        }
+
+        let mut count: i32 = 0;
+        let code = unsafe { (api.cu_device_get_count)(&mut count) };
+        if code != 0 {
+            return Err(init_err(&api, code, "cuDeviceGetCount"));
+        }
+        if count <= 0 {
+            return Err(GpuError::InitializationFailed {
+                provider: "cuda".to_string(),
+                code: None,
+                detail: "cuInit succeeded but no CUDA device was found (cuDeviceGetCount == 0)"
+                    .to_string(),
+            });
+        }
+
+        // Enumerate every device (names + compute capability) for the UI.
+        let mut devices: Vec<GpuDeviceInfo> = Vec::new();
+        let mut max_threads_per_block: u32 = 256;
+        for ordinal in 0..count {
+            let mut dev: i32 = -1;
+            if unsafe { (api.cu_device_get)(&mut dev, ordinal) } != 0 {
+                continue;
+            }
+            let mut name_buf = [0i8; 256];
+            let name = if unsafe {
+                (api.cu_device_get_name)(name_buf.as_mut_ptr(), name_buf.len() as i32, dev)
+            } == 0
+            {
+                // SAFETY: CUDA writes a NUL-terminated name into name_buf.
+                unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                format!("NVIDIA CUDA device {ordinal}")
+            };
+
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                (api.cu_device_get_attribute)(
+                    &mut major,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    dev,
+                );
