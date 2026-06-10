@@ -82,3 +82,87 @@ fn run_chunked(
                 check_interrupt(provider, cancel, started, timeout)?;
                 let e = (s + step).min(n);
                 let sub = WorkloadParams::VectorAxpy { n: e - s, a };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[s..e].to_vec(),
+                    y: inputs.y[s..e].to_vec(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[s..e]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                s = e;
+            }
+        }
+        WorkloadParams::VectorScale { n, a } => {
+            let step = n.min(CHUNK).max(1);
+            let mut s = 0usize;
+            while s < n {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let e = (s + step).min(n);
+                let sub = WorkloadParams::VectorScale { n: e - s, a };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[s..e].to_vec(),
+                    y: Vec::new(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[s..e]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                s = e;
+            }
+        }
+        WorkloadParams::Matmul { m, k, n } => {
+            let rows_per_chunk = (CHUNK / n.max(1)).max(1);
+            let mut rs = 0usize;
+            while rs < m {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let re = (rs + rows_per_chunk).min(m);
+                let sub = WorkloadParams::Matmul { m: re - rs, k, n };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[rs * k..re * k].to_vec(),
+                    y: inputs.y.clone(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[rs * n..re * n])
+                    .map_err(|err| GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    })?;
+                rs = re;
+            }
+        }
+        WorkloadParams::RowSum { rows, cols } => {
+            let rows_per_chunk = (CHUNK / cols.max(1)).max(1);
+            let mut rs = 0usize;
+            while rs < rows {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let re = (rs + rows_per_chunk).min(rows);
+                let sub = WorkloadParams::RowSum {
+                    rows: re - rs,
+                    cols,
+                };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[rs * cols..re * cols].to_vec(),
+                    y: Vec::new(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[rs..re]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                rs = re;
+            }
+        }
+    }
+    check_interrupt(provider, cancel, started, timeout)?;
+    Ok(())
+}
+
+impl GpuProvider for CpuProvider {
+    fn id(&self) -> &'static str {
+        "cpu"
+    }
