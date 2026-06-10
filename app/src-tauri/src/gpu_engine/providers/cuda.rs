@@ -786,3 +786,160 @@ impl CudaProvider {
             )
         };
 
+        let caps = ProviderCapabilities {
+            compute_ready,
+            unavailable_reason: if compute_ready {
+                None
+            } else {
+                Some(
+                    ptx_error_note
+                        .clone()
+                        .unwrap_or_else(|| "no PTX module could be loaded".to_string()),
+                )
+            },
+            max_threads_per_workgroup: Some(max_threads_per_block),
+            max_workgroup_size_x: Some(max_threads_per_block),
+            max_workgroup_size_y: Some(1024),
+            max_workgroup_size_z: Some(64),
+            max_buffer_bytes: if total_bytes > 0 {
+                Some(total_bytes)
+            } else {
+                None
+            },
+            allocation_alignment: 256,
+            backend_notes: {
+                let mut n = vec![
+                    "CUDA driver API via nvcuda.dll (no CUDA toolkit installed)".to_string(),
+                    "Embedded sm_75 PTX JIT-compiled at runtime by the driver".to_string(),
+                    format!("{} PTX module(s) loaded", modules.len()),
+                ];
+                if let Some(note) = &ptx_error_note {
+                    n.push(format!("PTX load failures: {note}"));
+                }
+                n
+            },
+        };
+
+        let mem = GpuMemoryInfo {
+            total_bytes: if total_bytes > 0 { Some(total_bytes) } else { None },
+            free_bytes: if total_bytes > 0 { Some(free_bytes) } else { None },
+            used_bytes: if total_bytes > 0 {
+                Some(total_bytes.saturating_sub(free_bytes))
+            } else {
+                None
+            },
+            allocated_bytes: 0,
+        };
+
+        let driver = CudaDriver {
+            api,
+            context: ctx as usize,
+            device_ordinal: dev0,
+            modules,
+            ptx_errors,
+            max_threads_per_block,
+            free_bytes,
+            total_bytes,
+        };
+
+        *self.driver.lock().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "driver state lock poisoned".to_string(),
+        })? = Some(driver);
+        *self.devices.write().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "devices lock poisoned".to_string(),
+        })? = devices.clone();
+        *self.caps.write().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "capabilities lock poisoned".to_string(),
+        })? = caps;
+        *self.supported.write().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "supported lock poisoned".to_string(),
+        })? = supported;
+        *self.mem.write().map_err(|_| GpuError::Internal {
+            provider: "cuda".to_string(),
+            detail: "memory lock poisoned".to_string(),
+        })? = mem;
+
+        self.available.store(true, Ordering::SeqCst);
+        self.compute_ready.store(compute_ready, Ordering::SeqCst);
+        *self.last_error.write().unwrap_or_else(|e| e.into_inner()) = None;
+
+        // Even if some modules failed, the provider is initialised and reports
+        // the honest subset. A total PTX failure still returns Ok (devices are
+        // real) but compute_ready = false so no workload is claimed.
+        Ok(devices)
+    }
+}
+
+// --- GpuProvider impl ------------------------------------------------------
+
+impl GpuProvider for CudaProvider {
+    fn id(&self) -> &'static str {
+        "cuda"
+    }
+
+    fn label(&self) -> &'static str {
+        "NVIDIA CUDA (driver API)"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Cuda
+    }
+
+    fn initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        // Idempotent fast path.
+        if self.available.load(Ordering::SeqCst) {
+            if let Ok(guard) = self.driver.lock() {
+                if guard.is_some() {
+                    return Ok(self.devices.read().map(|d| (*d).clone()).unwrap_or_default());
+                }
+            }
+        }
+        match self.do_initialize() {
+            Ok(devices) => Ok(devices),
+            Err(e) => {
+                self.available.store(false, Ordering::SeqCst);
+                self.compute_ready.store(false, Ordering::SeqCst);
+                *self
+                    .last_error
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                *self.caps.write().unwrap_or_else(|p| p.into_inner()) =
+                    ProviderCapabilities {
+                        compute_ready: false,
+                        unavailable_reason: Some(e.to_string()),
+                        ..ProviderCapabilities::default()
+                    };
+                Err(e)
+            }
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    fn devices(&self) -> Vec<GpuDeviceInfo> {
+        self.devices.read().map(|d| (*d).clone()).unwrap_or_default()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.caps.read().map(|c| (*c).clone()).unwrap_or_default()
+    }
+
+    fn supported_workloads(&self) -> Vec<WorkloadSupport> {
+        self.supported.read().map(|s| (*s).clone()).unwrap_or_default()
+    }
+
+    fn memory_info(&self) -> Option<GpuMemoryInfo> {
+        if !self.available.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(*self.mem.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()> {
+        if !self.available.load(Ordering::SeqCst) || !self.compute_ready.load(Ordering::SeqCst) {
