@@ -1,0 +1,25 @@
+// matmul: C(i,j) = sum_t A(i,t) * B(t,j),  A = x (m*k), B = y (k*n), C = out (m*n)
+// Param order: .u64 pA, .u64 pB, .u64 pC, .u32 pM, .u32 pK, .u32 pN
+//
+// Launched with a 2D grid so no integer division is needed:
+//   j = ctaid.x * ntid.x + tid.x  (column)
+//   i = ctaid.y * ntid.y + tid.y  (row)
+// Ascending-t accumulation with a separate mul then add (non-fused) to match
+// the CPU reference's arithmetic.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry matmul(
+    .param .u64 pA,
+    .param .u64 pB,
+    .param .u64 pC,
+    .param .u32 pM,
+    .param .u32 pK,
+    .param .u32 pN
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32  %f<6>;
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<12>;
