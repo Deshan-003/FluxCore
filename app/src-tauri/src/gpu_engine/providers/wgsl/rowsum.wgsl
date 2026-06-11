@@ -16,3 +16,21 @@ struct Params {
 @group(0) @binding(3) var<uniform>            params: Params;
 
 @compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups)       nwg: vec3<u32>) {
+    let rows = params.p0;
+    let cols = params.p1;
+    let stride = nwg.x * 64u;
+    var i = gid.x;
+    loop {
+        if (i >= rows) {
+            break;
+        }
+        var sum: f32 = 0.0;
+        for (var c: u32 = 0u; c < cols; c = c + 1u) {
+            sum = sum + x[i * cols + c];
+        }
+        out[i] = sum;
+        i = i + stride;
+    }
+}
