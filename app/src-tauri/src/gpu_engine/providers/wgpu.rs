@@ -405,3 +405,139 @@ impl WgpuProvider {
         let instance = wgpu::Instance::new(desc);
 
         let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        let adapters: Vec<wgpu::Adapter> = pollster::block_on(instance.enumerate_adapters(backends));
+        if adapters.is_empty() {
+            return Err(GpuError::InitializationFailed {
+                provider: "wgpu".to_string(),
+                code: None,
+                detail: "no DX12/Vulkan adapter was enumerated by wgpu".to_string(),
+            });
+        }
+
+        // Record every discovered adapter and create a device on the first one
+        // that succeeds. request_device is async in wgpu 30.
+        let mut devices: Vec<GpuDeviceInfo> = Vec::new();
+        let mut chosen: Option<(wgpu::Device, wgpu::Queue, wgpu::Limits, String, String)> = None;
+        for (idx, adapter) in adapters.iter().enumerate() {
+            let info = adapter.get_info();
+            let limits = adapter.limits();
+            let backend_str = match info.backend {
+                wgpu::Backend::Dx12 => "wgpu-dx12",
+                wgpu::Backend::Vulkan => "wgpu-vulkan",
+                _ => "wgpu-other",
+            };
+            let device_id = format!("{backend_str}-{idx}");
+            let is_discrete = matches!(info.device_type, wgpu::DeviceType::DiscreteGpu);
+            devices.push(GpuDeviceInfo {
+                device_id: device_id.clone(),
+                name: info.name.clone(),
+                vendor: format!("vendor id 0x{:x}", info.vendor),
+                backend: backend_str.to_string(),
+                monitor_gpu_index: None,
+                dedicated_total_bytes: None, // wgpu does not expose VRAM totals
+                dedicated_free_bytes: None,
+                compute_capability: None,
+                driver_version: if info.driver.is_empty() {
+                    None
+                } else {
+                    Some(info.driver.clone())
+                },
+                max_workgroup_size: Some(limits.max_compute_workgroup_size_x),
+                max_storage_buffer_bytes: Some(limits.max_storage_buffer_binding_size),
+                is_discrete,
+                notes: vec![format!(
+                    "wgpu 30 adapter ({}); driver info: {}",
+                    backend_str,
+                    if info.driver_info.is_empty() {
+                        "unavailable"
+                    } else {
+                        &info.driver_info
+                    }
+                )],
+            });
+
+            if chosen.is_none() {
+                let dev_desc = wgpu::DeviceDescriptor {
+                    label: Some("fluxcore-compute"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits.clone(),
+                    ..Default::default()
+                };
+                if let Ok((device, queue)) = pollster::block_on(adapter.request_device(&dev_desc)) {
+                    chosen = Some((
+                        device,
+                        queue,
+                        limits,
+                        backend_str.to_string(),
+                        device_id,
+                    ));
+                }
+            }
+        }
+
+        let (device, queue, limits, active_backend, _active_device_id) =
+            chosen.ok_or_else(|| GpuError::InitializationFailed {
+                provider: "wgpu".to_string(),
+                code: None,
+                detail: "wgpu found adapters but request_device failed on all of them".to_string(),
+            })?;
+
+        // Capture uncaptured wgpu errors instead of letting wgpu panic.
+        let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&error_slot);
+        let handler: Arc<dyn wgpu::UncapturedErrorHandler> = Arc::new(move |e: wgpu::Error| {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(format!("{e:?}"));
+            }
+        });
+        device.on_uncaptured_error(handler);
+
+        // Shared bind-group layout: binding 0 x (read storage), 1 y (read
+        // storage), 2 out (read_write storage), 3 params (uniform).
+        let read_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fluxcore-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_storage.clone(),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_storage,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fluxcore-pipeline-layout"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
