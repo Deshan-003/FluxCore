@@ -134,3 +134,138 @@ fn dispatch(
 ) -> GpuResult<WgpuRun> {
     let device = &inner.device;
     let queue = &inner.queue;
+    let out_bytes = (out_len * 4) as u64;
+
+    // Honest limit check on the largest single storage buffer binding.
+    let largest = (x.len().max(y.len()).max(out_len).saturating_mul(4)) as u64;
+    if largest > inner.max_storage_buffer_binding_size {
+        return Err(GpuError::ResourceExhausted {
+            provider: "wgpu".to_string(),
+            detail: format!(
+                "largest storage buffer ({largest} bytes) exceeds adapter max_storage_buffer_binding_size ({})",
+                inner.max_storage_buffer_binding_size
+            ),
+        });
+    }
+
+    let mut run = WgpuRun::default();
+
+    // transfer-in: upload x, y (or a 4-byte dummy) and the params uniform.
+    let t_in = Instant::now();
+    let x_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("fluxcore-x"),
+        contents: as_bytes(x),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let dummy = [0u8; 4];
+    let y_contents: &[u8] = if y.is_empty() { &dummy } else { as_bytes(y) };
+    let y_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("fluxcore-y"),
+        contents: y_contents,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("fluxcore-params"),
+        contents: &params,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    run.transfer_in_ns = t_in.elapsed().as_nanos() as u64;
+
+    // setup: output + readback buffers + bind group.
+    let t_setup = Instant::now();
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("fluxcore-out"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("fluxcore-readback"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fluxcore-bg"),
+        layout: &inner.bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &x_buf,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &y_buf,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &out_buf,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &params_buf,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+        ],
+    });
+    run.setup_ns = t_setup.elapsed().as_nanos() as u64;
+
+    // compute: record pass, copy to readback, submit, bounded wait.
+    let t_compute = Instant::now();
+    let wg = ((out_len as u64 + WORKGROUP as u64 - 1) / WORKGROUP as u64)
+        .min(inner.max_workgroups as u64)
+        .max(1) as u32;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        cpass.set_pipeline(pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(wg, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &readback_buf, 0, out_bytes);
+    let cmd = encoder.finish();
+    let index = queue.submit(std::iter::once(cmd));
+
+    // Register the map callback, then drive it to completion with a bounded
+    // wait so a hung GPU can never block the worker forever (R1 / R7).
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    readback_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res.is_ok());
+        });
+    let remaining = timeout.saturating_sub(start.elapsed()).max(Duration::from_millis(1));
+    match device.poll(wgpu::PollType::Wait {
+        submission_index: Some(index),
+        timeout: Some(remaining),
+    }) {
+        Ok(_) => {}
+        Err(wgpu::PollError::Timeout) => {
+            return Err(GpuError::Timeout {
+                provider: "wgpu".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(GpuError::ExecutionFailed {
+                provider: "wgpu".to_string(),
+                code: None,
+                detail: format!("device.poll(Wait): {e}"),
+            });
+        }
+    }
+    match rx.recv_timeout(Duration::from_millis(500)) {
