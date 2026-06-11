@@ -23,3 +23,29 @@
     .reg .f32  %f<6>;
     .reg .b32  %r<16>;
     .reg .b64  %rd<12>;
+
+    ld.param.u64  %rd1, [pA];
+    ld.param.u64  %rd2, [pB];
+    ld.param.u64  %rd3, [pC];
+    ld.param.u32  %r1,  [pM];        // m
+    ld.param.u32  %r2,  [pK];        // k
+    ld.param.u32  %r3,  [pN];        // n
+
+    mov.u32       %r5, %ctaid.x;
+    mov.u32       %r6, %ntid.x;
+    mov.u32       %r7, %tid.x;
+    mad.lo.s32    %r8, %r5, %r6, %r7;    // j
+    mov.u32       %r9, %ctaid.y;
+    mov.u32       %r10, %ntid.y;
+    mov.u32       %r11, %tid.y;
+    mad.lo.s32    %r12, %r9, %r10, %r11; // i
+
+    setp.ge.u32   %p1, %r12, %r1;        // i >= m
+    @%p1 bra      DONE;
+    setp.ge.u32   %p1, %r8, %r3;         // j >= n
+    @%p1 bra      DONE;
+
+    mov.f32       %f1, 0f00000000;       // sum = 0.0f
+    mov.u32       %r13, 0;               // t = 0
+
+LOOP:
