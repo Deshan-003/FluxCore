@@ -541,3 +541,139 @@ impl WgpuProvider {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
+
+        // Compile each WGSL module; advertise only pipelines that compiled
+        // without an uncaptured validation error.
+        let mut shaders: Vec<wgpu::ShaderModule> = Vec::new();
+        let mut pipelines: HashMap<&'static str, wgpu::ComputePipeline> = HashMap::new();
+        let mut supported: Vec<WorkloadSupport> = Vec::new();
+        let mut wgsl_errors: Vec<(String, String)> = Vec::new();
+        for (workload_id, wgsl) in KERNELS.iter() {
+            if let Ok(mut s) = error_slot.lock() {
+                *s = None;
+            }
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(*workload_id),
+                source: wgpu::ShaderSource::Wgsl((*wgsl).into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(*workload_id),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            // Flush validation errors to the handler, then inspect the slot.
+            let _ = device.poll(wgpu::PollType::Poll);
+            let captured = error_slot.lock().ok().and_then(|s| s.clone());
+            if let Some(err) = captured {
+                wgsl_errors.push((workload_id.to_string(), err));
+                continue;
+            }
+            shaders.push(shader);
+            pipelines.insert(*workload_id, pipeline);
+            let max_elements = match *workload_id {
+                "vector_axpy" | "vector_scale" => 64 * 1024 * 1024,
+                "matmul" => 2048,
+                _ => 32 * 1024 * 1024,
+            };
+            supported.push(WorkloadSupport {
+                workload_id: workload_id.to_string(),
+                max_elements,
+                notes: vec!["WGSL compute pipeline compiled successfully".to_string()],
+            });
+        }
+
+        let compute_ready = !pipelines.is_empty();
+        let wgsl_error_note = if wgsl_errors.is_empty() {
+            None
+        } else {
+            Some(
+                wgsl_errors
+                    .iter()
+                    .map(|(id, e)| format!("{id}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        };
+
+        let caps = ProviderCapabilities {
+            compute_ready,
+            unavailable_reason: if compute_ready {
+                None
+            } else {
+                Some(
+                    wgsl_error_note
+                        .clone()
+                        .unwrap_or_else(|| "no WGSL pipeline could be compiled".to_string()),
+                )
+            },
+            max_threads_per_workgroup: Some(limits.max_compute_invocations_per_workgroup),
+            max_workgroup_size_x: Some(limits.max_compute_workgroup_size_x),
+            max_workgroup_size_y: Some(limits.max_compute_workgroup_size_y),
+            max_workgroup_size_z: Some(limits.max_compute_workgroup_size_z),
+            max_buffer_bytes: Some(limits.max_buffer_size),
+            allocation_alignment: 4,
+            backend_notes: {
+                let mut n = vec![
+                    "wgpu 30.0.2, WGSL compute, DX12 + Vulkan adapters".to_string(),
+                    format!("{} WGSL pipeline(s) compiled", pipelines.len()),
+                    format!(
+                        "active backend {active_backend}; max_storage_buffer_binding_size={} bytes",
+                        limits.max_storage_buffer_binding_size
+                    ),
+                ];
+                if let Some(note) = &wgsl_error_note {
+                    n.push(format!("WGSL compile failures: {note}"));
+                }
+                n
+            },
+        };
+
+        let mem = GpuMemoryInfo::default(); // wgpu exposes no VRAM free/total
+
+        let inner = WgpuInner {
+            _instance: instance,
+            device,
+            queue,
+            bgl,
+            _pipeline_layout: pipeline_layout,
+            _shaders: shaders,
+            pipelines,
+            error_slot,
+            max_workgroups: limits.max_compute_workgroups_per_dimension,
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+        };
+
+        *self.inner.lock().map_err(|_| GpuError::Internal {
+            provider: "wgpu".to_string(),
+            detail: "inner state lock poisoned".to_string(),
+        })? = Some(inner);
+        *self.devices.write().map_err(|_| GpuError::Internal {
+            provider: "wgpu".to_string(),
+            detail: "devices lock poisoned".to_string(),
+        })? = devices.clone();
+        *self.caps.write().map_err(|_| GpuError::Internal {
+            provider: "wgpu".to_string(),
+            detail: "capabilities lock poisoned".to_string(),
+        })? = caps;
+        *self.supported.write().map_err(|_| GpuError::Internal {
+            provider: "wgpu".to_string(),
+            detail: "supported lock poisoned".to_string(),
+        })? = supported;
+        *self.mem.write().map_err(|_| GpuError::Internal {
+            provider: "wgpu".to_string(),
+            detail: "memory lock poisoned".to_string(),
+        })? = mem;
+
+        self.available.store(true, Ordering::SeqCst);
+        self.compute_ready.store(compute_ready, Ordering::SeqCst);
+        *self.last_error.write().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(devices)
+    }
+
+    fn record_failure(&self, e: &GpuError) {
+        self.available.store(false, Ordering::SeqCst);
+        self.compute_ready.store(false, Ordering::SeqCst);
+        *self
