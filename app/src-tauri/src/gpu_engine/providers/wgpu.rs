@@ -677,3 +677,138 @@ impl WgpuProvider {
         self.available.store(false, Ordering::SeqCst);
         self.compute_ready.store(false, Ordering::SeqCst);
         *self
+            .last_error
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+        *self
+            .caps
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = ProviderCapabilities {
+            compute_ready: false,
+            unavailable_reason: Some(e.to_string()),
+            ..ProviderCapabilities::default()
+        };
+    }
+}
+
+// --- GpuProvider impl ------------------------------------------------------
+
+impl GpuProvider for WgpuProvider {
+    fn id(&self) -> &'static str {
+        "wgpu"
+    }
+
+    fn label(&self) -> &'static str {
+        "wgpu (DX12 / Vulkan / WGSL)"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Wgpu
+    }
+
+    fn initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        // Idempotent fast path.
+        if self.available.load(Ordering::SeqCst) {
+            if let Ok(guard) = self.inner.lock() {
+                if guard.is_some() {
+                    return Ok(self.devices.read().map(|d| (*d).clone()).unwrap_or_default());
+                }
+            }
+        }
+        // Never let a wgpu panic escape the trait boundary.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.do_initialize()));
+        match result {
+            Ok(Ok(devices)) => Ok(devices),
+            Ok(Err(e)) => {
+                self.record_failure(&e);
+                Err(e)
+            }
+            Err(_) => {
+                let e = GpuError::InitializationFailed {
+                    provider: "wgpu".to_string(),
+                    code: None,
+                    detail: "wgpu initialization panicked (caught)".to_string(),
+                };
+                self.record_failure(&e);
+                Err(e)
+            }
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    fn devices(&self) -> Vec<GpuDeviceInfo> {
+        self.devices.read().map(|d| (*d).clone()).unwrap_or_default()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.caps.read().map(|c| (*c).clone()).unwrap_or_default()
+    }
+
+    fn supported_workloads(&self) -> Vec<WorkloadSupport> {
+        self.supported.read().map(|s| (*s).clone()).unwrap_or_default()
+    }
+
+    fn memory_info(&self) -> Option<GpuMemoryInfo> {
+        if !self.available.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(GpuMemoryInfo::default())
+    }
+
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()> {
+        if !self.available.load(Ordering::SeqCst) || !self.compute_ready.load(Ordering::SeqCst) {
+            return Err(GpuError::Unsupported {
+                provider: "wgpu".to_string(),
+                detail: format!(
+                    "wgpu compute not available: {}",
+                    self.last_error()
+                        .unwrap_or_else(|| "not compute-ready".to_string())
+                ),
+            });
+        }
+        let supported = self.supported_workloads();
+        let sup = supported
+            .iter()
+            .find(|s| s.workload_id == requirement.workload_id)
+            .ok_or_else(|| GpuError::Unsupported {
+                provider: "wgpu".to_string(),
+                detail: format!(
+                    "workload '{}' has no compiled WGSL pipeline",
+                    requirement.workload_id
+                ),
+            })?;
+        if requirement.input_size as u64 > sup.max_elements {
+            return Err(GpuError::ResourceExhausted {
+                provider: "wgpu".to_string(),
+                detail: format!(
+                    "{} needs {} elements, above the {} element wgpu cap",
+                    requirement.workload_id, requirement.input_size, sup.max_elements
+                ),
+            });
+        }
+        let caps = self.capabilities();
+        if let Some(max_buf) = caps.max_buffer_bytes {
+            if requirement.device_bytes > max_buf {
+                return Err(GpuError::ResourceExhausted {
+                    provider: "wgpu".to_string(),
+                    detail: format!(
+                        "workload needs {} device bytes, above adapter max_buffer_size {}",
+                        requirement.device_bytes, max_buf
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome> {
+        let start = Instant::now();
+        if !self.available.load(Ordering::SeqCst) || !self.compute_ready.load(Ordering::SeqCst) {
+            return Err(GpuError::DriverUnavailable {
+                provider: "wgpu".to_string(),
+                detail: self
+                    .last_error()
+                    .unwrap_or_else(|| "wgpu provider is not initialized".to_string()),
