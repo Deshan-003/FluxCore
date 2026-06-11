@@ -18,3 +18,24 @@ struct Params {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(num_workgroups)       nwg: vec3<u32>) {
+    let m = params.p0;
+    let k = params.p1;
+    let n = params.p2;
+    let total = m * n;
+    let stride = nwg.x * 64u;
+    var idx = gid.x;
+    loop {
+        if (idx >= total) {
+            break;
+        }
+        let i = idx / n;
+        let j = idx - i * n;
+        var sum: f32 = 0.0;
+        for (var t: u32 = 0u; t < k; t = t + 1u) {
+            let prod = x[i * k + t] * y[t * n + j];
+            sum = sum + prod;
+        }
+        out[idx] = sum;
+        idx = idx + stride;
+    }
+}
