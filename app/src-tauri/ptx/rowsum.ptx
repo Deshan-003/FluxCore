@@ -1,0 +1,18 @@
+// rowsum: out[i] = sum_c A(i,c),  A = x (rows*cols), y unused.
+// Param order: .u64 pA, .u64 pOut, .u32 pRows, .u32 pCols.
+// One thread per row, 1D grid. Ascending-column accumulation (plain adds) to
+// match the CPU reference exactly.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry rowsum(
+    .param .u64 pA,
+    .param .u64 pOut,
+    .param .u32 pRows,
+    .param .u32 pCols
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32  %f<5>;
+    .reg .b32  %r<12>;
