@@ -35,3 +35,21 @@
 
 LOOP:
     setp.ge.u32   %p2, %r7, %r2;         // c >= cols
+    @%p2 bra      STORE;
+
+    mad.lo.u32    %r8, %r6, %r2, %r7;    // idx = i*cols + c
+    mul.wide.u32  %rd3, %r8, 4;
+    add.u64       %rd4, %rd1, %rd3;      // &A[idx]
+    ld.global.f32 %f2, [%rd4];
+    add.f32       %f1, %f1, %f2;         // sum += A[idx]
+    add.u32       %r7, %r7, 1;           // c++
+    bra           LOOP;
+
+STORE:
+    mul.wide.u32  %rd5, %r6, 4;
+    add.u64       %rd6, %rd2, %rd5;      // &out[i]
+    st.global.f32 [%rd6], %f1;
+
+DONE:
+    ret;
+}
