@@ -49,3 +49,28 @@
     mov.u32       %r13, 0;               // t = 0
 
 LOOP:
+    setp.ge.u32   %p2, %r13, %r2;        // t >= k
+    @%p2 bra      STORE;
+
+    mad.lo.u32    %r14, %r12, %r2, %r13; // idxA = i*k + t
+    mad.lo.u32    %r15, %r13, %r3, %r8;  // idxB = t*n + j
+    mul.wide.u32  %rd4, %r14, 4;
+    mul.wide.u32  %rd5, %r15, 4;
+    add.u64       %rd7, %rd1, %rd4;      // &A[idxA]
+    add.u64       %rd8, %rd2, %rd5;      // &B[idxB]
+    ld.global.f32 %f2, [%rd7];
+    ld.global.f32 %f3, [%rd8];
+    mul.f32       %f4, %f2, %f3;         // A * B (non-fused)
+    add.f32       %f1, %f1, %f4;         // sum += A * B
+    add.u32       %r13, %r13, 1;         // t++
+    bra           LOOP;
+
+STORE:
+    mad.lo.u32    %r14, %r12, %r3, %r8;  // idx = i*n + j
+    mul.wide.u32  %rd6, %r14, 4;
+    add.u64       %rd9, %rd3, %rd6;      // &C[idx]
+    st.global.f32 [%rd9], %f1;
+
+DONE:
+    ret;
+}
