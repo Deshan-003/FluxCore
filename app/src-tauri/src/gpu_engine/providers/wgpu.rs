@@ -269,3 +269,139 @@ fn dispatch(
         }
     }
     match rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(GpuError::ExecutionFailed {
+                provider: "wgpu".to_string(),
+                code: None,
+                detail: "readback map_async failed (device lost or validation error)".to_string(),
+            });
+        }
+        Err(_) => {
+            return Err(GpuError::Timeout {
+                provider: "wgpu".to_string(),
+            });
+        }
+    }
+    run.compute_ns = t_compute.elapsed().as_nanos() as u64;
+
+    // transfer-out: read the mapped bytes back into f32 values.
+    let t_out = Instant::now();
+    let view = readback_buf.slice(..).get_mapped_range().map_err(|_| {
+        GpuError::ExecutionFailed {
+            provider: "wgpu".to_string(),
+            code: None,
+            detail: "get_mapped_range failed on readback buffer".to_string(),
+        }
+    })?;
+    let bytes: &[u8] = &view;
+    let out_f32 = from_bytes(bytes);
+    drop(view);
+    readback_buf.unmap();
+    run.transfer_out_ns = t_out.elapsed().as_nanos() as u64;
+
+    let y_bytes: u64 = if y.is_empty() { 4 } else { (y.len() * 4) as u64 };
+    run.peak_bytes = (x.len() * 4) as u64 + y_bytes + out_bytes * 2 + 16;
+    run.out = out_f32;
+    Ok(run)
+}
+
+fn accumulate(agg: &mut WgpuRun, d: &WgpuRun) {
+    agg.setup_ns += d.setup_ns;
+    agg.transfer_in_ns += d.transfer_in_ns;
+    agg.compute_ns += d.compute_ns;
+    agg.transfer_out_ns += d.transfer_out_ns;
+    agg.peak_bytes = agg.peak_bytes.max(d.peak_bytes);
+}
+
+// --- raw compute -----------------------------------------------------------
+
+fn run_wgpu(
+    inner: &WgpuInner,
+    params: &WorkloadParams,
+    inputs: &WorkloadInputs,
+    cancel: &CancelToken,
+    timeout: Duration,
+    start: Instant,
+) -> GpuResult<WgpuRun> {
+    let pipeline = inner.pipelines.get(params.workload_id()).ok_or_else(|| {
+        GpuError::Unsupported {
+            provider: "wgpu".to_string(),
+            detail: format!(
+                "workload '{}' has no compiled WGSL pipeline on this adapter",
+                params.workload_id()
+            ),
+        }
+    })?;
+
+    let mut agg = WgpuRun::default();
+    let mut out = vec![0.0f32; params.output_len()];
+
+    // Per-buffer float cap: keep every storage binding within the adapter's
+    // max_storage_buffer_binding_size and keep allocations modest.
+    let cap = (inner.max_storage_buffer_binding_size / 4).min(4_194_240) as usize;
+
+    match *params {
+        WorkloadParams::VectorAxpy { n, a } | WorkloadParams::VectorScale { n, a } => {
+            let is_axpy = matches!(*params, WorkloadParams::VectorAxpy { .. });
+            let step = n.min(cap).max(1);
+            let mut s = 0usize;
+            let mut chunks = 0u32;
+            while s < n {
+                check_interrupt("wgpu", cancel, start, timeout)?;
+                let e = (s + step).min(n);
+                let y: &[f32] = if is_axpy { &inputs.y[s..e] } else { &[] };
+                let pb = params_bytes((e - s) as u32, 0, 0, a);
+                let d = dispatch(inner, pipeline, &inputs.x[s..e], y, e - s, pb, timeout, start)?;
+                out[s..e].copy_from_slice(&d.out);
+                accumulate(&mut agg, &d);
+                s = e;
+                chunks += 1;
+            }
+            agg.notes.push(format!(
+                "WGSL vector kernel, workgroup_size({WORKGROUP}), {chunks} chunk(s), <= {wg} workgroups/dispatch",
+                wg = inner.max_workgroups
+            ));
+        }
+        WorkloadParams::Matmul { m, k, n } => {
+            check_interrupt("wgpu", cancel, start, timeout)?;
+            let pb = params_bytes(m as u32, k as u32, n as u32, 0.0);
+            let d = dispatch(inner, pipeline, &inputs.x, &inputs.y, m * n, pb, timeout, start)?;
+            copy_into(&mut out, &d.out);
+            accumulate(&mut agg, &d);
+            agg.notes.push(format!(
+                "WGSL naive matmul {m}x{k}x{n}, workgroup_size({WORKGROUP})"
+            ));
+        }
+        WorkloadParams::RowSum { rows, cols } => {
+            check_interrupt("wgpu", cancel, start, timeout)?;
+            let pb = params_bytes(rows as u32, cols as u32, 0, 0.0);
+            let d = dispatch(inner, pipeline, &inputs.x, &[], rows, pb, timeout, start)?;
+            copy_into(&mut out, &d.out);
+            accumulate(&mut agg, &d);
+            agg.notes.push(format!(
+                "WGSL row_sum {rows}x{cols}, one invocation per row, workgroup_size({WORKGROUP})"
+            ));
+        }
+    }
+
+    check_interrupt("wgpu", cancel, start, timeout)?;
+    agg.out = out;
+    Ok(agg)
+}
+
+fn copy_into(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+}
+
+// --- initialization --------------------------------------------------------
+
+impl WgpuProvider {
+    fn do_initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        // Instance with DX12 + Vulkan only (matching the crate features).
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        desc.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(desc);
+
+        let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
