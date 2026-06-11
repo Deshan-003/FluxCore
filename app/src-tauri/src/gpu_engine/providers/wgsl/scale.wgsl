@@ -12,3 +12,16 @@ struct Params {
 @group(0) @binding(3) var<uniform>            params: Params;
 
 @compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups)       nwg: vec3<u32>) {
+    let n = params.p0;
+    let stride = nwg.x * 64u;
+    var i = gid.x;
+    loop {
+        if (i >= n) {
+            break;
+        }
+        out[i] = params.a * x[i];
+        i = i + stride;
+    }
+}
