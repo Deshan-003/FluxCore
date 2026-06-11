@@ -812,3 +812,139 @@ impl GpuProvider for WgpuProvider {
                 detail: self
                     .last_error()
                     .unwrap_or_else(|| "wgpu provider is not initialized".to_string()),
+            });
+        }
+
+        // Lazy re-initialise if a previous device loss dropped the device.
+        {
+            let guard = self.inner.lock().map_err(|_| GpuError::Internal {
+                provider: "wgpu".to_string(),
+                detail: "inner state lock poisoned".to_string(),
+            })?;
+            if guard.is_none() {
+                drop(guard);
+                self.initialize()?;
+            }
+        }
+
+        let params = &request.params;
+        let inputs = params.make_inputs();
+        let mut drop_device = false;
+        let result: GpuResult<WgpuRun> = {
+            let guard = self.inner.lock().map_err(|_| GpuError::Internal {
+                provider: "wgpu".to_string(),
+                detail: "inner state lock poisoned".to_string(),
+            })?;
+            let inner = guard.as_ref().ok_or_else(|| GpuError::DriverUnavailable {
+                provider: "wgpu".to_string(),
+                detail: "wgpu device state missing".to_string(),
+            })?;
+            if let Ok(mut slot) = inner.error_slot.lock() {
+                *slot = None;
+            }
+            let r = run_wgpu(inner, params, &inputs, &request.cancel, request.timeout, start);
+            let captured = inner
+                .error_slot
+                .lock()
+                .ok()
+                .and_then(|s| s.clone());
+            if let Some(err) = captured {
+                drop_device = true;
+                Err(GpuError::ExecutionFailed {
+                    provider: "wgpu".to_string(),
+                    code: None,
+                    detail: format!("wgpu uncaptured error: {err}"),
+                })
+            } else {
+                r
+            }
+        };
+
+        if drop_device {
+            if let Ok(mut guard) = self.inner.lock() {
+                *guard = None; // drop Device/Queue/pipelines
+            }
+            self.available.store(false, Ordering::SeqCst);
+            self.compute_ready.store(false, Ordering::SeqCst);
+            *self
+                .last_error
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some("wgpu device lost / validation error; reset for next attempt".to_string());
+        }
+
+        let run = result?;
+
+        // GPU providers MUST validate against the CPU reference.
+        let (validated, max_abs_error, validation_ns) = if request.validate {
+            let (err, ns) = validate_gpu("wgpu", params, &inputs, &run.out)?;
+            (true, Some(err), ns)
+        } else {
+            (false, None, 0)
+        };
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+        let timing = TimingBreakdown {
+            setup_ns: run.setup_ns,
+            transfer_in_ns: run.transfer_in_ns,
+            compute_ns: run.compute_ns,
+            transfer_out_ns: run.transfer_out_ns,
+            validation_ns,
+            total_ns,
+            transferred_bytes: params.transfer_bytes(),
+        };
+
+        let devices = self.devices();
+        let (device_id, substituted) = pick_device_id(&devices, &request.device_id);
+        let mut notes = run.notes;
+        notes.push(format!(
+            "wgpu {} backend, WGSL pipeline, workgroup_size({WORKGROUP})",
+            backend_label(&devices)
+        ));
+        if let Some(err) = max_abs_error {
+            notes.push(format!("validated vs CPU reference (max abs error {err:.3e})"));
+        }
+        if substituted {
+            notes.push(format!(
+                "requested device '{}' not found; used first adapter",
+                request.device_id
+            ));
+        }
+
+        Ok(build_outcome(
+            "wgpu",
+            "wgpu",
+            device_id,
+            params,
+            &run.out,
+            timing,
+            run.peak_bytes,
+            notes,
+            validated,
+            max_abs_error,
+        ))
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = None; // releases Device/Queue/pipelines/buffers
+        }
+        self.available.store(false, Ordering::SeqCst);
+        self.compute_ready.store(false, Ordering::SeqCst);
+        // Idempotent: a second call sees `None` and is a no-op.
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error
+            .read()
+            .map(|e| (*e).clone())
+            .unwrap_or(None)
+    }
+}
+
+fn backend_label(devices: &[GpuDeviceInfo]) -> String {
+    devices
+        .first()
+        .map(|d| d.backend.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
