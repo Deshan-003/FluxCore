@@ -1,4 +1,5 @@
 pub mod database;
+pub mod gpu_engine;
 pub mod memory_engine;
 pub mod monitoring;
 
@@ -11,9 +12,16 @@ use monitoring::{HardwareCheckReport, HistoryPoint, MonitorEngine, MonitoringSet
 use std::sync::Arc;
 use tauri::{Manager, State};
 
+use gpu_engine::models::{
+    AccelerationConfig, AccelerationEnvironment, AccelerationMode, BenchmarkRecord,
+    BenchmarkRequest, GpuAccelerationState, GpuTask, ProviderStatus, SubmitTaskRequest,
+    SuitabilityAssessment, TaskStatus, WorkloadView,
+};
+
 struct AppState {
     engine: Arc<MonitorEngine>,
     memory: Arc<MemoryEngine>,
+    gpu: Arc<gpu_engine::GpuEngine>,
 }
 
 #[tauri::command]
@@ -92,16 +100,136 @@ fn set_dashboard_active(active: bool, state: State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: GPU acceleration commands. All state comes from GpuEngine; none of
+// these commands block on GPU execution (submit returns a queued task).
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_gpu_acceleration_state(state: State<'_, AppState>) -> Result<GpuAccelerationState, String> {
+    Ok(state.gpu.state())
+}
+
+#[tauri::command]
+fn set_acceleration_mode(
+    mode: AccelerationMode,
+    state: State<'_, AppState>,
+) -> Result<GpuAccelerationState, String> {
+    state.gpu.set_mode(mode)
+}
+
+#[tauri::command]
+fn get_gpu_resource_config(state: State<'_, AppState>) -> Result<AccelerationConfig, String> {
+    Ok(state.gpu.config())
+}
+
+#[tauri::command]
+fn update_gpu_resource_config(
+    config: AccelerationConfig,
+    state: State<'_, AppState>,
+) -> Result<AccelerationConfig, String> {
+    state.gpu.update_config(config)
+}
+
+#[tauri::command]
+fn list_gpu_providers(state: State<'_, AppState>) -> Result<Vec<ProviderStatus>, String> {
+    Ok(state.gpu.providers())
+}
+
+#[tauri::command]
+fn probe_gpu_providers(force: bool, state: State<'_, AppState>) -> Result<Vec<ProviderStatus>, String> {
+    Ok(state.gpu.probe(force))
+}
+
+#[tauri::command]
+fn list_supported_workloads(state: State<'_, AppState>) -> Result<Vec<WorkloadView>, String> {
+    Ok(state.gpu.workloads())
+}
+
+#[tauri::command]
+fn get_workload_recommendations(
+    size: Option<usize>,
+    workload_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<SuitabilityAssessment>, String> {
+    state.gpu.recommendations(size, workload_id)
+}
+
+#[tauri::command]
+fn submit_workload_task(
+    request: SubmitTaskRequest,
+    state: State<'_, AppState>,
+) -> Result<GpuTask, String> {
+    state.gpu.submit(request)
+}
+
+#[tauri::command]
+fn cancel_task(task_id: u64, state: State<'_, AppState>) -> Result<GpuTask, String> {
+    state.gpu.cancel(task_id)
+}
+
+#[tauri::command]
+fn list_tasks(
+    limit: Option<usize>,
+    status: Option<TaskStatus>,
+    state: State<'_, AppState>,
+) -> Result<Vec<GpuTask>, String> {
+    Ok(state.gpu.list_tasks(limit, status))
+}
+
+#[tauri::command]
+fn clear_finished_tasks(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.gpu.clear_finished())
+}
+
+#[tauri::command]
+fn get_task_history(
+    limit: Option<usize>,
+    workload_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<GpuTask>, String> {
+    Ok(state.gpu.task_history(limit, workload_id))
+}
+
+#[tauri::command]
+fn run_benchmark(
+    request: BenchmarkRequest,
+    state: State<'_, AppState>,
+) -> Result<BenchmarkRecord, String> {
+    state.gpu.run_benchmark(request)
+}
+
+#[tauri::command]
+fn get_benchmark_history(
+    limit: Option<usize>,
+    workload_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<BenchmarkRecord>, String> {
+    Ok(state.gpu.benchmark_history(limit, workload_id))
+}
+
+#[tauri::command]
+fn clear_benchmark_history(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.gpu.clear_benchmarks())
+}
+
+#[tauri::command]
+fn get_gpu_environment(state: State<'_, AppState>) -> Result<AccelerationEnvironment, String> {
+    Ok(state.gpu.environment())
+}
+
 pub fn run() {
     let database =
         Arc::new(database::Database::open().expect("failed to initialize FluxCore local database"));
     let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
     let engine = Arc::new(MonitorEngine::new(Arc::clone(&database), Arc::clone(&memory)));
+    let gpu = Arc::new(gpu_engine::GpuEngine::new(Arc::clone(&database), Arc::clone(&engine)));
     tauri::Builder::default()
-        .manage(AppState { engine, memory })
+        .manage(AppState { engine, memory, gpu })
         .setup(|app| {
             let state = app.state::<AppState>();
             state.engine.set_app_handle(app.handle().clone());
+            state.gpu.set_app_handle(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -118,7 +246,24 @@ pub fn run() {
             execute_optimization_action,
             get_memory_policy_config,
             update_memory_policy_config,
-            set_dashboard_active
+            set_dashboard_active,
+            get_gpu_acceleration_state,
+            set_acceleration_mode,
+            get_gpu_resource_config,
+            update_gpu_resource_config,
+            list_gpu_providers,
+            probe_gpu_providers,
+            list_supported_workloads,
+            get_workload_recommendations,
+            submit_workload_task,
+            cancel_task,
+            list_tasks,
+            clear_finished_tasks,
+            get_task_history,
+            run_benchmark,
+            get_benchmark_history,
+            clear_benchmark_history,
+            get_gpu_environment
         ])
         .run(tauri::generate_context!())
         .expect("error while running FluxCore");
