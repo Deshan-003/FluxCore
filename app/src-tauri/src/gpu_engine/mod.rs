@@ -432,3 +432,111 @@ impl GpuEngine {
         self.scheduler.clear_finished()
     }
 
+    pub fn task_history(&self, limit: Option<usize>, workload: Option<String>) -> Vec<GpuTask> {
+        persistence::recent_tasks(
+            &self.database,
+            limit.unwrap_or(100).clamp(1, 1000),
+            workload.as_deref(),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn benchmark_history(
+        &self,
+        limit: Option<usize>,
+        workload: Option<String>,
+    ) -> Vec<BenchmarkRecord> {
+        persistence::recent_benchmarks(
+            &self.database,
+            limit.unwrap_or(100).clamp(1, 1000),
+            workload.as_deref(),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn clear_benchmarks(&self) -> usize {
+        persistence::clear_benchmarks(&self.database).unwrap_or(0)
+    }
+
+    pub fn environment(&self) -> AccelerationEnvironment {
+        self.read_capabilities().environment
+    }
+
+    pub fn run_benchmark(&self, request: BenchmarkRequest) -> Result<BenchmarkRecord, String> {
+        let config = self.read_config();
+        let capabilities = self.read_capabilities();
+        let warmup = request.warmup_runs.clamp(0, 10);
+        let measured = request.measured_runs.clamp(1, 50);
+        let normalized = BenchmarkRequest {
+            workload_id: request.workload_id.clone(),
+            params: request.params.clone(),
+            warmup_runs: warmup,
+            measured_runs: measured,
+            validate: request.validate,
+        };
+        profiler::validate_params(&normalized.params)?;
+
+        // Benchmarks bypass the task queue but still take the same GPU budget and
+        // safety gates. The guard releases the slot on every exit path.
+        let requirement = WorkloadRequirement {
+            workload_id: normalized.params.workload_id().to_string(),
+            input_size: normalized.params.input_size(),
+            device_bytes: normalized.params.device_bytes(),
+            transfer_bytes: normalized.params.transfer_bytes(),
+            timeout: Duration::from_millis(config.task_timeout_ms),
+        };
+        let admission = self.resources.admit(BENCHMARK_SLOT_ID, &requirement, &config);
+        if !admission.allowed {
+            return Err(admission
+                .reason
+                .unwrap_or_else(|| "GPU resource budget unavailable".to_string()));
+        }
+        struct BenchGuard<'a> {
+            manager: &'a ResourceManager,
+        }
+        impl Drop for BenchGuard<'_> {
+            fn drop(&mut self) {
+                self.manager.release(BENCHMARK_SLOT_ID);
+            }
+        }
+        let _guard = BenchGuard {
+            manager: &self.resources,
+        };
+
+        let preferred = config
+            .provider_priority
+            .iter()
+            .filter_map(|id| BackendKind::parse(id))
+            .filter(|backend| *backend != BackendKind::Cpu)
+            .find(|backend| {
+                capabilities.providers.iter().any(|provider| {
+                    provider.available
+                        && provider.compute_ready
+                        && BackendKind::parse(&provider.id) == Some(*backend)
+                })
+            });
+
+        let context = benchmark::BenchmarkContext {
+            providers: self.providers.clone(),
+            environment: capabilities.environment.clone(),
+            config: config.clone(),
+            timeout: Duration::from_millis(config.task_timeout_ms),
+            cancel: CancelToken::new(),
+            preferred_backend: preferred,
+        };
+        let mut record = benchmark::run_benchmark(&normalized, &context)?;
+        if let Ok(id) = persistence::record_benchmark(&self.database, &record) {
+            record.id = id;
+        }
+        Ok(record)
+    }
+}
+
+impl Drop for GpuEngine {
+    fn drop(&mut self) {
+        // Scheduler::Drop cancels and joins its worker threads first.
+        for provider in &self.providers {
+            provider.shutdown();
+        }
+    }
+}
