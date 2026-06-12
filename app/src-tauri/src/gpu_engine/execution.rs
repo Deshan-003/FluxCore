@@ -190,3 +190,67 @@ pub fn execute_task(
             ));
             task.fell_back = true;
         }
+        Arc::clone(&cpu)
+    });
+    let primary_is_gpu = primary.id() != "cpu";
+
+    let request = build_request(task, primary.as_ref(), config, cancel);
+    match primary.execute(&request) {
+        Ok(outcome) => {
+            let record = to_record(&outcome);
+            let is_gpu = record.backend != BackendKind::Cpu;
+            if is_gpu {
+                gpu_total_ms = Some(ns_to_ms(outcome.timing.total_ns));
+            } else {
+                cpu_total_ms = Some(ns_to_ms(outcome.timing.total_ns));
+            }
+            apply_outcome(task, &outcome, is_gpu);
+            task.speedup = maybe_speedup(cpu_total_ms, gpu_total_ms);
+            Ok(record)
+        }
+        Err(err) => {
+            // Cancellations and timeouts propagate as cancellations; no fallback.
+            if matches!(
+                err,
+                GpuError::Cancelled { .. } | GpuError::Timeout { .. }
+            ) {
+                task.error = Some(err.to_string());
+                task.progress_percent = None;
+                return Err(err);
+            }
+
+            let can_fallback = !require_gpu && attempt_gpu && primary_is_gpu;
+            if !can_fallback {
+                task.error = Some(err.to_string());
+                task.progress_percent = None;
+                return Err(err);
+            }
+
+            // Recoverable GPU failure -> CPU fallback. Keep `selected_backend`
+            // as the GPU that was attempted; record the REAL GPU error.
+            task.warnings.push(format!(
+                "{} backend failed ({}) and the result was produced on the CPU instead",
+                selected.as_str(),
+                err
+            ));
+            task.fell_back = true;
+            let cpu_request = build_request(task, cpu.as_ref(), config, cancel);
+            match cpu.execute(&cpu_request) {
+                Ok(outcome) => {
+                    let record = to_record(&outcome);
+                    cpu_total_ms = Some(ns_to_ms(outcome.timing.total_ns));
+                    apply_outcome(task, &outcome, record.backend != BackendKind::Cpu);
+                    task.speedup = maybe_speedup(cpu_total_ms, gpu_total_ms);
+                    Ok(record)
+                }
+                Err(cpu_err) => {
+                    task.error = Some(format!(
+                        "GPU path failed ({err}) and the CPU fallback also failed: {cpu_err}"
+                    ));
+                    task.progress_percent = None;
+                    Err(cpu_err)
+                }
+            }
+        }
+    }
+}
