@@ -22,6 +22,9 @@ sysinfo = { version = "0.33", default-features = false, features = ["system", "d
 rusqlite = { version = "0.32", features = ["bundled"] }
 libloading = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+# Phase 3: vendor-neutral GPU compute (DX12/Vulkan/WGSL), no CUDA toolkit required.
+wgpu = { version = "30", default-features = false, features = ["wgsl", "dx12", "vulkan"] }
+pollster = "1"
 
 [dev-dependencies]
 tempfile = "3"
