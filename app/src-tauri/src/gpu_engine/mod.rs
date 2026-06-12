@@ -323,3 +323,112 @@ impl GpuEngine {
     }
 
     pub fn config(&self) -> AccelerationConfig {
+        self.read_config()
+    }
+
+    pub fn update_config(&self, config: AccelerationConfig) -> Result<AccelerationConfig, String> {
+        resources::ResourceManager::validate_config(&config)?;
+        persistence::save_config(&self.database, &config)?;
+        persistence::save_workload_settings(&self.database, &config.workload_settings)?;
+        self.emit_events.store(config.emit_events, Ordering::Relaxed);
+        self.scheduler.set_config(config.clone());
+        if let Ok(mut slot) = self.config.write() {
+            *slot = config.clone();
+        }
+        Ok(config)
+    }
+
+    pub fn set_mode(&self, mode: AccelerationMode) -> Result<GpuAccelerationState, String> {
+        let mut config = self.read_config();
+        config.mode = mode;
+        self.update_config(config)?;
+        Ok(self.state())
+    }
+
+    pub fn workloads(&self) -> Vec<WorkloadView> {
+        let config = self.read_config();
+        let capabilities = self.read_capabilities();
+        let resources = self.resources.status(&config);
+        let summaries = self.benchmark_summaries();
+        Self::build_workloads(&config, &capabilities, &resources, &summaries)
+    }
+
+    pub fn recommendations(
+        &self,
+        size: Option<usize>,
+        workload_id: Option<String>,
+    ) -> Result<Vec<SuitabilityAssessment>, String> {
+        let config = self.read_config();
+        let capabilities = self.read_capabilities();
+        let resources = self.resources.status(&config);
+        let summaries = self.benchmark_summaries();
+        let inputs = Self::classify_inputs(&config, &capabilities, &resources, &summaries);
+
+        let defs: Vec<&WorkloadDef> = match workload_id {
+            Some(id) => vec![profiler::find(&id)
+                .ok_or_else(|| format!("unknown workload id: {id}"))?],
+            None => profiler::registry().iter().collect(),
+        };
+        let mut out = Vec::with_capacity(defs.len());
+        for def in defs {
+            let chosen = size.unwrap_or(def.default_size);
+            let params = models::default_params(def.id, chosen)
+                .ok_or_else(|| format!("unsupported size {chosen} for {}", def.id))?;
+            out.push(profiler::classify(&params, &inputs));
+        }
+        Ok(out)
+    }
+
+    pub fn submit(&self, mut request: SubmitTaskRequest) -> Result<GpuTask, String> {
+        profiler::validate_params(&request.params)?;
+        let config = self.read_config();
+        let capabilities = self.read_capabilities();
+        let resources = self.resources.status(&config);
+        let summaries = self.benchmark_summaries();
+        let inputs = Self::classify_inputs(&config, &capabilities, &resources, &summaries);
+        let assessment = profiler::classify(&request.params, &inputs);
+        let gpu_enabled = inputs.gpu_enabled;
+
+        if config.mode == AccelerationMode::CpuOnly && request.require_gpu {
+            return Err("GPU acceleration is disabled (CPU Only mode)".to_string());
+        }
+        if request.require_gpu && !gpu_enabled {
+            return Err("no usable GPU compute backend is available".to_string());
+        }
+
+        // Manual backend pin / per-workload override, otherwise use the decision
+        // engine's own selected backend. The scheduler reads `request.backend`.
+        let decided = if let Some(backend) = request.backend {
+            backend
+        } else if config.mode == AccelerationMode::Manual {
+            config
+                .workload_settings
+                .iter()
+                .find(|item| item.workload_id == request.params.workload_id())
+                .map(|item| item.backend)
+                .unwrap_or(assessment.selected_backend)
+        } else {
+            assessment.selected_backend
+        };
+        request.backend = Some(if decided != BackendKind::Cpu && !gpu_enabled {
+            // A CPU-only decision must never be silently upgraded to a GPU path.
+            BackendKind::Cpu
+        } else {
+            decided
+        });
+
+        self.scheduler.submit(request, assessment)
+    }
+
+    pub fn cancel(&self, task_id: u64) -> Result<GpuTask, String> {
+        self.scheduler.cancel(task_id)
+    }
+
+    pub fn list_tasks(&self, limit: Option<usize>, status: Option<TaskStatus>) -> Vec<GpuTask> {
+        self.scheduler.list(limit.unwrap_or(100).clamp(1, 500), status)
+    }
+
+    pub fn clear_finished(&self) -> usize {
+        self.scheduler.clear_finished()
+    }
+
