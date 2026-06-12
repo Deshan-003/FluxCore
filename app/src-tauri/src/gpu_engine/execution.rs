@@ -62,3 +62,67 @@ fn build_request(
     config: &AccelerationConfig,
     cancel: &CancelToken,
 ) -> ExecutionRequest {
+    ExecutionRequest {
+        request_id: task.id,
+        workload_id: task.workload_id.clone(),
+        device_id: first_device_id(provider),
+        params: task.params, // WorkloadParams is Copy
+        timeout: Duration::from_millis(config.task_timeout_ms),
+        cancel: cancel.clone(),
+        validate: config.validate_results,
+    }
+}
+
+fn outcome_backend(outcome: &ExecutionOutcome) -> BackendKind {
+    BackendKind::parse(&outcome.backend)
+        .unwrap_or_else(|| providers::backend_for_provider(&outcome.provider_id))
+}
+
+fn to_record(outcome: &ExecutionOutcome) -> ExecutionRecord {
+    ExecutionRecord {
+        backend: outcome_backend(outcome),
+        provider_id: outcome.provider_id.clone(),
+        device_id: outcome.device_id.clone(),
+        timing: outcome.timing.clone(),
+        peak_vram_bytes: outcome.peak_device_bytes,
+        max_abs_error: outcome.max_abs_error,
+        validated: outcome.validated,
+        notes: outcome.notes.clone(),
+    }
+}
+
+fn timing_of(outcome: &ExecutionOutcome) -> &TimingBreakdown {
+    &outcome.timing
+}
+
+/// Apply a successful provider outcome to the task's result fields. `is_gpu`
+/// is determined from the backend that ACTUALLY produced the outcome (not from
+/// the requested backend), so a CPU fallback never reports a GPU timing.
+fn apply_outcome(task: &mut GpuTask, outcome: &ExecutionOutcome, is_gpu: bool) {
+    let t = timing_of(outcome);
+    if is_gpu {
+        task.gpu_time_ms = Some(ns_to_ms(t.compute_ns));
+        task.transfer_time_ms = Some(ns_to_ms(
+            t.transfer_in_ns.saturating_add(t.transfer_out_ns),
+        ));
+        // A GPU attempt measures no standalone CPU-total path. The host-side
+        // setup/validation work is NOT a CPU reference run, so it is not
+        // reported as `cpu_time_ms` and never used to fabricate a speedup.
+        task.cpu_time_ms = None;
+        task.total_time_ms = Some(ns_to_ms(t.total_ns));
+    } else {
+        task.cpu_time_ms = Some(ns_to_ms(t.total_ns));
+        task.gpu_time_ms = None;
+        task.transfer_time_ms = None;
+        task.total_time_ms = Some(ns_to_ms(t.total_ns));
+    }
+    task.vram_used_bytes = Some(outcome.peak_device_bytes);
+    task.max_abs_error = outcome.max_abs_error;
+    task.validated = outcome.validated;
+    task.progress_percent = Some(100.0);
+    task.error = None;
+    for note in &outcome.notes {
+        if !task.warnings.contains(note) {
+            task.warnings.push(note.clone());
+        }
+    }
