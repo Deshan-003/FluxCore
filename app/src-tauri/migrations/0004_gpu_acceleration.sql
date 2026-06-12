@@ -57,3 +57,33 @@ CREATE TABLE IF NOT EXISTS gpu_task_history (
   speedup REAL,
   vram_used_bytes INTEGER,
   max_abs_error REAL,
+  validated INTEGER NOT NULL,
+  fell_back INTEGER NOT NULL,
+  error TEXT,
+  warnings TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gpu_task_history_finished ON gpu_task_history(finished_at);
+CREATE INDEX IF NOT EXISTS idx_gpu_task_history_workload ON gpu_task_history(workload_id, finished_at);
+
+CREATE TABLE IF NOT EXISTS gpu_benchmark_results (
+  id INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  workload_id TEXT NOT NULL,
+  params TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  cpu TEXT NOT NULL,
+  gpu TEXT,
+  transfer_ms REAL,
+  speedup REAL,
+  vram_used_bytes INTEGER,
+  validated INTEGER NOT NULL,
+  max_abs_error REAL,
+  verdict TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gpu_benchmark_created ON gpu_benchmark_results(created_at);
+CREATE INDEX IF NOT EXISTS idx_gpu_benchmark_workload ON gpu_benchmark_results(workload_id, created_at);
