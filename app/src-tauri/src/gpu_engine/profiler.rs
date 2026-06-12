@@ -571,3 +571,146 @@ pub fn classify(params: &WorkloadParams, inputs: &ClassifyInputs<'_>) -> Suitabi
             safety_blockers,
         );
     }
+    let ordered = ordered_by_priority(&implementing, config);
+    let selected_gpu_backend = backend_of(ordered[0]);
+
+    // ---- Step 5: required VRAM exceeds remaining budget ---------------------
+    let required = params.device_bytes();
+    if vram_known && required > resources.remaining_budget_bytes {
+        let mut blockers = safety_blockers.clone();
+        blockers.push(format!(
+            "workload needs {} but the budget leaves {}",
+            fmt_mib(required),
+            fmt_mib(resources.remaining_budget_bytes)
+        ));
+        return make(
+            Suitability::InsufficientGpuResources,
+            format!(
+                "{wid} needs {} of VRAM but the configured GPU budget leaves only {}",
+                fmt_mib(required),
+                fmt_mib(resources.remaining_budget_bytes)
+            ),
+            BackendKind::Cpu,
+            blockers,
+        );
+    }
+
+    // ---- Step 6: provider-reported free VRAM below required -----------------
+    if let Some(reported_free) = device_free_vram.or(free_vram) {
+        if reported_free < required {
+            let mut blockers = safety_blockers.clone();
+            blockers.push(format!(
+                "GPU reports only {} free VRAM",
+                fmt_mib(reported_free)
+            ));
+            return make(
+                Suitability::InsufficientGpuResources,
+                format!(
+                    "GPU reports only {} free VRAM; {wid} needs {}",
+                    fmt_mib(reported_free),
+                    fmt_mib(required)
+                ),
+                BackendKind::Cpu,
+                blockers,
+            );
+        }
+    }
+
+    // ---- Step 7: safety gates block (NOT InsufficientGpuResources) ----------
+    // Utilisation / temperature / RAM are safety gates ONLY. They never route
+    // a workload to the GPU; they go into blockers and force a CPU decision.
+    if !safety_blockers.is_empty() {
+        return make(
+            Suitability::GpuAvailableNotBeneficial,
+            format!(
+                "The GPU is usable but a safety gate blocks GPU execution: {}",
+                safety_blockers.join("; ")
+            ),
+            BackendKind::Cpu,
+            safety_blockers.clone(),
+        );
+    }
+
+    let user_pinned_cpu = config.mode == AccelerationMode::Manual
+        && config
+            .workload_settings
+            .iter()
+            .any(|s| s.workload_id == wid && s.backend == BackendKind::Cpu);
+
+    // ---- Step 8: model says the GPU would not pay off -----------------------
+    let beneficial = estimates.gpu_total_ms * def.beneficial_speedup < estimates.cpu_ms;
+    if !beneficial {
+        let classification = if user_pinned_cpu {
+            Suitability::CpuRecommended
+        } else {
+            Suitability::GpuAvailableNotBeneficial
+        };
+        let pin_note = if user_pinned_cpu {
+            " (CPU is pinned by the user)"
+        } else {
+            ""
+        };
+        return make(
+            classification,
+            format!(
+                "GPU is available but would not pay off at this size: estimated CPU {:.3} ms vs \
+                 GPU total {:.3} ms (compute {:.3} ms + transfer {:.3} ms + {:.2} ms launch); \
+                 a >{:.2}x end-to-end speedup is required{pin_note}. Transfer + launch overhead \
+                 dominates at small sizes.",
+                estimates.cpu_ms,
+                estimates.gpu_total_ms,
+                estimates.gpu_ms,
+                estimates.transfer_ms,
+                LAUNCH_OVERHEAD_MS,
+                def.beneficial_speedup,
+            ),
+            BackendKind::Cpu,
+            safety_blockers,
+        );
+    }
+
+    // ---- Conservative guard (brief §classify) -------------------------------
+    // A GpuRecommended verdict is only issued when a MEASURED benchmark at
+    // this exact input size backs it and VRAM could actually be verified.
+    // Otherwise we stay on the CPU and say exactly what was missing.
+    let measured_basis = estimate_source == EstimateSource::Measured;
+    if !measured_basis || !vram_known || !inputs.gpu_enabled || !estimates.missing.is_empty() {
+        let mut missing = estimates.missing.clone();
+        if !measured_basis {
+            missing.push("no measured CPU+GPU benchmark backs a speedup claim".to_string());
+        }
+        if !vram_known {
+            missing.push("GPU VRAM is unknown, so the memory budget cannot be verified".to_string());
+        }
+        if !inputs.gpu_enabled {
+            missing.push("GPU acceleration is not enabled".to_string());
+        }
+        let what_missing = if missing.is_empty() {
+            "the decision lacks sufficient measured evidence".to_string()
+        } else {
+            missing.join("; ")
+        };
+        return make(
+            Suitability::CpuRecommended,
+            format!(
+                "The GPU may be faster (estimated CPU {:.3} ms vs GPU total {:.3} ms) but the \
+                 estimate is not sufficient to recommend it: {what_missing}. Running on the CPU \
+                 until a measured benchmark at this size is available.",
+                estimates.cpu_ms, estimates.gpu_total_ms,
+            ),
+            BackendKind::Cpu,
+            safety_blockers,
+        );
+    }
+
+    // ---- Step 9: otherwise GPU is recommended -------------------------------
+    let ratio = estimates.cpu_ms / estimates.gpu_total_ms.max(1.0e-9);
+    make(
+        Suitability::GpuRecommended,
+        format!(
+            "A measured benchmark at this exact input size shows the GPU is worthwhile: \
+             CPU {:.3} ms vs GPU total {:.3} ms ({:.2}x, threshold {:.2}x). \
+             {} selected by provider priority.",
+            estimates.cpu_ms,
+            estimates.gpu_total_ms,
+            ratio,
