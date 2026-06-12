@@ -857,3 +857,146 @@ mod tests {
         assert!(validate_params(&WorkloadParams::VectorAxpy {
             n: 1024,
             a: f32::NAN
+        })
+        .is_err());
+        assert!(validate_params(&WorkloadParams::Matmul { m: 2049, k: 1, n: 1 }).is_err());
+        assert!(validate_params(&WorkloadParams::Matmul { m: 0, k: 1, n: 1 }).is_err());
+        assert!(validate_params(&WorkloadParams::RowSum { rows: 0, cols: 10 }).is_err());
+        assert!(validate_params(&WorkloadParams::RowSum { rows: 6000, cols: 6000 }).is_err());
+    }
+
+    #[test]
+    fn cpu_only_classification() {
+        let (mut config, providers, resources) = healthy_setup();
+        config.mode = AccelerationMode::CpuOnly;
+        let params = WorkloadParams::VectorAxpy { n: 1024, a: 1.5 };
+        let benchmarks: Vec<BenchmarkSummary> = Vec::new();
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, false));
+        assert_eq!(a.classification, Suitability::CpuRecommended);
+        assert_eq!(a.selected_backend, BackendKind::Cpu);
+        assert!(!a.gpu_enabled);
+        assert!(a.reason.contains("disabled"));
+        assert_eq!(a.required_vram_bytes, params.device_bytes());
+        assert_eq!(a.gpu_budget_bytes, resources.budget_bytes);
+        assert!(a.estimated_cpu_ms.is_some());
+        assert!(a.estimated_gpu_total_ms.is_some());
+    }
+
+    #[test]
+    fn gpu_recommended_with_measured_benchmark() {
+        let (config, providers, resources) = healthy_setup();
+        let n = 1024 * 1024;
+        let params = WorkloadParams::VectorAxpy { n, a: 1.5 };
+        let benchmarks = vec![summary(n, 100.0, Some(2.0), Some(1.0))];
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::GpuRecommended);
+        assert_eq!(a.estimate_source, EstimateSource::Measured);
+        assert_eq!(a.selected_backend, BackendKind::Cuda);
+        assert_eq!(a.estimated_cpu_ms, Some(100.0));
+        assert_eq!(a.estimated_gpu_ms, Some(2.0));
+        assert!((a.estimated_gpu_total_ms.unwrap() - 3.05).abs() < 1e-9);
+        assert!(a.blockers.is_empty());
+        assert!(a.reason.contains("measured benchmark"));
+    }
+
+    #[test]
+    fn insufficient_vram() {
+        let (config, providers, mut resources) = healthy_setup();
+        resources.remaining_budget_bytes = 1024;
+        resources.free_vram_bytes = Some(1024);
+        resources.budget_bytes = 1024;
+        let params = WorkloadParams::VectorAxpy { n: 1024, a: 1.5 };
+        let benchmarks: Vec<BenchmarkSummary> = Vec::new();
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::InsufficientGpuResources);
+        assert_eq!(a.selected_backend, BackendKind::Cpu);
+        assert!(a.reason.contains("needs"));
+        assert!(a.blockers.iter().any(|b| b.contains("budget")));
+    }
+
+    #[test]
+    fn no_compute_provider() {
+        let (config, _, resources) = healthy_setup();
+        let providers: Vec<ProviderStatus> = Vec::new();
+        let params = WorkloadParams::VectorAxpy { n: 1024, a: 1.5 };
+        let benchmarks: Vec<BenchmarkSummary> = Vec::new();
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, false));
+        assert_eq!(a.classification, Suitability::AccelerationUnavailable);
+        assert!(a.reason.contains("No GPU compute backend is usable"));
+        assert!(a.blockers.iter().any(|b| b.contains("compute-ready")));
+    }
+
+    #[test]
+    fn unsupported_workload_id_via_registry() {
+        assert!(find("bogus_workload").is_none());
+        assert!(default_params("bogus_workload", 1024).is_none());
+        assert_eq!(registry().len(), 4);
+    }
+
+    #[test]
+    fn safety_gate_blockers_are_cpu_not_gpu_routing() {
+        let (config, providers, mut resources) = healthy_setup();
+        resources.gates = vec!["GPU utilisation 95% above limit 85%".to_string()];
+        resources.gpu_utilization_percent = Some(95.0);
+        let n = 1024 * 1024;
+        let params = WorkloadParams::VectorAxpy { n, a: 1.5 };
+        let benchmarks = vec![summary(n, 100.0, Some(2.0), Some(1.0))];
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::GpuAvailableNotBeneficial);
+        assert_eq!(a.selected_backend, BackendKind::Cpu);
+        assert!(a.blockers.iter().any(|b| b.contains("utilisation")));
+        assert!(a.reason.contains("safety gate"));
+    }
+
+    #[test]
+    fn cpu_fallback_decision_small_size() {
+        let (config, providers, resources) = healthy_setup();
+        let params = WorkloadParams::VectorAxpy { n: 1024, a: 1.5 };
+        let benchmarks: Vec<BenchmarkSummary> = Vec::new();
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::GpuAvailableNotBeneficial);
+        assert_eq!(a.estimate_source, EstimateSource::Model);
+        assert_eq!(a.selected_backend, BackendKind::Cpu);
+        assert!(a.reason.contains("would not pay off"));
+    }
+
+    #[test]
+    fn model_only_is_conservative_even_when_beneficial() {
+        let (config, providers, resources) = healthy_setup();
+        let params = WorkloadParams::VectorAxpy {
+            n: 16 * 1024 * 1024,
+            a: 1.5,
+        };
+        let benchmarks: Vec<BenchmarkSummary> = Vec::new();
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::CpuRecommended);
+        assert_eq!(a.estimate_source, EstimateSource::Model);
+        assert!(a.reason.contains("measured benchmark"));
+    }
+
+    #[test]
+    fn unknown_vram_is_conservative() {
+        let (config, mut providers, mut resources) = healthy_setup();
+        // No live free/total VRAM and no provider-reported free VRAM either.
+        resources.total_vram_bytes = None;
+        resources.free_vram_bytes = None;
+        providers[0].devices[0].dedicated_free_bytes = None;
+        let n = 1024 * 1024;
+        let params = WorkloadParams::VectorAxpy { n, a: 1.5 };
+        let benchmarks = vec![summary(n, 100.0, Some(2.0), Some(1.0))];
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.classification, Suitability::CpuRecommended);
+        assert!(a.reason.contains("VRAM"));
+    }
+
+    #[test]
+    fn mixed_source_when_gpu_median_missing() {
+        let (config, providers, resources) = healthy_setup();
+        let n = 1024 * 1024;
+        let params = WorkloadParams::VectorAxpy { n, a: 1.5 };
+        let benchmarks = vec![summary(n, 100.0, None, Some(1.0))];
+        let a = classify(&params, &inputs(&config, &providers, &resources, &benchmarks, true));
+        assert_eq!(a.estimate_source, EstimateSource::Mixed);
+        assert_eq!(a.classification, Suitability::CpuRecommended);
+    }
+}
