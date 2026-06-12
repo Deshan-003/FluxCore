@@ -714,3 +714,146 @@ pub fn classify(params: &WorkloadParams, inputs: &ClassifyInputs<'_>) -> Suitabi
             estimates.cpu_ms,
             estimates.gpu_total_ms,
             ratio,
+            def.beneficial_speedup,
+            selected_gpu_backend.as_str(),
+        ),
+        selected_gpu_backend,
+        safety_blockers,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — pure `classify` with hand-built inputs (no MonitorEngine).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_engine::models::{
+        GpuDeviceInfo, ProviderCapabilities, SafetyLevel, WorkloadSupport,
+    };
+
+    fn base_resources() -> ResourceBudgetStatus {
+        ResourceBudgetStatus {
+            total_vram_bytes: Some(4 * 1024 * 1024 * 1024),
+            free_vram_bytes: Some(3 * 1024 * 1024 * 1024),
+            budget_bytes: 1024 * 1024 * 1024,
+            reserved_bytes: 0,
+            allocated_bytes: 0,
+            remaining_budget_bytes: 1024 * 1024 * 1024,
+            running_gpu_tasks: 0,
+            queued_gpu_tasks: 0,
+            max_concurrent_gpu_tasks: 1,
+            gpu_utilization_percent: Some(20.0),
+            temperature_c: Some(50.0),
+            power_watts: Some(30.0),
+            safety_level: SafetyLevel::Ok,
+            gates: Vec::new(),
+            system_ram_available_percent: Some(60.0),
+        }
+    }
+
+    fn gpu_provider(id: &str, workloads: &[&str]) -> ProviderStatus {
+        ProviderStatus {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind: match id {
+                "cuda" => ProviderKind::Cuda,
+                _ => ProviderKind::Wgpu,
+            },
+            available: true,
+            compute_ready: true,
+            detail: "ready".to_string(),
+            devices: vec![GpuDeviceInfo {
+                device_id: format!("{id}-0"),
+                dedicated_total_bytes: Some(4 * 1024 * 1024 * 1024),
+                dedicated_free_bytes: Some(3 * 1024 * 1024 * 1024),
+                ..Default::default()
+            }],
+            capabilities: ProviderCapabilities {
+                compute_ready: true,
+                ..Default::default()
+            },
+            supported_workloads: workloads
+                .iter()
+                .map(|w| WorkloadSupport {
+                    workload_id: (*w).to_string(),
+                    max_elements: u64::MAX,
+                    notes: Vec::new(),
+                })
+                .collect(),
+            selected_device: format!("{id}-0"),
+            last_error: None,
+        }
+    }
+
+    fn summary(size: usize, cpu: f64, gpu: Option<f64>, transfer: Option<f64>) -> BenchmarkSummary {
+        BenchmarkSummary {
+            id: 7,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            workload_id: "vector_axpy".to_string(),
+            input_size: size,
+            backend: BackendKind::Cuda,
+            cpu_median_ms: cpu,
+            gpu_median_ms: gpu,
+            transfer_ms: transfer,
+            speedup: None,
+            verdict: "measured".to_string(),
+        }
+    }
+
+    fn inputs<'a>(
+        config: &'a AccelerationConfig,
+        providers: &'a [ProviderStatus],
+        resources: &'a ResourceBudgetStatus,
+        benchmarks: &'a [BenchmarkSummary],
+        gpu_enabled: bool,
+    ) -> ClassifyInputs<'a> {
+        ClassifyInputs {
+            config,
+            providers,
+            resources,
+            benchmarks,
+            gpu_enabled,
+        }
+    }
+
+    fn healthy_setup() -> (AccelerationConfig, Vec<ProviderStatus>, ResourceBudgetStatus) {
+        (
+            AccelerationConfig::default(),
+            vec![gpu_provider("cuda", &["vector_axpy", "vector_scale", "matmul", "row_sum"])],
+            base_resources(),
+        )
+    }
+
+    #[test]
+    fn registry_has_exactly_four_workloads() {
+        let ids: Vec<&str> = registry().iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec!["vector_axpy", "vector_scale", "matmul", "row_sum"]);
+        for def in registry() {
+            assert_eq!(def.beneficial_speedup, 1.15);
+            assert!(!def.sizes.is_empty());
+            assert!(def.sizes.contains(&def.default_size));
+            assert!(def.cpu_model.scale_ns_per_unit > 0.0);
+            assert!(def.gpu_model.scale_ns_per_unit > 0.0);
+        }
+        assert!(find("vector_axpy").is_some());
+        assert!(find("not_a_workload").is_none());
+        assert!(default_params("not_a_workload", 1024).is_none());
+    }
+
+    #[test]
+    fn validate_params_enforces_caps() {
+        assert!(validate_params(&WorkloadParams::VectorAxpy { n: 1024, a: 1.5 }).is_ok());
+        assert!(validate_params(&WorkloadParams::Matmul { m: 32, k: 32, n: 32 }).is_ok());
+        assert!(validate_params(&WorkloadParams::RowSum { rows: 1024, cols: 1024 }).is_ok());
+
+        assert!(validate_params(&WorkloadParams::VectorAxpy { n: 0, a: 1.0 }).is_err());
+        assert!(validate_params(&WorkloadParams::VectorScale {
+            n: VECTOR_MAX + 1,
+            a: 1.0
+        })
+        .is_err());
+        assert!(validate_params(&WorkloadParams::VectorAxpy {
+            n: 1024,
+            a: f32::NAN
