@@ -126,3 +126,67 @@ fn apply_outcome(task: &mut GpuTask, outcome: &ExecutionOutcome, is_gpu: bool) {
             task.warnings.push(note.clone());
         }
     }
+}
+
+/// Honest speedup: only computed when BOTH a CPU-total and a GPU-total were
+/// actually measured in the same `execute_task` invocation. A single attempt
+/// runs at most one successful backend, so in normal operation this is `None`
+/// — never invented. A value < 1.0 (a slowdown) is reported as-is.
+fn maybe_speedup(cpu_total_ms: Option<f64>, gpu_total_ms: Option<f64>) -> Option<f64> {
+    match (cpu_total_ms, gpu_total_ms) {
+        (Some(c), Some(g))
+            if c.is_finite() && g.is_finite() && g > 0.0 =>
+        {
+            Some(c / g)
+        }
+        _ => None,
+    }
+}
+
+/// One task attempt. Selects the provider for `task.selected_backend`, builds
+/// the `ExecutionRequest`, dispatches, maps `ExecutionOutcome` ->
+/// `ExecutionRecord`, fills the task result fields, and (unless `require_gpu`)
+/// re-runs on the CPU provider after a recoverable GPU failure.
+///
+/// `Cancelled` and `Timeout` are propagated unchanged (they must surface as
+/// cancellations/timeouts, never as a CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_task(
+    task: &mut GpuTask,
+    providers: &[Arc<dyn GpuProvider>],
+    config: &AccelerationConfig,
+    cancel: &CancelToken,
+    require_gpu: bool,
+) -> GpuResult<ExecutionRecord> {
+    let selected = task.selected_backend.unwrap_or(BackendKind::Cpu);
+    let attempt_gpu = selected != BackendKind::Cpu;
+
+    // Truthful per-attempt defaults. `warnings` is preserved (the scheduler
+    // may already have recorded an admission-denial warning).
+    task.error = None;
+    task.fell_back = false;
+    task.cpu_time_ms = None;
+    task.gpu_time_ms = None;
+    task.transfer_time_ms = None;
+    task.total_time_ms = None;
+    task.speedup = None;
+    task.vram_used_bytes = None;
+    task.max_abs_error = None;
+    task.validated = false;
+
+    let mut cpu_total_ms: Option<f64> = None;
+    let mut gpu_total_ms: Option<f64> = None;
+
+    let cpu = cpu_provider(providers).ok_or_else(|| GpuError::Internal {
+        provider: "scheduler".to_string(),
+        detail: "no CPU provider (id \"cpu\") is available for execution".to_string(),
+    })?;
+
+    let primary = find_provider(providers, selected).unwrap_or_else(|| {
+        if attempt_gpu {
+            task.warnings.push(format!(
+                "No provider implements backend {}; falling back to the CPU provider",
+                selected.as_str()
+            ));
+            task.fell_back = true;
+        }
