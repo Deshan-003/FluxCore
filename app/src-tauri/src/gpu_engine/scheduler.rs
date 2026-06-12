@@ -181,3 +181,94 @@ impl Scheduler {
                 .expect("spawn gpu-worker");
             if let Ok(mut workers) = self.workers.lock() {
                 workers.gpu = Some(handle);
+            }
+        }
+        for _ in 0..cpu_cap {
+            self.spawn_cpu_worker();
+        }
+    }
+
+    pub fn submit(
+        &self,
+        request: SubmitTaskRequest,
+        assessment: SuitabilityAssessment,
+    ) -> Result<GpuTask, String> {
+        let mut shared = self
+            .shared
+            .0
+            .lock()
+            .map_err(|_| "scheduler lock poisoned".to_string())?;
+        if shared.shutdown {
+            return Err("scheduler is shutting down".to_string());
+        }
+        if shared.queue.len() >= shared.config.max_queue_length {
+            return Err(format!(
+                "task queue is full ({} waiting); try again shortly",
+                shared.queue.len()
+            ));
+        }
+        let id = shared.next_id;
+        shared.next_id += 1;
+        let selected = request.backend.unwrap_or(assessment.selected_backend);
+        let title = profiler::find(&request.params.workload_id())
+            .map(|def| def.title.to_string())
+            .unwrap_or_else(|| request.workload_id.clone());
+        let task = GpuTask {
+            id,
+            client_ref: request.client_ref.clone(),
+            workload_id: request.params.workload_id().to_string(),
+            title,
+            params: request.params,
+            status: TaskStatus::Queued,
+            priority: request.priority,
+            requested_backend: request.backend,
+            selected_backend: Some(selected),
+            assessment: Some(assessment),
+            queued_at: now(),
+            started_at: None,
+            finished_at: None,
+            duration_ms: None,
+            queue_ms: None,
+            progress_percent: Some(0.0),
+            cpu_time_ms: None,
+            gpu_time_ms: None,
+            transfer_time_ms: None,
+            total_time_ms: None,
+            speedup: None,
+            vram_used_bytes: None,
+            max_abs_error: None,
+            validated: false,
+            fell_back: false,
+            error: None,
+            warnings: Vec::new(),
+        };
+        shared.tokens.insert(id, CancelToken::new());
+        shared.require_gpu.insert(id, request.require_gpu);
+        shared.queue.push(QueueEntry {
+            id,
+            priority: request.priority,
+            queued_at: task.queued_at.clone(),
+            gpu: selected != BackendKind::Cpu,
+        });
+        shared.tasks.insert(id, task.clone());
+        self.sync_queued(&shared);
+        self.ensure_workers(shared.config.max_concurrent_cpu_tasks);
+        (self.observer)(&task);
+        self.shared.1.notify_all();
+        Ok(task)
+    }
+
+    pub fn cancel(&self, task_id: u64) -> Result<GpuTask, String> {
+        let mut shared = self
+            .shared
+            .0
+            .lock()
+            .map_err(|_| "scheduler lock poisoned".to_string())?;
+        let status = shared
+            .tasks
+            .get(&task_id)
+            .map(|task| task.status)
+            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        if crate::gpu_engine::persistence::is_terminal(status) {
+            return Err(format!("task {task_id} already finished"));
+        }
