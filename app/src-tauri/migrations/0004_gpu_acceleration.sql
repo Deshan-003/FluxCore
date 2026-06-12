@@ -28,3 +28,32 @@ CREATE TABLE IF NOT EXISTS gpu_acceleration_settings (
 );
 
 CREATE TABLE IF NOT EXISTS gpu_workload_settings (
+  workload_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  selected_size INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gpu_task_history (
+  id INTEGER PRIMARY KEY,
+  task_ref TEXT,
+  workload_id TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  priority TEXT NOT NULL,
+  queued_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  duration_ms INTEGER,
+  queue_ms INTEGER,
+  cpu_time_ms REAL,
+  gpu_time_ms REAL,
+  transfer_time_ms REAL,
+  total_time_ms REAL,
+  speedup REAL,
+  vram_used_bytes INTEGER,
+  max_abs_error REAL,
