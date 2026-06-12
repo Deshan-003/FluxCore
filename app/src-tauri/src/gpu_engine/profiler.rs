@@ -427,3 +427,147 @@ fn make_assessment(
     selected_backend: BackendKind,
     available_vram_bytes: Option<u64>,
     blockers: Vec<String>,
+) -> SuitabilityAssessment {
+    SuitabilityAssessment {
+        workload_id: params.workload_id().to_string(),
+        input_size: params.input_size(),
+        secondary_size: params.secondary_size(),
+        classification,
+        reason,
+        estimated_cpu_ms: estimates.map(|e| e.cpu_ms),
+        estimated_gpu_ms: estimates.map(|e| e.gpu_ms),
+        estimated_gpu_total_ms: estimates.map(|e| e.gpu_total_ms),
+        transfer_overhead_ms: estimates.map(|e| e.transfer_ms),
+        transfer_bytes: params.transfer_bytes(),
+        estimated_vram_bytes: params.device_bytes(),
+        required_vram_bytes: params.device_bytes(),
+        available_vram_bytes,
+        gpu_budget_bytes: inputs.resources.budget_bytes,
+        estimate_source,
+        selected_backend,
+        gpu_enabled: inputs.gpu_enabled,
+        blockers,
+    }
+}
+
+/// Deterministic, side-effect-free. Decision order is EXACTLY §7.2, with two
+/// explicit conservative guards required by the Subagent-3 brief:
+///  * VRAM checks (steps 5/6) are skipped when VRAM is unknown, and an unknown
+///    VRAM is reported in the conservative reason.
+///  * A `GpuRecommended` verdict requires a MEASURED benchmark at this exact
+///    input size. Placeholder model coefficients (EstimateSource::Model/Mixed)
+///    are conservative estimates and are NEVER used alone to claim a speedup.
+pub fn classify(params: &WorkloadParams, inputs: &ClassifyInputs<'_>) -> SuitabilityAssessment {
+    let config = inputs.config;
+    let resources = inputs.resources;
+    let wid = params.workload_id();
+
+    // Always-truthful base fields.
+    let free_vram = resources.free_vram_bytes;
+    let device_free_vram: Option<u64> = inputs
+        .providers
+        .iter()
+        .filter(|p| p.kind != ProviderKind::Cpu)
+        .flat_map(|p| p.devices.iter())
+        .filter_map(|d| d.dedicated_free_bytes)
+        .max();
+    let vram_known = resources.total_vram_bytes.is_some()
+        || free_vram.is_some()
+        || device_free_vram.is_some();
+    let available_vram_bytes = Some(free_vram.unwrap_or(resources.remaining_budget_bytes));
+
+    let safety_blockers = merge_blockers(
+        resources.gates.clone(),
+        derived_safety_blockers(resources, config),
+    );
+
+    let ready_gpu: Vec<&ProviderStatus> = inputs
+        .providers
+        .iter()
+        .filter(|p| p.available && p.compute_ready && p.kind != ProviderKind::Cpu)
+        .collect();
+
+    let bench = most_recent_benchmark(inputs.benchmarks, wid, params.input_size());
+
+    // ---- Step 1: workload id not in registry --------------------------------
+    let def = match find(wid) {
+        Some(def) => def,
+        None => {
+            let mut blockers = safety_blockers.clone();
+            blockers.push(format!("no implementation is registered for '{wid}'"));
+            return make_assessment(
+                params,
+                Suitability::UnsupportedWorkload,
+                format!("No implementation is registered for workload '{wid}'"),
+                None,
+                EstimateSource::Model,
+                inputs,
+                BackendKind::Cpu,
+                available_vram_bytes,
+                blockers,
+            );
+        }
+    };
+
+    let estimates = build_estimates(params, def, bench);
+    let estimate_source = estimates.source;
+    let make = |classification, reason, backend, blockers: Vec<String>| {
+        make_assessment(
+            params,
+            classification,
+            reason,
+            Some(&estimates),
+            estimate_source,
+            inputs,
+            backend,
+            available_vram_bytes,
+            blockers,
+        )
+    };
+
+    // ---- Step 2: CpuOnly mode -----------------------------------------------
+    if config.mode == AccelerationMode::CpuOnly {
+        return make(
+            Suitability::CpuRecommended,
+            "GPU acceleration is disabled in CPU Only mode; this workload runs on the CPU."
+                .to_string(),
+            BackendKind::Cpu,
+            safety_blockers,
+        );
+    }
+
+    // ---- Step 3: no compute-ready GPU provider ------------------------------
+    if ready_gpu.is_empty() {
+        let reason = gpu_unavailable_reason(inputs.providers);
+        let mut blockers = safety_blockers.clone();
+        blockers.insert(
+            0,
+            "no compute-ready GPU provider is available".to_string(),
+        );
+        return make(
+            Suitability::AccelerationUnavailable,
+            format!("No GPU compute backend is usable: {reason}"),
+            BackendKind::Cpu,
+            blockers,
+        );
+    }
+
+    // ---- Step 4: no provider implements this workload -----------------------
+    let implementing: Vec<&ProviderStatus> = ready_gpu
+        .iter()
+        .copied()
+        .filter(|p| supports(p, wid))
+        .collect();
+    if implementing.is_empty() {
+        let names = ordered_by_priority(&ready_gpu, config)
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return make(
+            Suitability::UnsupportedWorkload,
+            format!("No compute-ready GPU provider implements '{wid}' (checked: {names})"),
+            BackendKind::Cpu,
+            safety_blockers,
+        );
+    }
