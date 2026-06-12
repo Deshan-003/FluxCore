@@ -284,3 +284,146 @@ fn build_estimates(
                 }
             }
         }
+        None => {
+            missing.push(format!(
+                "no measured benchmark exists at input size {}",
+                params.input_size()
+            ));
+            (model_cpu, model_gpu, model_transfer, EstimateSource::Model)
+        }
+    };
+    if degenerate && bench.is_none() {
+        missing.push("no cost-model coefficients are available".to_string());
+    }
+
+    let gpu_total_ms = gpu_ms + transfer_ms + LAUNCH_OVERHEAD_MS;
+    Estimates {
+        cpu_ms,
+        gpu_ms,
+        transfer_ms,
+        gpu_total_ms,
+        source,
+        missing,
+    }
+}
+
+/// Safety gates read from the single passed-in snapshot. These NEVER route a
+/// workload TO the GPU — they only block GPU execution and appear in blockers.
+fn derived_safety_blockers(
+    resources: &ResourceBudgetStatus,
+    config: &AccelerationConfig,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(util) = resources.gpu_utilization_percent {
+        if util > config.max_gpu_utilization_percent {
+            out.push(format!(
+                "GPU utilisation {util:.0}% exceeds the limit {:.0}%",
+                config.max_gpu_utilization_percent
+            ));
+        }
+    }
+    if let Some(temp) = resources.temperature_c {
+        if temp > config.max_temperature_c {
+            out.push(format!(
+                "GPU temperature {temp:.0} C exceeds the limit {:.0} C",
+                config.max_temperature_c
+            ));
+        }
+    }
+    // Power is recorded as a note only, never a blocker (§7.6).
+    if let Some(ram) = resources.system_ram_available_percent {
+        if ram < config.min_system_ram_available_percent {
+            out.push(format!(
+                "system RAM available {ram:.0}% is below the minimum {:.0}%",
+                config.min_system_ram_available_percent
+            ));
+        }
+    }
+    out
+}
+
+fn merge_blockers(mut base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    for item in extra {
+        if !base.iter().any(|existing| existing == &item) {
+            base.push(item);
+        }
+    }
+    base
+}
+
+fn backend_of(provider: &ProviderStatus) -> BackendKind {
+    match provider.id.as_str() {
+        "cuda" => BackendKind::Cuda,
+        "wgpu" => BackendKind::Wgpu,
+        "cpu" => BackendKind::Cpu,
+        _ => match provider.kind {
+            ProviderKind::Cuda => BackendKind::Cuda,
+            ProviderKind::Wgpu => BackendKind::Wgpu,
+            _ => BackendKind::Cpu,
+        },
+    }
+}
+
+/// A provider with an empty support list is treated as supporting every
+/// registered workload (§7.1 declares a GPU path for all four). An explicit
+/// list is authoritative.
+fn supports(provider: &ProviderStatus, workload_id: &str) -> bool {
+    if provider.supported_workloads.is_empty() {
+        return true;
+    }
+    provider
+        .supported_workloads
+        .iter()
+        .any(|s| s.workload_id == workload_id)
+}
+
+fn ordered_by_priority<'a>(
+    providers: &[&'a ProviderStatus],
+    config: &AccelerationConfig,
+) -> Vec<&'a ProviderStatus> {
+    let mut out = providers.to_vec();
+    out.sort_by_key(|p| {
+        config
+            .provider_priority
+            .iter()
+            .position(|id| id == &p.id)
+            .unwrap_or(usize::MAX)
+    });
+    out
+}
+
+fn gpu_unavailable_reason(providers: &[ProviderStatus]) -> String {
+    let reasons: Vec<String> = providers
+        .iter()
+        .filter(|p| p.kind != ProviderKind::Cpu)
+        .map(|p| {
+            let detail = p
+                .last_error
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let d = p.detail.as_str();
+                    if d.is_empty() { None } else { Some(d) }
+                })
+                .unwrap_or("not compute-ready");
+            format!("{}: {}", p.id, detail)
+        })
+        .collect();
+    if reasons.is_empty() {
+        "no GPU compute provider was discovered".to_string()
+    } else {
+        reasons.join("; ")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_assessment(
+    params: &WorkloadParams,
+    classification: Suitability,
+    reason: String,
+    estimates: Option<&Estimates>,
+    estimate_source: EstimateSource,
+    inputs: &ClassifyInputs<'_>,
+    selected_backend: BackendKind,
+    available_vram_bytes: Option<u64>,
+    blockers: Vec<String>,
