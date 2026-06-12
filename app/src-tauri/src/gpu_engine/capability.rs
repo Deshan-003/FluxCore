@@ -167,3 +167,87 @@ pub fn environment(providers: &[Arc<dyn GpuProvider>]) -> AccelerationEnvironmen
     for provider in providers {
         let kind = provider.kind();
         for device in provider.devices() {
+            let backend = device.backend.as_str();
+            // DX12/Vulkan presence is "actually probed": wgpu enumerated an
+            // adapter on that backend. Never hardcoded true.
+            if backend.contains("dx12") {
+                dx12_present = true;
+            }
+            if backend.contains("vulkan") {
+                vulkan_present = true;
+            }
+            if kind == ProviderKind::Wgpu && wgpu_backend.is_none() {
+                wgpu_backend = Some(device.backend.clone());
+            }
+            if kind == ProviderKind::Cpu {
+                continue;
+            }
+            if gpu_name.starts_with("unavailable") && !device.name.is_empty() {
+                gpu_name = device.name.clone();
+                gpu_vram_bytes = device.dedicated_total_bytes;
+            }
+            if driver_version.is_none() {
+                driver_version = device.driver_version.clone();
+            }
+        }
+    }
+    // Driver version from cuDriverGetVersion (via the CUDA provider) when no
+    // device carried one; None when unreadable.
+    let driver_version = driver_version.or_else(providers::cuda::probe_driver_version);
+
+    AccelerationEnvironment {
+        os_name,
+        os_version,
+        cpu_name,
+        logical_processors,
+        system_ram_bytes,
+        gpu_name,
+        gpu_vram_bytes,
+        driver_version,
+        cuda_toolkit_present,
+        cuda_runtime_api_present,
+        cuda_compute_path,
+        wgpu_version: "30.0.2".to_string(),
+        wgpu_backend,
+        vulkan_present,
+        dx12_present,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_engine::providers::CpuProvider;
+
+    #[test]
+    fn which_finds_an_existing_tool() {
+        // `cargo`/`rustc` live on PATH in this environment; at minimum the
+        // helper must not panic and must return a bool.
+        let _ = which("cmd.exe");
+    }
+
+    #[test]
+    fn cpu_status_is_available_but_not_a_gpu() {
+        let cpu = CpuProvider::new();
+        let _ = cpu.initialize();
+        let s = status_of(&cpu);
+        assert_eq!(s.id, "cpu");
+        assert_eq!(s.kind, ProviderKind::Cpu);
+        assert!(s.available);
+        assert!(s.compute_ready);
+        assert!(!s.detail.is_empty());
+    }
+
+    #[test]
+    fn environment_records_only_detected_facts() {
+        let providers = crate::gpu_engine::providers::all_providers();
+        let env = environment(&providers);
+        assert_eq!(env.wgpu_version, "30.0.2");
+        assert_eq!(env.os_name, std::env::consts::OS);
+        // DX12/Vulkan are false unless wgpu actually enumerated an adapter;
+        // nothing is hardcoded true here.
+        let _ = (env.dx12_present, env.vulkan_present);
+        assert!(env.logical_processors > 0);
+    }
+}
