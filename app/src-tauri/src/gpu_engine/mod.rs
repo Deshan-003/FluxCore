@@ -215,3 +215,111 @@ impl GpuEngine {
                     .iter()
                     .find(|item| item.workload_id == def.id && item.input_size == selected_size)
                     .cloned();
+                WorkloadView {
+                    id: def.id.to_string(),
+                    title: def.title.to_string(),
+                    description: def.description.to_string(),
+                    category: def.category.to_string(),
+                    sizes: def.sizes.to_vec(),
+                    selected_size,
+                    mode: setting
+                        .map(|item| item.mode)
+                        .unwrap_or(AccelerationMode::IntelligentAuto),
+                    pinned: setting.is_some(),
+                    assessment,
+                    last_benchmark,
+                }
+            })
+            .collect()
+    }
+
+    // ---- command-facing API -------------------------------------------------
+
+    pub fn state(&self) -> GpuAccelerationState {
+        let config = self.read_config();
+        let capabilities = self.read_capabilities();
+        let resources = self.resources.status(&config);
+        let summaries = self.benchmark_summaries();
+        let compute_ready = capabilities.providers.iter().any(|provider| {
+            provider.available && provider.compute_ready && provider.kind != ProviderKind::Cpu
+        });
+        let unavailable_reason = if !compute_ready {
+            let reasons: Vec<String> = capabilities
+                .providers
+                .iter()
+                .filter(|provider| provider.kind != ProviderKind::Cpu)
+                .map(|provider| {
+                    format!(
+                        "{}: {}",
+                        provider.label,
+                        if provider.detail.is_empty() {
+                            "not compute-ready"
+                        } else {
+                            provider.detail.as_str()
+                        }
+                    )
+                })
+                .collect();
+            Some(if reasons.is_empty() {
+                "No GPU compute provider was discovered".to_string()
+            } else {
+                reasons.join("; ")
+            })
+        } else if config.mode == AccelerationMode::CpuOnly {
+            Some("GPU acceleration is disabled in CPU Only mode".to_string())
+        } else {
+            None
+        };
+
+        let mut safety_notes = vec![
+            "Dedicated VRAM is GPU memory, not system RAM. FluxCore never converts VRAM into RAM."
+                .to_string(),
+            "GPU workloads are explicit, user-started computations; FluxCore does not accelerate other applications."
+                .to_string(),
+        ];
+        safety_notes.extend(resources.gates.clone());
+        safety_notes.extend(capabilities.notes.clone());
+        if config.mode == AccelerationMode::CpuOnly {
+            safety_notes.push("CPU Only mode: all supported workloads execute on the CPU.".to_string());
+        }
+
+        GpuAccelerationState {
+            collected_at: chrono::Utc::now().to_rfc3339(),
+            mode: config.mode,
+            available: compute_ready && config.mode != AccelerationMode::CpuOnly,
+            unavailable_reason,
+            providers: capabilities.providers.clone(),
+            workloads: Self::build_workloads(&config, &capabilities, &resources, &summaries),
+            resources,
+            tasks: self.scheduler.list(100, None),
+            safety_notes,
+            environment: capabilities.environment.clone(),
+        }
+    }
+
+    pub fn providers(&self) -> Vec<ProviderStatus> {
+        self.read_capabilities().providers
+    }
+
+    pub fn probe(&self, force: bool) -> Vec<ProviderStatus> {
+        if force {
+            for provider in &self.providers {
+                // A failed initialize is a reported state, never an error here.
+                let _ = provider.initialize();
+            }
+        }
+        let report = capability::detect_providers(&self.providers);
+        let statuses = report.providers.clone();
+        self.resources
+            .set_device_vram_total(Self::provider_vram_total(&self.providers));
+        if let Ok(mut slot) = self.capabilities.write() {
+            *slot = report;
+        }
+        for status in &statuses {
+            let _ = persistence::upsert_provider(&self.database, status);
+        }
+        self.emit_capabilities(&statuses);
+        statuses
+    }
+
+    pub fn config(&self) -> AccelerationConfig {
