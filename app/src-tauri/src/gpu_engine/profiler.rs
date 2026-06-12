@@ -141,3 +141,146 @@ pub fn find(id: &str) -> Option<&'static WorkloadDef> {
 const VECTOR_MAX: usize = 64 * 1024 * 1024;
 const MATMUL_MAX: usize = 2048;
 const ROW_SUM_MAX_ELEMENTS: u64 = 32 * 1024 * 1024;
+
+pub fn validate_params(params: &WorkloadParams) -> Result<(), String> {
+    let id = params.workload_id();
+    match *params {
+        WorkloadParams::VectorAxpy { n, a } | WorkloadParams::VectorScale { n, a } => {
+            if n == 0 {
+                return Err(format!("{id}: n must be at least 1 (got 0)"));
+            }
+            if n > VECTOR_MAX {
+                return Err(format!(
+                    "{id}: n={n} exceeds the cap of {VECTOR_MAX} elements (256 MiB per f32 buffer)"
+                ));
+            }
+            if !a.is_finite() {
+                return Err(format!("{id}: scalar a must be finite (got {a})"));
+            }
+        }
+        WorkloadParams::Matmul { m, k, n } => {
+            for (name, value) in [("m", m), ("k", k), ("n", n)] {
+                if value == 0 {
+                    return Err(format!("{id}: {name} must be at least 1 (got 0)"));
+                }
+                if value > MATMUL_MAX {
+                    return Err(format!(
+                        "{id}: {name}={value} exceeds the cap of {MATMUL_MAX}"
+                    ));
+                }
+            }
+            if m.checked_mul(k).is_none()
+                || k.checked_mul(n).is_none()
+                || m.checked_mul(n).is_none()
+            {
+                return Err(format!("{id}: matrix dimensions overflow usize"));
+            }
+        }
+        WorkloadParams::RowSum { rows, cols } => {
+            if rows == 0 || cols == 0 {
+                return Err(format!(
+                    "{id}: rows and cols must be at least 1 (got rows={rows}, cols={cols})"
+                ));
+            }
+            let elements = (rows as u64).saturating_mul(cols as u64);
+            if elements > ROW_SUM_MAX_ELEMENTS {
+                return Err(format!(
+                    "{id}: rows*cols = {elements} exceeds the cap of {ROW_SUM_MAX_ELEMENTS} elements"
+                ));
+            }
+            rows.checked_mul(cols)
+                .ok_or_else(|| format!("{id}: rows*cols overflows usize"))?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 inputs + estimates.
+// ---------------------------------------------------------------------------
+
+pub struct ClassifyInputs<'a> {
+    pub config: &'a AccelerationConfig,
+    pub providers: &'a [ProviderStatus],
+    pub resources: &'a ResourceBudgetStatus,
+    pub benchmarks: &'a [BenchmarkSummary],
+    pub gpu_enabled: bool,
+}
+
+struct Estimates {
+    cpu_ms: f64,
+    gpu_ms: f64,
+    transfer_ms: f64,
+    gpu_total_ms: f64,
+    source: EstimateSource,
+    /// Human-readable list of information that was missing (for conservative
+    /// "CpuRecommended" reasons).
+    missing: Vec<String>,
+}
+
+fn most_recent_benchmark<'a>(
+    benchmarks: &'a [BenchmarkSummary],
+    workload_id: &str,
+    input_size: usize,
+) -> Option<&'a BenchmarkSummary> {
+    benchmarks
+        .iter()
+        .filter(|b| b.workload_id == workload_id && b.input_size == input_size)
+        .max_by_key(|b| b.id)
+}
+
+fn build_estimates(
+    params: &WorkloadParams,
+    def: &WorkloadDef,
+    bench: Option<&BenchmarkSummary>,
+) -> Estimates {
+    let work = params.work_units();
+    let model_cpu = model_ms(&def.cpu_model, work);
+    let model_gpu = model_ms(&def.gpu_model, work);
+    let model_transfer = model_transfer_ms(params.transfer_bytes());
+    let degenerate = def.cpu_model.intercept_ns <= 0.0
+        && def.cpu_model.scale_ns_per_unit <= 0.0
+        && def.gpu_model.intercept_ns <= 0.0
+        && def.gpu_model.scale_ns_per_unit <= 0.0;
+
+    let mut missing: Vec<String> = Vec::new();
+    let (cpu_ms, gpu_ms, transfer_ms, source) = match bench {
+        Some(b) => {
+            let cpu_measured = b.cpu_median_ms.is_finite() && b.cpu_median_ms > 0.0;
+            let cpu = if cpu_measured {
+                b.cpu_median_ms
+            } else {
+                missing.push("the benchmark has no valid CPU median".to_string());
+                model_cpu
+            };
+            let transfer = match b.transfer_ms {
+                Some(t) if t.is_finite() && t >= 0.0 => t,
+                _ => {
+                    missing.push("the benchmark has no measured transfer time".to_string());
+                    model_transfer
+                }
+            };
+            match b.gpu_median_ms {
+                Some(g) if g.is_finite() && g > 0.0 => {
+                    // `gpu_median_ms` is interpreted as the GPU compute median;
+                    // `transfer_ms` and the launch overhead are added separately
+                    // (§7.3, §11's speedup = cpu / (gpu + transfer)). If a
+                    // producer instead reports an end-to-end GPU total, this
+                    // over-estimates gpu_total_ms — the CONSERVATIVE direction.
+                    (
+                        cpu,
+                        g,
+                        transfer,
+                        if cpu_measured {
+                            EstimateSource::Measured
+                        } else {
+                            EstimateSource::Mixed
+                        },
+                    )
+                }
+                _ => {
+                    missing.push("the benchmark has no measured GPU median".to_string());
+                    (cpu, model_gpu, transfer, EstimateSource::Mixed)
+                }
+            }
+        }
