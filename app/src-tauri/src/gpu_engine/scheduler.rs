@@ -272,3 +272,94 @@ impl Scheduler {
         if crate::gpu_engine::persistence::is_terminal(status) {
             return Err(format!("task {task_id} already finished"));
         }
+        let mut task = shared.tasks.get(&task_id).cloned().unwrap();
+        if status == TaskStatus::Queued {
+            let entries: Vec<QueueEntry> = shared
+                .queue
+                .drain()
+                .filter(|entry| entry.id != task_id)
+                .collect();
+            shared.queue.extend(entries);
+            task.status = TaskStatus::Cancelled;
+            task.finished_at = Some(now());
+            task.progress_percent = None;
+            shared.tokens.remove(&task_id);
+            shared.require_gpu.remove(&task_id);
+            shared.tasks.insert(task_id, task.clone());
+            self.sync_queued(&shared);
+            (self.observer)(&task);
+            self.shared.1.notify_all();
+        } else {
+            if let Some(token) = shared.tokens.get(&task_id) {
+                token.cancel();
+            }
+            let note = "cancellation requested; stops at the next cooperative checkpoint"
+                .to_string();
+            if !task.warnings.contains(&note) {
+                task.warnings.push(note);
+            }
+            shared.tasks.insert(task_id, task.clone());
+            (self.observer)(&task);
+        }
+        Ok(task)
+    }
+
+    pub fn list(&self, limit: usize, status: Option<TaskStatus>) -> Vec<GpuTask> {
+        let shared = match self.shared.0.lock() {
+            Ok(shared) => shared,
+            Err(_) => return Vec::new(),
+        };
+        let mut tasks: Vec<GpuTask> = shared
+            .tasks
+            .values()
+            .filter(|task| status.map(|want| task.status == want).unwrap_or(true))
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| b.id.cmp(&a.id));
+        tasks.truncate(limit);
+        tasks
+    }
+
+    pub fn clear_finished(&self) -> usize {
+        let mut shared = match self.shared.0.lock() {
+            Ok(shared) => shared,
+            Err(_) => return 0,
+        };
+        let finished: Vec<u64> = shared
+            .tasks
+            .iter()
+            .filter(|(_, task)| crate::gpu_engine::persistence::is_terminal(task.status))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &finished {
+            shared.tasks.remove(id);
+            shared.tokens.remove(id);
+            shared.require_gpu.remove(id);
+        }
+        self.sync_queued(&shared);
+        self.shared.1.notify_all();
+        finished.len()
+    }
+
+    pub fn set_config(&self, config: AccelerationConfig) {
+        let cpu_cap = config.max_concurrent_cpu_tasks;
+        if let Ok(mut shared) = self.shared.0.lock() {
+            shared.config = config;
+        }
+        if self.started.load(Ordering::SeqCst) {
+            let current = self
+                .workers
+                .lock()
+                .map(|workers| workers.cpu.len())
+                .unwrap_or(0);
+            for _ in current..cpu_cap {
+                self.spawn_cpu_worker();
+            }
+        }
+        self.shared.1.notify_all();
+    }
+
+    pub fn set_providers(&self, providers: Vec<Arc<dyn GpuProvider>>) {
+        if let Ok(mut shared) = self.shared.0.lock() {
+            shared.providers = providers;
+        }
