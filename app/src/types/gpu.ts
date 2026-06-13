@@ -77,3 +77,82 @@ export interface AccelerationEnvironment {
   osName: string
   osVersion: string
   cpuName: string
+  logicalProcessors: number
+  systemRamBytes: number
+  gpuName: string
+  gpuVramBytes: number | null
+  driverVersion: string | null
+  cudaToolkitPresent: boolean
+  cudaRuntimeApiPresent: boolean
+  cudaComputePath: string
+  wgpuVersion: string
+  wgpuBackend: string | null
+  vulkanPresent: boolean
+  dx12Present: boolean
+  recordedAt: string
+}
+
+export interface ResourceBudgetStatus {
+  totalVramBytes: number | null
+  freeVramBytes: number | null
+  budgetBytes: number
+  reservedBytes: number
+  allocatedBytes: number
+  remainingBudgetBytes: number
+  runningGpuTasks: number
+  queuedGpuTasks: number
+  maxConcurrentGpuTasks: number
+  gpuUtilizationPercent: number | null
+  temperatureC: number | null
+  powerWatts: number | null
+  safetyLevel: SafetyLevel
+  gates: string[]
+  systemRamAvailablePercent: number | null
+}
+
+export type WorkloadParams =
+  | { kind: 'vectorAxpy'; n: number; a: number }
+  | { kind: 'vectorScale'; n: number; a: number }
+  | { kind: 'matmul'; m: number; k: number; n: number }
+  | { kind: 'rowSum'; rows: number; cols: number }
+
+export interface TimingBreakdown {
+  setupNs: number
+  transferInNs: number
+  computeNs: number
+  transferOutNs: number
+  validationNs: number
+  totalNs: number
+  transferredBytes: number
+}
+
+export interface ExecutionRecord {
+  backend: BackendKind
+  providerId: string
+  deviceId: string
+  timing: TimingBreakdown
+  peakVramBytes: number
+  maxAbsError: number | null
+  validated: boolean
+  notes: string[]
+}
+
+export interface SuitabilityAssessment {
+  workloadId: string
+  inputSize: number
+  secondarySize: number | null
+  classification: Suitability
+  reason: string
+  estimatedCpuMs: number | null
+  estimatedGpuMs: number | null
+  estimatedGpuTotalMs: number | null
+  transferOverheadMs: number | null
+  transferBytes: number
+  estimatedVramBytes: number
+  requiredVramBytes: number
+  availableVramBytes: number | null
+  gpuBudgetBytes: number
+  estimateSource: EstimateSource
+  selectedBackend: BackendKind
+  gpuEnabled: boolean
+  blockers: string[]
