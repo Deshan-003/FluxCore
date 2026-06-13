@@ -363,3 +363,95 @@ impl Scheduler {
         if let Ok(mut shared) = self.shared.0.lock() {
             shared.providers = providers;
         }
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.shared.0.lock() {
+            shared.shutdown = true;
+            for token in shared.tokens.values() {
+                token.cancel();
+            }
+        }
+        self.shared.1.notify_all();
+        if let Ok(mut workers) = self.workers.lock() {
+            if let Some(handle) = workers.gpu.take() {
+                let _ = handle.join();
+            }
+            for handle in workers.cpu.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// Dequeue one runnable task for this worker kind, enforcing admission for GPU
+/// tasks. Runs under the shared lock; returns `None` when nothing is runnable.
+fn take_job(
+    shared: &mut Shared,
+    resources: &ResourceManager,
+    observer: &TaskObserver,
+    gpu: bool,
+) -> Option<Job> {
+    loop {
+        let cap = if gpu {
+            shared.config.max_concurrent_gpu_tasks
+        } else {
+            shared.config.max_concurrent_cpu_tasks
+        };
+        let running = if gpu {
+            shared.running_gpu
+        } else {
+            shared.running_cpu
+        };
+        if running >= cap {
+            return None;
+        }
+        let mut entries: Vec<QueueEntry> = shared.queue.drain().collect();
+        entries.sort_unstable_by(|a, b| b.cmp(a));
+        let position = entries.iter().position(|entry| entry.gpu == gpu);
+        let Some(position) = position else {
+            shared.queue.extend(entries);
+            return None;
+        };
+        let entry = entries.remove(position);
+        shared.queue.extend(entries);
+
+        let id = entry.id;
+        let require_gpu = shared.require_gpu.get(&id).copied().unwrap_or(false);
+        let Some(mut task) = shared.tasks.get(&id).cloned() else {
+            continue;
+        };
+        if gpu {
+            let requirement = WorkloadRequirement {
+                workload_id: task.workload_id.clone(),
+                input_size: task.params.input_size(),
+                device_bytes: task.params.device_bytes(),
+                transfer_bytes: task.params.transfer_bytes(),
+                timeout: Duration::from_millis(shared.config.task_timeout_ms),
+            };
+            let decision = resources.admit(id, &requirement, &shared.config);
+            if !decision.allowed {
+                let reason = decision
+                    .reason
+                    .unwrap_or_else(|| "GPU resources unavailable".to_string());
+                if require_gpu {
+                    task.status = TaskStatus::Rejected;
+                    task.error = Some(reason);
+                    task.finished_at = Some(now());
+                    task.progress_percent = None;
+                    shared.tokens.remove(&id);
+                    shared.require_gpu.remove(&id);
+                    shared.tasks.insert(id, task.clone());
+                    observer(&task);
+                    continue;
+                }
+                task.selected_backend = Some(BackendKind::Cpu);
+                task.warnings.push(format!(
+                    "GPU admission denied ({reason}); executing on the CPU instead"
+                ));
+                shared.tasks.insert(id, task.clone());
+                shared.queue.push(QueueEntry {
+                    id,
+                    priority: entry.priority,
