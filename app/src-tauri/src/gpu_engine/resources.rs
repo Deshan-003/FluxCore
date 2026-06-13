@@ -222,3 +222,77 @@ impl ResourceManager {
         let running = self.running_gpu_tasks();
         if running >= config.max_concurrent_gpu_tasks {
             return denied(format!(
+                "GPU concurrency limit reached ({running}/{} tasks hold the GPU budget)",
+                config.max_concurrent_gpu_tasks
+            ));
+        }
+        let snapshot = self.snapshot();
+        let gates = Self::gates_from(config, snapshot.as_ref());
+        if !gates.is_empty() {
+            return denied(gates.join("; "));
+        }
+        let remaining = self
+            .budget_bytes(config)
+            .saturating_sub(self.reserved_bytes());
+        if requirement.device_bytes > remaining {
+            return denied(format!(
+                "workload needs {} MiB of VRAM but the FluxCore budget leaves {} MiB",
+                requirement.device_bytes / MIB,
+                remaining / MIB
+            ));
+        }
+        if let Some(free) = snapshot
+            .as_ref()
+            .and_then(|s| s.gpus.first())
+            .and_then(|g| g.dedicated_available_bytes)
+        {
+            if requirement.device_bytes > free {
+                return denied(format!(
+                    "GPU reports {} MiB free VRAM; workload needs {} MiB",
+                    free / MIB,
+                    requirement.device_bytes / MIB
+                ));
+            }
+        }
+        self.reserve(task_id, requirement.device_bytes);
+        AdmissionDecision {
+            allowed: true,
+            reason: None,
+            reserved_bytes: requirement.device_bytes,
+        }
+    }
+
+    pub fn validate_config(config: &AccelerationConfig) -> Result<(), String> {
+        if !(1.0..=90.0).contains(&config.vram_budget_percent) {
+            return Err("vramBudgetPercent must be between 1.0 and 90.0".to_string());
+        }
+        if config.vram_budget_cap_mb > 4096 {
+            return Err("vramBudgetCapMb must be at most 4096".to_string());
+        }
+        if !(10.0..=100.0).contains(&config.max_gpu_utilization_percent) {
+            return Err("maxGpuUtilizationPercent must be between 10.0 and 100.0".to_string());
+        }
+        if !(40.0..=110.0).contains(&config.max_temperature_c) {
+            return Err("maxTemperatureC must be between 40.0 and 110.0".to_string());
+        }
+        if !(1..=2).contains(&config.max_concurrent_gpu_tasks) {
+            return Err("maxConcurrentGpuTasks must be 1 or 2".to_string());
+        }
+        if !(1..=4).contains(&config.max_concurrent_cpu_tasks) {
+            return Err("maxConcurrentCpuTasks must be between 1 and 4".to_string());
+        }
+        if !(1..=256).contains(&config.max_queue_length) {
+            return Err("maxQueueLength must be between 1 and 256".to_string());
+        }
+        if !(500..=60000).contains(&config.task_timeout_ms) {
+            return Err("taskTimeoutMs must be between 500 and 60000".to_string());
+        }
+        if !(1.0..=50.0).contains(&config.min_system_ram_available_percent) {
+            return Err("minSystemRamAvailablePercent must be between 1.0 and 50.0".to_string());
+        }
+        if !(1..=90).contains(&config.retention_days) {
+            return Err("retentionDays must be between 1 and 90".to_string());
+        }
+        Ok(())
+    }
+}
