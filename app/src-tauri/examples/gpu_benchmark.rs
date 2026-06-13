@@ -37,3 +37,41 @@ fn main() {
         environment.gpu_name,
         environment.gpu_vram_bytes.map(|b| b / (1024 * 1024)),
         environment.driver_version
+    );
+    println!(
+        "cuda_toolkit={} cuda_path={} wgpu={} backend={:?} vulkan={} dx12={}",
+        environment.cuda_toolkit_present,
+        environment.cuda_compute_path,
+        environment.wgpu_version,
+        environment.wgpu_backend,
+        environment.vulkan_present,
+        environment.dx12_present
+    );
+    for status in capability::detect_providers(&providers).providers {
+        println!(
+            "provider {} available={} compute_ready={} detail={}",
+            status.id, status.available, status.compute_ready, status.detail
+        );
+    }
+
+    let context = benchmark::BenchmarkContext {
+        providers: providers.clone(),
+        environment,
+        config: AccelerationConfig::default(),
+        timeout: Duration::from_millis(10_000),
+        cancel: CancelToken::new(),
+        preferred_backend: None,
+    };
+
+    let catalogue: [(&str, usize); 4] = [
+        ("vector_axpy", 1_048_576),
+        ("vector_scale", 1_048_576),
+        ("matmul", 512),
+        ("row_sum", 1024),
+    ];
+    for (workload_id, size) in catalogue {
+        let Some(params) = default_params(workload_id, size) else {
+            println!("{workload_id}: no default params for size {size}");
+            continue;
+        };
+        let request = BenchmarkRequest {
