@@ -75,3 +75,42 @@ fn main() {
             continue;
         };
         let request = BenchmarkRequest {
+            workload_id: workload_id.to_string(),
+            params,
+            warmup_runs: 1,
+            measured_runs: measured,
+            validate: true,
+        };
+        match benchmark::run_benchmark(&request, &context) {
+            Ok(record) => {
+                println!("-- {workload_id} (size {size}) --");
+                println!(
+                    "cpu median {:.3} ms (min {:.3} / max {:.3}, {} runs)",
+                    record.cpu.median_ms, record.cpu.min_ms, record.cpu.max_ms, record.cpu.runs
+                );
+                match &record.gpu {
+                    Some(gpu) => println!(
+                        "gpu median {:.3} ms (min {:.3} / max {:.3}, {} runs), transfer {:?} ms, vram {:?} MiB",
+                        gpu.median_ms,
+                        gpu.min_ms,
+                        gpu.max_ms,
+                        gpu.runs,
+                        record.transfer_ms,
+                        record.vram_used_bytes.map(|b| b / (1024 * 1024))
+                    ),
+                    None => println!("gpu: did not run"),
+                }
+                println!(
+                    "speedup {:?} validated={} max_abs_error={:?}",
+                    record.speedup, record.validated, record.max_abs_error
+                );
+                println!("verdict: {}", record.verdict);
+            }
+            Err(error) => println!("-- {workload_id} -- benchmark failed: {error}"),
+        }
+    }
+
+    for provider in &providers {
+        provider.shutdown();
+    }
+}
