@@ -72,3 +72,78 @@ impl ResourceManager {
             .map(|map| map.values().copied().sum())
             .unwrap_or(0)
     }
+
+    /// Budget from a known dedicated-VRAM total. Percent semantics per freeze
+    /// §0bis C3: `vram_budget_percent` is 1.0..=90.0, default 50.0.
+    fn budget_from_total(total: u64, config: &AccelerationConfig) -> u64 {
+        let percent_budget = (total as f64 * config.vram_budget_percent as f64 / 100.0) as u64;
+        if config.vram_budget_cap_mb > 0 {
+            percent_budget.min(config.vram_budget_cap_mb.saturating_mul(MIB))
+        } else {
+            percent_budget
+        }
+    }
+
+    pub fn budget_bytes(&self, config: &AccelerationConfig) -> u64 {
+        let total = self.effective_total(
+            self.snapshot()
+                .and_then(|s| s.gpus.first().and_then(|g| g.dedicated_total_bytes)),
+        )
+        .unwrap_or(0);
+        Self::budget_from_total(total, config)
+    }
+
+    pub fn remaining_bytes(&self, config: &AccelerationConfig) -> u64 {
+        self.budget_bytes(config)
+            .saturating_sub(self.reserved_bytes())
+    }
+
+    /// Number of GPU tasks currently holding a reservation (running, plus the
+    /// benchmark slot). Queued-but-not-started tasks hold no reservation.
+    pub fn running_gpu_tasks(&self) -> usize {
+        self.reserved.lock().map(|map| map.len()).unwrap_or(0)
+    }
+
+    /// Additive helper: the scheduler publishes its GPU queue depth so the UI
+    /// can show queued vs running truthfully (the frozen surface had no setter).
+    pub fn set_queued_gpu_tasks(&self, count: usize) {
+        self.queued_gpu.store(count, Ordering::Relaxed);
+    }
+
+    fn gates_from(config: &AccelerationConfig, snapshot: Option<&SystemSnapshot>) -> Vec<String> {
+        let mut gates = Vec::new();
+        let Some(snapshot) = snapshot else {
+            return gates;
+        };
+        if let Some(gpu) = snapshot.gpus.first() {
+            if let Some(util) = gpu.utilization_percent {
+                if util > config.max_gpu_utilization_percent {
+                    gates.push(format!(
+                        "GPU utilisation {util:.0}% above limit {:.0}%",
+                        config.max_gpu_utilization_percent
+                    ));
+                }
+            }
+            if let Some(temp) = gpu.temperature_c {
+                if temp > config.max_temperature_c {
+                    gates.push(format!(
+                        "GPU temperature {temp:.0}C above limit {:.0}C",
+                        config.max_temperature_c
+                    ));
+                }
+            }
+        }
+        if snapshot.memory.total_bytes > 0 {
+            let available =
+                snapshot.memory.available_bytes as f32 * 100.0 / snapshot.memory.total_bytes as f32;
+            if available < config.min_system_ram_available_percent {
+                gates.push(format!(
+                    "System RAM available {available:.0}% below minimum {:.0}%",
+                    config.min_system_ram_available_percent
+                ));
+            }
+        }
+        gates
+    }
+
+    pub fn gates(&self, config: &AccelerationConfig) -> Vec<String> {
