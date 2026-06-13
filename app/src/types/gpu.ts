@@ -156,3 +156,81 @@ export interface SuitabilityAssessment {
   selectedBackend: BackendKind
   gpuEnabled: boolean
   blockers: string[]
+}
+
+export interface BenchmarkSummary {
+  id: number
+  createdAt: string
+  workloadId: string
+  inputSize: number
+  backend: BackendKind
+  cpuMedianMs: number
+  gpuMedianMs: number | null
+  transferMs: number | null
+  speedup: number | null
+  verdict: string
+}
+
+export interface WorkloadView {
+  id: string
+  title: string
+  description: string
+  category: string
+  sizes: number[]
+  selectedSize: number
+  mode: AccelerationMode
+  pinned: boolean
+  assessment: SuitabilityAssessment
+  lastBenchmark: BenchmarkSummary | null
+}
+
+export interface GpuTask {
+  id: number
+  clientRef: string | null
+  workloadId: string
+  title: string
+  params: WorkloadParams
+  status: TaskStatus
+  priority: TaskPriority
+  requestedBackend: BackendKind | null
+  selectedBackend: BackendKind | null
+  assessment: SuitabilityAssessment | null
+  queuedAt: string
+  startedAt: string | null
+  finishedAt: string | null
+  durationMs: number | null
+  queueMs: number | null
+  progressPercent: number | null
+  cpuTimeMs: number | null
+  gpuTimeMs: number | null
+  transferTimeMs: number | null
+  totalTimeMs: number | null
+  speedup: number | null
+  vramUsedBytes: number | null
+  maxAbsError: number | null
+  validated: boolean
+  fellBack: boolean
+  error: string | null
+  warnings: string[]
+}
+
+export interface WorkloadSetting {
+  workloadId: string
+  mode: AccelerationMode
+  backend: BackendKind
+  enabled: boolean
+  selectedSize: number
+}
+
+export interface DevicePreference {
+  providerId: string
+  deviceId: string
+}
+
+export interface AccelerationConfig {
+  mode: AccelerationMode
+  workloadSettings: WorkloadSetting[]
+  providerPriority: string[]
+  preferredDevices: DevicePreference[]
+  vramBudgetPercent: number
+  vramBudgetCapMb: number
