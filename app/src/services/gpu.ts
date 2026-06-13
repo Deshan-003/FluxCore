@@ -26,3 +26,32 @@ export async function listGpuProviders(): Promise<ProviderStatus[]> {
   return invoke<ProviderStatus[]>('list_gpu_providers')
 }
 
+export async function probeGpuProviders(force: boolean): Promise<ProviderStatus[]> {
+  return invoke<ProviderStatus[]>('probe_gpu_providers', { force })
+}
+
+export async function listSupportedWorkloads(): Promise<WorkloadView[]> {
+  return invoke<WorkloadView[]>('list_supported_workloads')
+}
+
+export async function getWorkloadRecommendations(
+  size?: number, workloadId?: string,
+): Promise<SuitabilityAssessment[]> {
+  return invoke<SuitabilityAssessment[]>('get_workload_recommendations', { size, workloadId })
+}
+
+export async function submitWorkloadTask(request: SubmitTaskRequest): Promise<GpuTask> {
+  return invoke<GpuTask>('submit_workload_task', { request })
+}
+
+export async function cancelTask(taskId: number): Promise<GpuTask> {
+  return invoke<GpuTask>('cancel_task', { taskId })
+}
+
+export async function listTasks(limit?: number, status?: TaskStatus): Promise<GpuTask[]> {
+  return invoke<GpuTask[]>('list_tasks', { limit, status })
+}
+
+export async function clearFinishedTasks(): Promise<number> {
+  return invoke<number>('clear_finished_tasks')
+}
