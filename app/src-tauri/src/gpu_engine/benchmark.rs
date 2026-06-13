@@ -241,3 +241,84 @@ pub fn run_benchmark(
             if request.validate {
                 all_validated &= gpu_outcome.validated;
                 if let Some(error) = gpu_outcome.max_abs_error {
+                    max_abs_error = Some(max_abs_error.map(|m| m.max(error)).unwrap_or(error));
+                }
+            }
+        }
+    }
+
+    let cpu_stats = stats(&cpu_samples);
+    let gpu_stats = if gpu_samples.is_empty() {
+        None
+    } else {
+        Some(stats(&gpu_samples))
+    };
+    let transfer = median(&transfer_samples);
+    let speedup = gpu_stats.as_ref().and_then(|gpu_stats| {
+        if gpu_stats.median_ms > 0.0 {
+            Some(cpu_stats.median_ms / gpu_stats.median_ms)
+        } else {
+            None
+        }
+    });
+    let gpu_ran = gpu_stats.is_some();
+    let verdict = match (&gpu_stats, speedup) {
+        (None, _) => format!(
+            "GPU path did not run ({}); CPU median {:.2} ms over {} measured runs",
+            gpu_reason.unwrap_or_else(|| "unavailable".to_string()),
+            cpu_stats.median_ms,
+            cpu_stats.runs
+        ),
+        (Some(gpu_stats), Some(speedup)) if speedup >= 1.0 => format!(
+            "GPU was {speedup:.2}x faster than CPU at this size (CPU {:.2} ms vs GPU {:.2} ms end-to-end, {} measured runs)",
+            cpu_stats.median_ms,
+            gpu_stats.median_ms,
+            gpu_stats.runs
+        ),
+        (Some(gpu_stats), Some(speedup)) => format!(
+            "GPU was {:.2}x slower than CPU at this size (CPU {:.2} ms vs GPU {:.2} ms end-to-end, transfer {:.2} ms, {} measured runs)",
+            1.0 / speedup,
+            cpu_stats.median_ms,
+            gpu_stats.median_ms,
+            transfer.unwrap_or(0.0),
+            gpu_stats.runs
+        ),
+        (Some(gpu_stats), None) => format!(
+            "GPU ran but produced no usable timing (CPU {:.2} ms, {} measured runs)",
+            cpu_stats.median_ms,
+            gpu_stats.runs
+        ),
+    };
+    let backend = if gpu_ran {
+        gpu.map(|p| crate::gpu_engine::providers::backend_for_provider(p.id()))
+            .unwrap_or(BackendKind::Cpu)
+    } else {
+        BackendKind::Cpu
+    };
+    let provider_id = if gpu_ran {
+        gpu.map(|p| p.id().to_string()).unwrap_or_default()
+    } else {
+        "cpu".to_string()
+    };
+    Ok(BenchmarkRecord {
+        id: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        workload_id: request.params.workload_id().to_string(),
+        params: request.params,
+        backend,
+        provider_id,
+        device_id: if gpu_ran { gpu_device } else { String::new() },
+        cpu: cpu_stats,
+        gpu: gpu_stats,
+        transfer_ms: transfer,
+        speedup,
+        vram_used_bytes: if gpu_ran { Some(peak_vram) } else { None },
+        validated: gpu_ran && request.validate && all_validated,
+        max_abs_error,
+        verdict,
+        environment: ctx.environment.clone(),
+    })
+}
+
+/// Re-exported for callers that only need the error type alias.
+pub type BenchmarkResult = GpuResult<BenchmarkRecord>;
