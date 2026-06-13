@@ -160,3 +160,84 @@ pub fn run_benchmark(
                     p.last_error()
                         .unwrap_or_else(|| "not compute-ready for this workload".to_string())
                 )
+            })
+            .collect();
+        Some(if reasons.is_empty() {
+            "no GPU compute provider was discovered".to_string()
+        } else {
+            reasons.join("; ")
+        })
+    } else {
+        None
+    };
+    let gpu_device = gpu
+        .and_then(|p| p.devices().first().map(|d| d.device_id.clone()))
+        .unwrap_or_default();
+
+    let deadline = Instant::now()
+        + ctx
+            .timeout
+            .saturating_mul(warmup.saturating_add(measured).max(1));
+    let check = || -> Result<(), String> {
+        if ctx.cancel.is_cancelled() {
+            return Err("benchmark cancelled".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err("benchmark exceeded its total time budget".to_string());
+        }
+        Ok(())
+    };
+
+    for _ in 0..warmup {
+        check()?;
+        run_once(cpu.as_ref(), &request.params, "", ctx.timeout, &ctx.cancel, false)
+            .map_err(|error| format!("CPU warm-up failed: {error}"))?;
+        if let Some(gpu) = gpu {
+            check()?;
+            run_once(
+                gpu.as_ref(),
+                &request.params,
+                &gpu_device,
+                ctx.timeout,
+                &ctx.cancel,
+                false,
+            )
+            .map_err(|error| format!("GPU warm-up failed: {error}"))?;
+        }
+    }
+
+    let mut cpu_samples: Vec<f64> = Vec::new();
+    let mut gpu_samples: Vec<f64> = Vec::new();
+    let mut transfer_samples: Vec<f64> = Vec::new();
+    let mut peak_vram: u64 = 0;
+    let mut max_abs_error: Option<f32> = None;
+    let mut all_validated = true;
+    for _ in 0..measured {
+        check()?;
+        let cpu_outcome = run_once(
+            cpu.as_ref(),
+            &request.params,
+            "",
+            ctx.timeout,
+            &ctx.cancel,
+            false,
+        )
+        .map_err(|error| format!("CPU measurement failed: {error}"))?;
+        cpu_samples.push(total_ms(&cpu_outcome));
+        if let Some(gpu) = gpu {
+            check()?;
+            let gpu_outcome = run_once(
+                gpu.as_ref(),
+                &request.params,
+                &gpu_device,
+                ctx.timeout,
+                &ctx.cancel,
+                request.validate,
+            )
+            .map_err(|error| format!("GPU measurement failed: {error}"))?;
+            gpu_samples.push(total_ms(&gpu_outcome));
+            transfer_samples.push(transfer_ms(&gpu_outcome));
+            peak_vram = peak_vram.max(gpu_outcome.peak_device_bytes);
+            if request.validate {
+                all_validated &= gpu_outcome.validated;
+                if let Some(error) = gpu_outcome.max_abs_error {
