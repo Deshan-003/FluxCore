@@ -79,3 +79,84 @@ pub fn run_once(
     cancel: &CancelToken,
     validate: bool,
 ) -> GpuResult<ExecutionOutcome> {
+    let request = ExecutionRequest {
+        request_id: 0,
+        workload_id: params.workload_id().to_string(),
+        device_id: device_id.to_string(),
+        params: *params,
+        timeout,
+        cancel: cancel.clone(),
+        validate,
+    };
+    provider.execute(&request)
+}
+
+fn total_ms(outcome: &ExecutionOutcome) -> f64 {
+    outcome.timing.total_ns as f64 / NS_PER_MS
+}
+
+fn transfer_ms(outcome: &ExecutionOutcome) -> f64 {
+    outcome
+        .timing
+        .transfer_in_ns
+        .saturating_add(outcome.timing.transfer_out_ns) as f64
+        / NS_PER_MS
+}
+
+fn gpu_candidate<'a>(
+    providers: &'a [Arc<dyn GpuProvider>],
+    preferred: Option<BackendKind>,
+    workload_id: &str,
+) -> Option<&'a Arc<dyn GpuProvider>> {
+    let mut order: Vec<BackendKind> = Vec::new();
+    if let Some(preferred) = preferred {
+        if preferred != BackendKind::Cpu {
+            order.push(preferred);
+        }
+    }
+    for backend in [BackendKind::Cuda, BackendKind::Wgpu] {
+        if !order.contains(&backend) {
+            order.push(backend);
+        }
+    }
+    for backend in order {
+        if let Some(provider) = providers.iter().find(|p| p.id() == backend.as_str()) {
+            if provider.is_available()
+                && provider.capabilities().compute_ready
+                && provider
+                    .supported_workloads()
+                    .iter()
+                    .any(|support| support.workload_id == workload_id)
+            {
+                return Some(provider);
+            }
+        }
+    }
+    None
+}
+
+pub fn run_benchmark(
+    request: &BenchmarkRequest,
+    ctx: &BenchmarkContext,
+) -> Result<BenchmarkRecord, String> {
+    profiler::validate_params(&request.params).map_err(|error| error.to_string())?;
+    let warmup = request.warmup_runs.clamp(0, 10);
+    let measured = request.measured_runs.clamp(1, 50);
+    let cpu = ctx
+        .providers
+        .iter()
+        .find(|p| p.id() == "cpu")
+        .ok_or_else(|| "no CPU provider is available for benchmarking".to_string())?;
+    let gpu = gpu_candidate(&ctx.providers, ctx.preferred_backend, &request.params.workload_id());
+    let gpu_reason = if gpu.is_none() {
+        let reasons: Vec<String> = ctx
+            .providers
+            .iter()
+            .filter(|p| p.id() != "cpu")
+            .map(|p| {
+                format!(
+                    "{}: {}",
+                    p.label(),
+                    p.last_error()
+                        .unwrap_or_else(|| "not compute-ready for this workload".to_string())
+                )
