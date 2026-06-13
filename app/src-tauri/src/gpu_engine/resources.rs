@@ -147,3 +147,78 @@ impl ResourceManager {
     }
 
     pub fn gates(&self, config: &AccelerationConfig) -> Vec<String> {
+        Self::gates_from(config, self.snapshot().as_ref())
+    }
+
+    pub fn status(&self, config: &AccelerationConfig) -> ResourceBudgetStatus {
+        let snapshot = self.snapshot();
+        let gpu = snapshot.as_ref().and_then(|s| s.gpus.first());
+        let total = self.effective_total(gpu.and_then(|g| g.dedicated_total_bytes));
+        let free = gpu.and_then(|g| g.dedicated_available_bytes);
+        let budget = Self::budget_from_total(total.unwrap_or(0), config);
+        let reserved = self.reserved_bytes();
+        let gates = Self::gates_from(config, snapshot.as_ref());
+        let utilization = gpu.and_then(|g| g.utilization_percent);
+        let safety_level = if !gates.is_empty() {
+            SafetyLevel::Blocked
+        } else if utilization
+            .map(|u| u > config.max_gpu_utilization_percent * 0.8)
+            .unwrap_or(false)
+        {
+            SafetyLevel::Caution
+        } else {
+            SafetyLevel::Ok
+        };
+        let system_ram_available_percent = snapshot
+            .as_ref()
+            .filter(|s| s.memory.total_bytes > 0)
+            .map(|s| s.memory.available_bytes as f32 * 100.0 / s.memory.total_bytes as f32);
+        ResourceBudgetStatus {
+            total_vram_bytes: total,
+            free_vram_bytes: free,
+            budget_bytes: budget,
+            reserved_bytes: reserved,
+            // Reservations are released exactly when the provider frees the
+            // matching buffers, so reserved == allocated; counting both would
+            // double-subtract the same bytes (architecture R9).
+            allocated_bytes: reserved,
+            remaining_budget_bytes: budget.saturating_sub(reserved),
+            running_gpu_tasks: self.running_gpu_tasks(),
+            queued_gpu_tasks: self.queued_gpu.load(Ordering::Relaxed),
+            max_concurrent_gpu_tasks: config.max_concurrent_gpu_tasks,
+            gpu_utilization_percent: utilization,
+            temperature_c: gpu.and_then(|g| g.temperature_c),
+            power_watts: gpu.and_then(|g| g.power_watts),
+            safety_level,
+            gates,
+            system_ram_available_percent,
+        }
+    }
+
+    /// Idempotent per task id: a double reserve must not double-count.
+    pub fn reserve(&self, task_id: u64, bytes: u64) -> bool {
+        match self.reserved.lock() {
+            Ok(mut map) => {
+                map.entry(task_id).or_insert(bytes);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Idempotent per task id: a double release must not corrupt accounting.
+    pub fn release(&self, task_id: u64) {
+        if let Ok(mut map) = self.reserved.lock() {
+            map.remove(&task_id);
+        }
+    }
+
+    pub fn admit(
+        &self,
+        task_id: u64,
+        requirement: &WorkloadRequirement,
+        config: &AccelerationConfig,
+    ) -> AdmissionDecision {
+        let running = self.running_gpu_tasks();
+        if running >= config.max_concurrent_gpu_tasks {
+            return denied(format!(
