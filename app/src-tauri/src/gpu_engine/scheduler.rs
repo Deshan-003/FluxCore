@@ -455,3 +455,94 @@ fn take_job(
                 shared.queue.push(QueueEntry {
                     id,
                     priority: entry.priority,
+                    queued_at: entry.queued_at,
+                    gpu: false,
+                });
+                observer(&task);
+                continue;
+            }
+        }
+        task.status = TaskStatus::Running;
+        task.started_at = Some(now());
+        task.queue_ms = Some(ms_since(&task.queued_at));
+        if gpu {
+            shared.running_gpu += 1;
+        } else {
+            shared.running_cpu += 1;
+        }
+        let token = shared.tokens.get(&id).cloned().unwrap_or_default();
+        let providers = shared.providers.clone();
+        let config = shared.config.clone();
+        shared.tasks.insert(id, task.clone());
+        observer(&task);
+        return Some(Job {
+            task,
+            providers,
+            config,
+            token,
+            require_gpu,
+            started: Instant::now(),
+        });
+    }
+}
+
+fn worker_loop(
+    shared: Arc<(Mutex<Shared>, Condvar)>,
+    resources: Arc<ResourceManager>,
+    observer: TaskObserver,
+    gpu: bool,
+) {
+    loop {
+        let job = {
+            let mut guard = match shared.0.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            loop {
+                if guard.shutdown {
+                    return;
+                }
+                if let Some(job) = take_job(&mut guard, &resources, &observer, gpu) {
+                    break job;
+                }
+                guard = match shared.1.wait(guard) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+        };
+        let mut task = job.task;
+        let result = execution::execute_task(
+            &mut task,
+            &job.providers,
+            &job.config,
+            &job.token,
+            job.require_gpu,
+        );
+        let mut guard = match shared.0.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if gpu {
+            guard.running_gpu = guard.running_gpu.saturating_sub(1);
+            resources.release(task.id);
+        } else {
+            guard.running_cpu = guard.running_cpu.saturating_sub(1);
+        }
+        task.finished_at = Some(now());
+        task.duration_ms = Some(job.started.elapsed().as_millis() as u64);
+        task.status = match result {
+            Ok(_) => TaskStatus::Succeeded,
+            Err(GpuError::Cancelled { .. }) => TaskStatus::Cancelled,
+            Err(GpuError::Timeout { .. }) => TaskStatus::TimedOut,
+            Err(_) => TaskStatus::Failed,
+        };
+        guard.tokens.remove(&task.id);
+        guard.require_gpu.remove(&task.id);
+        guard.tasks.insert(task.id, task.clone());
+        let queued = guard.queue.iter().filter(|entry| entry.gpu).count();
+        resources.set_queued_gpu_tasks(queued);
+        observer(&task);
+        shared.1.notify_all();
+    }
+}
