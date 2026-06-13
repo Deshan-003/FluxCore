@@ -170,3 +170,89 @@ pub fn recent_benchmarks(
                 }
             }
             None => {
+                let mut stmt = connection
+                    .prepare("SELECT payload FROM gpu_benchmark_results ORDER BY id DESC LIMIT ?1")?;
+                let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+        }
+        Ok(out
+            .into_iter()
+            .filter_map(|payload| serde_json::from_str::<BenchmarkRecord>(&payload).ok())
+            .collect())
+    })
+}
+
+pub fn clear_benchmarks(db: &Database) -> Result<usize, String> {
+    db.with_connection(|connection| {
+        let removed = connection.execute("DELETE FROM gpu_benchmark_results", [])?;
+        Ok(removed)
+    })
+}
+
+pub fn save_config(db: &Database, config: &AccelerationConfig) -> Result<(), String> {
+    let payload = json(config)?;
+    let mode = config.mode.as_str().to_string();
+    let updated = now();
+    db.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO gpu_acceleration_settings (id, mode, payload, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET mode = excluded.mode,
+               payload = excluded.payload, updated_at = excluded.updated_at",
+            rusqlite::params![mode, payload, updated],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn load_config(db: &Database) -> Result<Option<AccelerationConfig>, String> {
+    db.with_connection(|connection| {
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM gpu_acceleration_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(payload.and_then(|text| serde_json::from_str::<AccelerationConfig>(&text).ok()))
+    })
+}
+
+pub fn save_workload_settings(db: &Database, settings: &[WorkloadSetting]) -> Result<(), String> {
+    let updated = now();
+    db.with_connection(|connection| {
+        connection.execute_batch("BEGIN; DELETE FROM gpu_workload_settings;")?;
+        for setting in settings {
+            connection.execute(
+                "INSERT INTO gpu_workload_settings (workload_id, mode, backend, enabled, selected_size, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    setting.workload_id,
+                    setting.mode.as_str(),
+                    setting.backend.as_str(),
+                    setting.enabled as i64,
+                    setting.selected_size as i64,
+                    updated,
+                ],
+            )?;
+        }
+        connection.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+}
+
+pub fn load_workload_settings(db: &Database) -> Result<Vec<WorkloadSetting>, String> {
+    db.with_connection(|connection| {
+        let mut stmt = connection.prepare(
+            "SELECT workload_id, mode, backend, enabled, selected_size FROM gpu_workload_settings ORDER BY workload_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
