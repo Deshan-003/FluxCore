@@ -55,3 +55,31 @@ export async function listTasks(limit?: number, status?: TaskStatus): Promise<Gp
 export async function clearFinishedTasks(): Promise<number> {
   return invoke<number>('clear_finished_tasks')
 }
+
+export async function getTaskHistory(limit?: number, workloadId?: string): Promise<GpuTask[]> {
+  return invoke<GpuTask[]>('get_task_history', { limit, workloadId })
+}
+
+export async function runBenchmark(request: BenchmarkRequest): Promise<BenchmarkRecord> {
+  return invoke<BenchmarkRecord>('run_benchmark', { request })
+}
+
+export async function getBenchmarkHistory(limit?: number, workloadId?: string): Promise<BenchmarkRecord[]> {
+  return invoke<BenchmarkRecord[]>('get_benchmark_history', { limit, workloadId })
+}
+
+export async function clearBenchmarkHistory(): Promise<number> {
+  return invoke<number>('clear_benchmark_history')
+}
+
+export async function getGpuEnvironment(): Promise<AccelerationEnvironment> {
+  return invoke<AccelerationEnvironment>('get_gpu_environment')
+}
+
+export function onGpuTaskEvent(handler: (task: GpuTask) => void): Promise<UnlistenFn> {
+  return listen<GpuTask>('fluxcore-gpu-task', (event) => handler(event.payload))
+}
+
+export function onGpuCapabilitiesEvent(handler: (providers: ProviderStatus[]) => void): Promise<UnlistenFn> {
+  return listen<ProviderStatus[]>('fluxcore-gpu-capabilities', (event) => handler(event.payload))
+}
