@@ -234,3 +234,82 @@ export interface AccelerationConfig {
   preferredDevices: DevicePreference[]
   vramBudgetPercent: number
   vramBudgetCapMb: number
+  maxGpuUtilizationPercent: number
+  maxTemperatureC: number
+  maxConcurrentGpuTasks: number
+  maxConcurrentCpuTasks: number
+  maxQueueLength: number
+  taskTimeoutMs: number
+  minSystemRamAvailablePercent: number
+  persistHistory: boolean
+  retentionDays: number
+  autoBenchmark: boolean
+  validateResults: boolean
+  emitEvents: boolean
+}
+
+export interface SubmitTaskRequest {
+  workloadId: string
+  params: WorkloadParams
+  priority: TaskPriority
+  backend: BackendKind | null
+  clientRef: string | null
+  requireGpu: boolean
+  timeoutMs: number | null
+}
+
+export interface BenchmarkRequest {
+  workloadId: string
+  params: WorkloadParams
+  warmupRuns: number
+  measuredRuns: number
+  validate: boolean
+}
+
+export interface TimingStats {
+  runs: number
+  minMs: number
+  medianMs: number
+  meanMs: number
+  maxMs: number
+  stddevMs: number
+}
+
+export interface BenchmarkRecord {
+  id: number
+  createdAt: string
+  workloadId: string
+  params: WorkloadParams
+  backend: BackendKind
+  providerId: string
+  deviceId: string
+  cpu: TimingStats
+  gpu: TimingStats | null
+  transferMs: number | null
+  speedup: number | null
+  vramUsedBytes: number | null
+  validated: boolean
+  maxAbsError: number | null
+  verdict: string
+  environment: AccelerationEnvironment
+}
+
+export interface CapabilityReport {
+  collectedAt: string
+  providers: ProviderStatus[]
+  environment: AccelerationEnvironment
+  notes: string[]
+}
+
+export interface GpuAccelerationState {
+  collectedAt: string
+  mode: AccelerationMode
+  available: boolean
+  unavailableReason: string | null
+  providers: ProviderStatus[]
+  workloads: WorkloadView[]
+  resources: ResourceBudgetStatus
+  tasks: GpuTask[]
+  safetyNotes: string[]
+  environment: AccelerationEnvironment
+}
