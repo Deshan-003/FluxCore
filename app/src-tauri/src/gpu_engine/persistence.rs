@@ -256,3 +256,89 @@ pub fn load_workload_settings(db: &Database) -> Result<Vec<WorkloadSetting>, Str
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (workload_id, mode, backend, enabled, selected_size) = row?;
+            out.push(WorkloadSetting {
+                workload_id,
+                mode: AccelerationMode::parse(&mode).unwrap_or_default(),
+                backend: BackendKind::parse(&backend).unwrap_or(BackendKind::Cpu),
+                enabled: enabled != 0,
+                selected_size: selected_size.max(0) as usize,
+            });
+        }
+        Ok(out)
+    })
+}
+
+pub fn upsert_provider(db: &Database, status: &ProviderStatus) -> Result<(), String> {
+    let capabilities = json(&status.capabilities)?;
+    let kind = enum_string(&status.kind);
+    let seen = now();
+    db.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO gpu_providers (provider_id, label, kind, available, compute_ready, detail, device_count, capabilities, last_seen)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(provider_id) DO UPDATE SET label = excluded.label, kind = excluded.kind,
+               available = excluded.available, compute_ready = excluded.compute_ready,
+               detail = excluded.detail, device_count = excluded.device_count,
+               capabilities = excluded.capabilities, last_seen = excluded.last_seen",
+            rusqlite::params![
+                status.id,
+                status.label,
+                kind,
+                status.available as i64,
+                status.compute_ready as i64,
+                status.detail,
+                status.devices.len() as i64,
+                capabilities,
+                seen,
+            ],
+        )?;
+        // Refresh the single-row provider cache with a summary of every known
+        // provider so the table is a real cache, not dead schema.
+        let mut stmt = connection.prepare(
+            "SELECT provider_id, label, kind, available, compute_ready, detail, device_count, last_seen FROM gpu_providers ORDER BY provider_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "providerId": row.get::<_, String>(0)?,
+                "label": row.get::<_, String>(1)?,
+                "kind": row.get::<_, String>(2)?,
+                "available": row.get::<_, i64>(3)? != 0,
+                "computeReady": row.get::<_, i64>(4)? != 0,
+                "detail": row.get::<_, String>(5)?,
+                "deviceCount": row.get::<_, i64>(6)?,
+                "lastSeen": row.get::<_, String>(7)?,
+            }))
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        let payload = serde_json::to_string(&summaries)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        connection.execute(
+            "INSERT INTO gpu_provider_cache (id, payload, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+            rusqlite::params![payload, seen],
+        )?;
+        Ok(())
+    })
+}
+
+/// Terminal statuses are the ones the observer persists (freeze §1.5).
+pub fn is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Succeeded
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled
+            | TaskStatus::TimedOut
+            | TaskStatus::Rejected
+    )
+}
