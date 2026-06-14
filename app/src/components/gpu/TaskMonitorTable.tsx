@@ -24,3 +24,29 @@ export default function TaskMonitorTable({ tasks, onCancel }: {
       </thead>
       <tbody>
         {tasks.map((task) => (
+          <tr key={task.id}>
+            <td>{task.id}</td>
+            <td title={task.workloadId}>{task.title}</td>
+            <td><BackendBadge backend={task.selectedBackend} fellBack={task.fellBack} /></td>
+            <td><span className={`gpu-pill status-${task.status}`}>{task.status}</span></td>
+            <td>{task.progressPercent === null ? '—' : `${task.progressPercent.toFixed(0)}%`}</td>
+            <td>{ms(task.totalTimeMs)}</td>
+            <td>{task.speedup === null ? '—' : `${task.speedup.toFixed(2)}x`}</td>
+            <td>{fmtBytes(task.vramUsedBytes)}</td>
+            <td className="gpu-task-notes">
+              {task.error && <span className="gpu-error">{task.error}</span>}
+              {task.warnings.map((warning) => <span key={warning} className="gpu-warning">{warning}</span>)}
+            </td>
+            <td>
+              {(task.status === 'queued' || task.status === 'running') && (
+                <button className="button ghost" aria-label={`Cancel task ${task.id}`} onClick={() => onCancel(task.id)}>
+                  <X size={14} />
+                </button>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
