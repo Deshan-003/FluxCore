@@ -101,3 +101,54 @@ export const useGpuStore = create<GpuStore>()((set, get) => ({
     try {
       const stored = await updateGpuResourceConfig(config)
       set({ config: stored, error: null })
+      await get().refresh()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  submit: async (request) => {
+    try {
+      const task = await submitWorkloadTask(request)
+      set({ error: null })
+      await get().refresh()
+      return task
+    } catch (error) {
+      set({ error: message(error) })
+      return null
+    }
+  },
+
+  cancel: async (taskId) => {
+    try {
+      await cancelTask(taskId)
+      set({ error: null })
+      await get().refresh()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  clearFinished: async () => {
+    try {
+      await clearFinishedTasks()
+      await get().refresh()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  runBenchmark: async (request) => {
+    set({ benchmarkBusy: true })
+    try {
+      const record = await runBenchmark(request)
+      set({ error: null })
+      await get().loadBenchmarks()
+      await get().refresh()
+      return record
+    } catch (error) {
+      set({ error: message(error) })
+      return null
+    } finally {
+      set({ benchmarkBusy: false })
+    }
