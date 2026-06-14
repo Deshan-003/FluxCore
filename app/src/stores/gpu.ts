@@ -152,3 +152,55 @@ export const useGpuStore = create<GpuStore>()((set, get) => ({
     } finally {
       set({ benchmarkBusy: false })
     }
+  },
+
+  probe: async (force) => {
+    try {
+      await probeGpuProviders(force)
+      set({ error: null })
+      await get().refresh()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  loadHistory: async () => {
+    try {
+      set({ history: await getTaskHistory(100) })
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  loadBenchmarks: async () => {
+    try {
+      set({ benchmarks: await getBenchmarkHistory(100) })
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  clearBenchmarks: async () => {
+    try {
+      await clearBenchmarkHistory()
+      await get().loadBenchmarks()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  setPrefs: (patch) => {
+    const prefs = { ...get().prefs, ...patch }
+    savePrefs(prefs)
+    set({ prefs })
+  },
+
+  applyTaskEvent: (task) => {
+    const current = get().state
+    if (!current) return
+    const tasks = current.tasks.some((item) => item.id === task.id)
+      ? current.tasks.map((item) => (item.id === task.id ? task : item))
+      : [task, ...current.tasks].slice(0, 100)
+    set({ state: { ...current, tasks } })
+  },
+}))
