@@ -263,3 +263,91 @@ export default function GpuAccelerationPage() {
                       value={setting?.mode ?? 'intelligentAuto'}
                       onChange={(e) => patchDraft({
                         workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { mode: e.target.value as AccelerationMode }),
+                      })}
+                    >
+                      {MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
+                    </select>
+                    <select
+                      value={setting?.backend ?? 'cpu'}
+                      onChange={(e) => patchDraft({
+                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { backend: e.target.value as BackendKind }),
+                      })}
+                    >
+                      <option value="cpu">CPU</option>
+                      <option value="cuda">CUDA</option>
+                      <option value="wgpu">wgpu</option>
+                    </select>
+                    <Toggle
+                      checked={setting?.enabled ?? true}
+                      onChange={(checked) => patchDraft({
+                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { enabled: checked }),
+                      })}
+                    />
+                  </span>
+                </SettingRow>
+              )
+            })}
+          </Panel>
+        </TabsContent>
+
+        <TabsContent value="tasks">
+          <Panel title="Active tasks" icon={ListChecks} action={
+            <button className="button ghost" onClick={() => void clearFinished()}>
+              <Trash2 size={14} /> Clear finished
+            </button>
+          }>
+            <TaskMonitorTable tasks={state.tasks} onCancel={(id) => void cancel(id)} />
+          </Panel>
+          <Panel title="Task history (SQLite)" icon={ListChecks} action={
+            <button className="button ghost" onClick={() => void loadHistory()}>
+              <RefreshCw size={14} /> Reload
+            </button>
+          }>
+            <TaskMonitorTable tasks={history} onCancel={() => undefined} />
+          </Panel>
+        </TabsContent>
+
+        <TabsContent value="benchmarks">
+          <Panel title="Run a CPU-vs-GPU benchmark" icon={Gauge} action={
+            <button
+              className="button primary"
+              disabled={benchmarkBusy}
+              onClick={() => void runBenchmark({
+                workloadId: benchWorkload,
+                params: paramsFor(benchWorkload, benchSize),
+                warmupRuns: warmup,
+                measuredRuns: runs,
+                validate: true,
+              })}
+            >
+              <Sparkles size={14} /> {benchmarkBusy ? 'Benchmarking…' : 'Run benchmark'}
+            </button>
+          }>
+            <div className="gpu-config-grid">
+              <label>Workload
+                <select value={benchWorkload} onChange={(e) => { setBenchWorkload(e.target.value); setBenchSize(state.workloads.find((w) => w.id === e.target.value)?.sizes[0] ?? 1_048_576) }}>
+                  {state.workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.title}</option>)}
+                </select>
+              </label>
+              <label>Size
+                <select value={benchSize} onChange={(e) => setBenchSize(Number(e.target.value))}>
+                  {benchSizes.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+                </select>
+              </label>
+              <label>Warm-up runs<input type="number" min={0} max={10} value={warmup} onChange={(e) => setWarmup(Number(e.target.value))} /></label>
+              <label>Measured runs<input type="number" min={1} max={50} value={runs} onChange={(e) => setRuns(Number(e.target.value))} /></label>
+            </div>
+            <SensorNotice text="Benchmarks use identical inputs on both backends, discard warm-ups and report medians. A slowdown is reported as a slowdown." />
+          </Panel>
+          <Panel title="Measured comparison" icon={Gauge} action={
+            <button className="button ghost" onClick={() => void clearBenchmarks()}>
+              <Trash2 size={14} /> Clear history
+            </button>
+          }>
+            <BenchmarkComparisonChart records={benchmarks} />
+          </Panel>
+        </TabsContent>
+      </Tabs>
+    </div>
+  )
+}
