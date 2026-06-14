@@ -32,3 +32,36 @@ export default function WorkloadRecommendationRow({ workload, busy, onRun, onSiz
         </span>
         <BackendBadge backend={assessment.selectedBackend} />
         <span className="gpu-estimate-source">
+          {assessment.estimateSource === 'measured' ? 'measured' : assessment.estimateSource === 'mixed' ? 'mixed' : 'estimate'}
+        </span>
+      </div>
+      <p className="gpu-reason">{assessment.reason}</p>
+      <div className="gpu-grid">
+        <span>CPU estimate: <strong>{ms(assessment.estimatedCpuMs)}</strong></span>
+        <span>GPU estimate: <strong>{ms(assessment.estimatedGpuTotalMs)}</strong></span>
+        <span>Transfer: <strong>{ms(assessment.transferOverheadMs)}</strong> ({fmtBytes(assessment.transferBytes)})</span>
+        <span>VRAM needed: <strong>{fmtBytes(assessment.requiredVramBytes)}</strong> / budget {fmtBytes(assessment.gpuBudgetBytes)}</span>
+      </div>
+      {assessment.blockers.map((blocker) => <p key={blocker} className="gpu-blocker">{blocker}</p>)}
+      <div className="gpu-workload-actions">
+        <label className="gpu-size-picker">
+          <span>Size</span>
+          <select
+            value={workload.selectedSize}
+            onChange={(event) => onSize(workload, Number(event.target.value))}
+          >
+            {workload.sizes.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+          </select>
+        </label>
+        <button className="button primary" disabled={busy} onClick={() => onRun(workload)}>
+          <Play size={14} /> Run
+        </button>
+        {workload.lastBenchmark && (
+          <span className="gpu-last-bench" title={workload.lastBenchmark.verdict}>
+            last: {workload.lastBenchmark.speedup === null ? 'CPU only' : `${workload.lastBenchmark.speedup.toFixed(2)}x`}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
