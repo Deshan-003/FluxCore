@@ -174,3 +174,92 @@ export default function GpuAccelerationPage() {
               <Detail label="CUDA toolkit" value={state.environment.cudaToolkitPresent ? 'Present' : 'Absent'} />
               <Detail label="CUDA compute path" value={state.environment.cudaComputePath} />
               <Detail label="wgpu" value={`${state.environment.wgpuVersion} (${state.environment.wgpuBackend ?? 'no adapter'})`} />
+              <Detail label="Vulkan / DX12" value={`${state.environment.vulkanPresent ? 'yes' : 'no'} / ${state.environment.dx12Present ? 'yes' : 'no'}`} />
+            </div>
+          </Panel>
+        </TabsContent>
+
+        <TabsContent value="workloads">
+          <Panel title="Workload suitability" icon={Sparkles}>
+            {state.workloads.map((workload) => (
+              <WorkloadRecommendationRow
+                key={workload.id}
+                workload={workload}
+                busy={loading}
+                onRun={runWorkload}
+                onSize={changeSize}
+              />
+            ))}
+          </Panel>
+        </TabsContent>
+
+        <TabsContent value="center">
+          <Panel title="Execution mode" icon={Zap}>
+            <SettingRow title="Acceleration mode" description={MODES.find((m) => m.value === state.mode)?.hint ?? ''}>
+              <select
+                value={state.mode}
+                onChange={(event) => void setMode(event.target.value as AccelerationMode)}
+              >
+                {MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
+              </select>
+            </SettingRow>
+          </Panel>
+          <Panel title="Resource limits" icon={Gauge} action={
+            <span>
+              <button className="button ghost" onClick={() => setDraft(null)}>Reset</button>
+              <button className="button primary" onClick={() => void saveConfig(draft)}>Save</button>
+            </span>
+          }>
+            <div className="gpu-config-grid">
+              <label>VRAM budget (%)<input type="number" min={1} max={90} step={1} value={draft.vramBudgetPercent} onChange={(e) => patchDraft({ vramBudgetPercent: Number(e.target.value) })} /></label>
+              <label>VRAM cap (MiB, 0 = none)<input type="number" min={0} max={4096} value={draft.vramBudgetCapMb} onChange={(e) => patchDraft({ vramBudgetCapMb: Number(e.target.value) })} /></label>
+              <label>Max GPU utilisation (%)<input type="number" min={10} max={100} value={draft.maxGpuUtilizationPercent} onChange={(e) => patchDraft({ maxGpuUtilizationPercent: Number(e.target.value) })} /></label>
+              <label>Max temperature (°C)<input type="number" min={40} max={110} value={draft.maxTemperatureC} onChange={(e) => patchDraft({ maxTemperatureC: Number(e.target.value) })} /></label>
+              <label>Concurrent GPU tasks<input type="number" min={1} max={2} value={draft.maxConcurrentGpuTasks} onChange={(e) => patchDraft({ maxConcurrentGpuTasks: Number(e.target.value) })} /></label>
+              <label>Concurrent CPU tasks<input type="number" min={1} max={4} value={draft.maxConcurrentCpuTasks} onChange={(e) => patchDraft({ maxConcurrentCpuTasks: Number(e.target.value) })} /></label>
+              <label>Max queue length<input type="number" min={1} max={256} value={draft.maxQueueLength} onChange={(e) => patchDraft({ maxQueueLength: Number(e.target.value) })} /></label>
+              <label>Task timeout (ms)<input type="number" min={500} max={60000} step={100} value={draft.taskTimeoutMs} onChange={(e) => patchDraft({ taskTimeoutMs: Number(e.target.value) })} /></label>
+              <label>Min system RAM available (%)<input type="number" min={1} max={50} value={draft.minSystemRamAvailablePercent} onChange={(e) => patchDraft({ minSystemRamAvailablePercent: Number(e.target.value) })} /></label>
+              <label>Retention (days)<input type="number" min={1} max={90} value={draft.retentionDays} onChange={(e) => patchDraft({ retentionDays: Number(e.target.value) })} /></label>
+            </div>
+            <SettingRow title="Validate GPU results" description="Compare every GPU output against the CPU reference.">
+              <Toggle checked={draft.validateResults} onChange={(checked) => patchDraft({ validateResults: checked })} />
+            </SettingRow>
+            <SettingRow title="Persist history" description="Store task history and benchmarks in SQLite.">
+              <Toggle checked={draft.persistHistory} onChange={(checked) => patchDraft({ persistHistory: checked })} />
+            </SettingRow>
+            <SettingRow title="Live task events" description="Emit fluxcore-gpu-task events to the UI.">
+              <Toggle checked={draft.emitEvents} onChange={(checked) => patchDraft({ emitEvents: checked })} />
+            </SettingRow>
+            <SettingRow title="Auto refresh" description="Refresh this page while it is visible.">
+              <Toggle checked={prefs.autoRefresh} onChange={(checked) => setPrefs({ autoRefresh: checked })} />
+            </SettingRow>
+          </Panel>
+          <Panel title="Provider priority" icon={ListChecks}>
+            {draft.providerPriority.map((id, index) => (
+              <SettingRow key={id} title={id} description={`Preference position ${index + 1}`}>
+                <span>
+                  <button className="button ghost" disabled={index === 0} onClick={() => {
+                    const order = [...draft.providerPriority]
+                    ;[order[index - 1], order[index]] = [order[index], order[index - 1]]
+                    patchDraft({ providerPriority: order })
+                  }}>Up</button>
+                  <button className="button ghost" disabled={index === draft.providerPriority.length - 1} onClick={() => {
+                    const order = [...draft.providerPriority]
+                    ;[order[index + 1], order[index]] = [order[index], order[index + 1]]
+                    patchDraft({ providerPriority: order })
+                  }}>Down</button>
+                </span>
+              </SettingRow>
+            ))}
+          </Panel>
+          <Panel title="Per-workload pins (Manual mode)" icon={ListChecks}>
+            {state.workloads.map((workload) => {
+              const setting = draft.workloadSettings.find((item) => item.workloadId === workload.id)
+              return (
+                <SettingRow key={workload.id} title={workload.title} description="Honoured when the execution mode is Manual.">
+                  <span className="gpu-pin-controls">
+                    <select
+                      value={setting?.mode ?? 'intelligentAuto'}
+                      onChange={(e) => patchDraft({
+                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { mode: e.target.value as AccelerationMode }),
