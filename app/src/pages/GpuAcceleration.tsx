@@ -86,3 +86,91 @@ export default function GpuAccelerationPage() {
     const caps = onGpuCapabilitiesEvent(() => void useGpuStore.getState().refresh())
     return () => {
       void task.then((unlisten) => unlisten())
+      void caps.then((unlisten) => unlisten())
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!prefs.autoRefresh) return undefined
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') void useGpuStore.getState().refresh()
+    }, 3000)
+    return () => clearInterval(id)
+  }, [prefs.autoRefresh])
+
+  if (error && !state) {
+    return (
+      <div className="gpu-page">
+        <EmptyState title="GPU engine unavailable" detail={error} />
+        <button className="button primary" onClick={() => void refresh()}>Retry</button>
+      </div>
+    )
+  }
+  if (!state || !config || !draft) {
+    return (
+      <div className="gpu-page">
+        <EmptyState title="Loading GPU engine" detail="Reading provider capabilities and resource budget…" />
+      </div>
+    )
+  }
+
+  const draft = draftOverride ?? config
+  const runWorkload = (workload: WorkloadView) => {
+    void submit({
+      workloadId: workload.id,
+      params: paramsFor(workload.id, workload.selectedSize),
+      priority: 'normal',
+      backend: null,
+      clientRef: null,
+      requireGpu: false,
+      timeoutMs: null,
+    })
+  }
+  const changeSize = (workload: WorkloadView, size: number) => {
+    setPrefs({ selectedSizes: { ...prefs.selectedSizes, [workload.id]: size } })
+    void saveConfig({
+      ...config,
+      workloadSettings: upsertSetting(config.workloadSettings, workload.id, { selectedSize: size }),
+    })
+  }
+  const patchDraft = (patch: Partial<AccelerationConfig>) => setDraft({ ...draft, ...patch })
+  const benchSizes = state.workloads.find((w) => w.id === benchWorkload)?.sizes ?? [1_048_576]
+
+  return (
+    <div className="gpu-page">
+      <Tabs
+        value={prefs.lastTab}
+        onValueChange={(value) => setPrefs({ lastTab: value })}
+        className="gpu-tabs"
+      >
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="workloads">Workload Intelligence</TabsTrigger>
+          <TabsTrigger value="center">Acceleration Center</TabsTrigger>
+          <TabsTrigger value="tasks">Task Monitor</TabsTrigger>
+          <TabsTrigger value="benchmarks">Performance Comparison</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="overview">
+          {!state.available && (
+            <UnsupportedState reason={state.unavailableReason} />
+          )}
+          {state.safetyNotes.map((note) => <SensorNotice key={note} text={note} />)}
+          <div className="gpu-columns">
+            {state.providers.map((provider) => <GpuStatusCard key={provider.id} provider={provider} />)}
+          </div>
+          <ResourceBudgetPanel resources={state.resources} />
+          <Panel title="Environment" icon={MonitorCog} action={
+            <button className="button ghost" onClick={() => void probe(true)} disabled={loading}>
+              <RefreshCw size={14} /> Re-probe
+            </button>
+          }>
+            <div className="gpu-grid">
+              <Detail label="OS" value={`${state.environment.osName} ${state.environment.osVersion}`} />
+              <Detail label="CPU" value={state.environment.cpuName} />
+              <Detail label="Logical processors" value={String(state.environment.logicalProcessors)} />
+              <Detail label="GPU" value={state.environment.gpuName} />
+              <Detail label="Driver" value={state.environment.driverVersion ?? 'Unavailable'} />
+              <Detail label="CUDA toolkit" value={state.environment.cudaToolkitPresent ? 'Present' : 'Absent'} />
+              <Detail label="CUDA compute path" value={state.environment.cudaComputePath} />
+              <Detail label="wgpu" value={`${state.environment.wgpuVersion} (${state.environment.wgpuBackend ?? 'no adapter'})`} />
