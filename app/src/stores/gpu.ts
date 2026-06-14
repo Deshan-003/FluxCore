@@ -50,3 +50,54 @@ interface GpuStore {
   setMode: (mode: AccelerationMode) => Promise<void>
   saveConfig: (config: AccelerationConfig) => Promise<void>
   submit: (request: SubmitTaskRequest) => Promise<GpuTask | null>
+  cancel: (taskId: number) => Promise<void>
+  clearFinished: () => Promise<void>
+  runBenchmark: (request: BenchmarkRequest) => Promise<BenchmarkRecord | null>
+  probe: (force: boolean) => Promise<void>
+  loadHistory: () => Promise<void>
+  loadBenchmarks: () => Promise<void>
+  clearBenchmarks: () => Promise<void>
+  setPrefs: (patch: Partial<GpuPreferences>) => void
+  applyTaskEvent: (task: GpuTask) => void
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+export const useGpuStore = create<GpuStore>()((set, get) => ({
+  state: null,
+  config: null,
+  benchmarks: [],
+  history: [],
+  loading: false,
+  benchmarkBusy: false,
+  error: null,
+  prefs: loadPrefs(),
+
+  refresh: async () => {
+    set({ loading: true })
+    try {
+      const [state, config] = await Promise.all([getGpuAccelerationState(), getGpuResourceConfig()])
+      set({ state, config, error: null })
+    } catch (error) {
+      set({ error: message(error) })
+    } finally {
+      set({ loading: false })
+    }
+  },
+
+  setMode: async (mode) => {
+    try {
+      const state = await setAccelerationMode(mode)
+      set({ state, error: null })
+      await get().refresh()
+    } catch (error) {
+      set({ error: message(error) })
+    }
+  },
+
+  saveConfig: async (config) => {
+    try {
+      const stored = await updateGpuResourceConfig(config)
+      set({ config: stored, error: null })
