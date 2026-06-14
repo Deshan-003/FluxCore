@@ -18,3 +18,24 @@ export default function ResourceBudgetPanel({ resources }: { resources: Resource
   return (
     <Panel title="GPU resource budget" icon={Gauge}>
       <ResourceBar
+        label="FluxCore VRAM budget"
+        value={mib(resources.reservedBytes)}
+        total={mib(resources.budgetBytes)}
+        percent={usedPercent}
+        color="violet"
+      />
+      <div className="gpu-grid">
+        <Detail label="Dedicated VRAM total" value={mib(resources.totalVramBytes)} />
+        <Detail label="Dedicated VRAM free" value={mib(resources.freeVramBytes)} />
+        <Detail label="Remaining budget" value={mib(resources.remainingBudgetBytes)} />
+        <Detail label="Running GPU tasks" value={`${resources.runningGpuTasks} / ${resources.maxConcurrentGpuTasks}`} />
+        <Detail label="Queued GPU tasks" value={String(resources.queuedGpuTasks)} />
+        <Detail label="GPU utilisation" value={percent(resources.gpuUtilizationPercent)} />
+        <Detail label="GPU temperature" value={resources.temperatureC === null ? 'Unavailable' : `${resources.temperatureC.toFixed(0)}°C`} />
+        <Detail label="System RAM available" value={percent(resources.systemRamAvailablePercent)} />
+      </div>
+      <SensorNotice text="Dedicated VRAM is GPU memory, not system RAM. The budget limits only FluxCore's own allocations." />
+      {resources.gates.map((gate) => <SensorNotice key={gate} text={gate} />)}
+    </Panel>
+  )
+}
