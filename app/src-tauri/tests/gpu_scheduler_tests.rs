@@ -182,3 +182,96 @@ fn harness(mode: Mode, mutate: impl FnOnce(&mut AccelerationConfig)) -> Harness 
     let path = dir.path().join("scheduler-test.sqlite3");
     std::mem::forget(dir);
     let db = Arc::new(Database::open_at_path(path).unwrap());
+    let memory = Arc::new(MemoryEngine::new(Arc::clone(&db)));
+    let monitor = Arc::new(MonitorEngine::new(Arc::clone(&db), Arc::clone(&memory)));
+    let resources = Arc::new(ResourceManager::new(Arc::clone(&monitor)));
+    // The Linux verification host has no monitor-visible GPU; publish the mock
+    // device's VRAM so admission behaves as it does on real hardware.
+    resources.set_device_vram_total(Some(4 * GIB));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let observer: TaskObserver = Arc::new(move |task| sink.lock().unwrap().push(task.clone()));
+    let mock = Arc::new(MockState {
+        mode: Mutex::new(mode),
+        executes: AtomicUsize::new(0),
+    });
+    let providers: Vec<Arc<dyn GpuProvider>> = vec![
+        Arc::new(CpuProvider::new()),
+        Arc::new(MockProvider {
+            state: Arc::clone(&mock),
+        }),
+    ];
+    for provider in &providers {
+        let _ = provider.initialize();
+    }
+    let mut config = AccelerationConfig::default();
+    config.mode = AccelerationMode::GpuAcceleration;
+    mutate(&mut config);
+    let scheduler = Scheduler::new(
+        providers.clone(),
+        Arc::clone(&resources),
+        observer,
+        config.clone(),
+    );
+    Harness {
+        scheduler,
+        resources,
+        events,
+        mock,
+        config,
+        providers,
+    }
+}
+
+fn assessment(h: &Harness, params: &WorkloadParams) -> SuitabilityAssessment {
+    let statuses = capability::detect_providers(&h.providers).providers;
+    let resources = h.resources.status(&h.config);
+    profiler::classify(
+        params,
+        &profiler::ClassifyInputs {
+            config: &h.config,
+            providers: &statuses,
+            resources: &resources,
+            benchmarks: &[],
+            gpu_enabled: true,
+        },
+    )
+}
+
+fn request(params: WorkloadParams, backend: Option<BackendKind>, require_gpu: bool) -> SubmitTaskRequest {
+    SubmitTaskRequest {
+        workload_id: params.workload_id().to_string(),
+        params,
+        priority: TaskPriority::Normal,
+        backend,
+        client_ref: None,
+        require_gpu,
+        timeout_ms: None,
+    }
+}
+
+fn wait_terminal(h: &Harness, id: u64, secs: u64) -> GpuTask {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(task) = h.scheduler.list(500, None).into_iter().find(|t| t.id == id) {
+            if matches!(
+                task.status,
+                TaskStatus::Succeeded
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::TimedOut
+                    | TaskStatus::Rejected
+            ) {
+                return task;
+            }
+        }
+        assert!(Instant::now() < deadline, "task {id} did not finish in {secs}s");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn axpy() -> WorkloadParams {
+    WorkloadParams::VectorAxpy { n: 65_536, a: 1.5 }
+}
+
+#[test]
