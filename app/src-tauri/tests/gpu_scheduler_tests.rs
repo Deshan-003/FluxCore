@@ -275,3 +275,95 @@ fn axpy() -> WorkloadParams {
 }
 
 #[test]
+fn cpu_only_mode_executes_on_cpu_and_reports_no_gpu_time() {
+    let h = harness(Mode::Success, |c| c.mode = AccelerationMode::CpuOnly);
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, None, false), assessment(&h, &params))
+        .unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert_eq!(done.selected_backend, Some(BackendKind::Cpu));
+    assert!(done.cpu_time_ms.is_some());
+    assert_eq!(done.gpu_time_ms, None);
+    assert_eq!(h.mock.executes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn gpu_mode_uses_the_gpu_provider_and_reports_gpu_timing() {
+    let h = harness(Mode::Success, |_| {});
+    let params = axpy();
+    // Pin CUDA: at 64K elements the Auto decision correctly prefers CPU.
+    let task = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), false), assessment(&h, &params))
+        .unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert_eq!(done.selected_backend, Some(BackendKind::Cuda));
+    assert!(done.gpu_time_ms.is_some());
+    assert!(done.validated);
+    assert!(!done.fell_back);
+    assert!(h.mock.executes.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn gpu_failure_falls_back_to_cpu_with_a_recorded_reason() {
+    let h = harness(Mode::Fail, |_| {});
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), false), assessment(&h, &params))
+        .unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert!(done.fell_back);
+    assert!(done.cpu_time_ms.is_some());
+    assert_eq!(done.gpu_time_ms, None);
+    assert!(done.warnings.iter().any(|w| w.contains("CPU")));
+}
+
+#[test]
+fn require_gpu_never_falls_back() {
+    let h = harness(Mode::Fail, |_| {});
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::Failed);
+    assert!(!done.fell_back);
+    assert!(done.error.is_some());
+}
+
+#[test]
+fn running_task_can_be_cancelled_cooperatively() {
+    let h = harness(Mode::Hold, |_| {});
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h
+        .scheduler
+        .list(10, None)
+        .iter()
+        .all(|t| t.status != TaskStatus::Running)
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.scheduler.cancel(task.id).unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn wall_clock_timeout_marks_the_task_timed_out() {
+    let h = harness(Mode::Hold, |c| c.task_timeout_ms = 500);
+    let params = axpy();
+    let task = h
+        .scheduler
