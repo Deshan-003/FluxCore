@@ -90,3 +90,95 @@ impl GpuProvider for MockProvider {
             .iter()
             .map(|id| WorkloadSupport {
                 workload_id: id.to_string(),
+                max_elements: 64 * 1024 * 1024,
+                notes: Vec::new(),
+            })
+            .collect()
+    }
+    fn memory_info(&self) -> Option<GpuMemoryInfo> {
+        Some(GpuMemoryInfo {
+            total_bytes: Some(4 * GIB),
+            free_bytes: Some(4 * GIB),
+            used_bytes: Some(0),
+            allocated_bytes: 0,
+        })
+    }
+    fn can_execute(&self, _requirement: &WorkloadRequirement) -> GpuResult<()> {
+        Ok(())
+    }
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome> {
+        self.state.executes.fetch_add(1, Ordering::SeqCst);
+        let mode = *self.state.mode.lock().unwrap();
+        let started = Instant::now();
+        match mode {
+            Mode::Fail => Err(GpuError::ExecutionFailed {
+                provider: "cuda".to_string(),
+                code: Some(999),
+                detail: "injected mock failure".to_string(),
+            }),
+            Mode::Hold => loop {
+                if request.cancel.is_cancelled() {
+                    return Err(GpuError::Cancelled {
+                        provider: "cuda".to_string(),
+                    });
+                }
+                if started.elapsed() >= request.timeout {
+                    return Err(GpuError::Timeout {
+                        provider: "cuda".to_string(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            },
+            Mode::Success => {
+                let inputs = request.params.make_inputs();
+                let mut out = vec![0.0f32; request.params.output_len()];
+                request
+                    .params
+                    .run_cpu(&inputs, &mut out)
+                    .map_err(|detail| GpuError::Internal {
+                        provider: "cuda".to_string(),
+                        detail,
+                    })?;
+                let total = started.elapsed().as_nanos() as u64;
+                Ok(ExecutionOutcome {
+                    backend: "cuda".to_string(),
+                    provider_id: "cuda".to_string(),
+                    device_id: "0".to_string(),
+                    timing: TimingBreakdown {
+                        setup_ns: 0,
+                        transfer_in_ns: total / 4,
+                        compute_ns: total / 2,
+                        transfer_out_ns: total / 4,
+                        validation_ns: 0,
+                        total_ns: total,
+                        transferred_bytes: request.params.transfer_bytes(),
+                    },
+                    peak_device_bytes: request.params.device_bytes(),
+                    notes: Vec::new(),
+                    output_digest: request.params.digest(&out),
+                    max_abs_error: Some(0.0),
+                    validated: true,
+                })
+            }
+        }
+    }
+    fn shutdown(&self) {}
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+}
+
+struct Harness {
+    scheduler: Scheduler,
+    resources: Arc<ResourceManager>,
+    events: Arc<Mutex<Vec<GpuTask>>>,
+    mock: Arc<MockState>,
+    config: AccelerationConfig,
+    providers: Vec<Arc<dyn GpuProvider>>,
+}
+
+fn harness(mode: Mode, mutate: impl FnOnce(&mut AccelerationConfig)) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scheduler-test.sqlite3");
+    std::mem::forget(dir);
+    let db = Arc::new(Database::open_at_path(path).unwrap());
