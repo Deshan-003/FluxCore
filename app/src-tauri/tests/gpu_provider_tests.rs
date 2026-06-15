@@ -97,3 +97,53 @@ fn validation_accepts_identical_and_rejects_perturbed_output() {
 #[test]
 fn cancelled_token_stops_execution() {
     let provider = cpu();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let error = provider
+        .execute(&request(
+            WorkloadParams::VectorAxpy { n: 1_048_576, a: 1.0 },
+            cancel,
+            Duration::from_secs(10),
+        ))
+        .expect_err("cancelled execution must fail");
+    assert!(matches!(error, GpuError::Cancelled { .. }));
+}
+
+#[test]
+fn expired_timeout_stops_execution() {
+    let provider = cpu();
+    let error = provider
+        .execute(&request(
+            WorkloadParams::VectorAxpy { n: 4_194_304, a: 1.0 },
+            CancelToken::new(),
+            Duration::ZERO,
+        ))
+        .expect_err("expired timeout must fail");
+    assert!(matches!(error, GpuError::Timeout { .. }));
+}
+
+#[test]
+fn unknown_workload_is_not_admitted() {
+    let provider = cpu();
+    let requirement = WorkloadRequirement {
+        workload_id: "not_a_workload".to_string(),
+        input_size: 16,
+        device_bytes: 64,
+        transfer_bytes: 64,
+        timeout: Duration::from_secs(1),
+    };
+    assert!(provider.can_execute(&requirement).is_err());
+}
+
+#[test]
+fn oversized_workload_is_rejected_by_caps() {
+    let provider = cpu();
+    let requirement = WorkloadRequirement {
+        workload_id: "matmul".to_string(),
+        input_size: 4096,
+        device_bytes: 1 << 30,
+        transfer_bytes: 1 << 30,
+        timeout: Duration::from_secs(1),
+    };
+    assert!(provider.can_execute(&requirement).is_err());
+}
