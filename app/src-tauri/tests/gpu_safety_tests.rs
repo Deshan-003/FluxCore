@@ -216,3 +216,76 @@ fn config_and_workload_settings_round_trip() {
         selected_size: 512,
     }];
     persistence::save_config(&db, &config).unwrap();
+    persistence::save_workload_settings(&db, &config.workload_settings).unwrap();
+    let loaded = persistence::load_config(&db).unwrap().unwrap();
+    assert!((loaded.vram_budget_percent - 40.0).abs() < f32::EPSILON);
+    let settings = persistence::load_workload_settings(&db).unwrap();
+    assert_eq!(settings.len(), 1);
+    assert_eq!(settings[0].backend, BackendKind::Cpu);
+    assert_eq!(settings[0].selected_size, 512);
+}
+
+#[test]
+fn provider_upsert_is_idempotent() {
+    let (db, _path) = temp_db();
+    let status = ProviderStatus {
+        id: "cuda".to_string(),
+        label: "CUDA".to_string(),
+        kind: ProviderKind::Cuda,
+        available: true,
+        compute_ready: true,
+        detail: String::new(),
+        devices: Vec::new(),
+        capabilities: ProviderCapabilities::default(),
+        supported_workloads: Vec::new(),
+        selected_device: "0".to_string(),
+        last_error: None,
+    };
+    persistence::upsert_provider(&db, &status).unwrap();
+    persistence::upsert_provider(&db, &status).unwrap();
+    let count: i64 = db
+        .with_connection(|c| {
+            c.query_row("SELECT COUNT(*) FROM gpu_providers", [], |r| r.get(0))
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn migrations_are_additive_and_idempotent_across_reopen() {
+    let (db, path) = temp_db();
+    persistence::record_task(&db, &sample_task(1)).unwrap();
+    let versions: Vec<i64> = db
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .unwrap();
+    for expected in [1, 2, 3, 4] {
+        assert!(versions.contains(&expected), "missing migration {expected}");
+    }
+    // Phase 1 and Phase 2 tables must still exist alongside the new ones.
+    let tables: Vec<String> = db
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .unwrap();
+    for expected in [
+        "performance_snapshots",
+        "memory_snapshots",
+        "gpu_task_history",
+        "gpu_benchmark_results",
+        "gpu_providers",
+        "gpu_acceleration_settings",
+        "gpu_workload_settings",
+        "gpu_provider_cache",
+    ] {
+        assert!(tables.contains(&expected.to_string()), "missing table {expected}");
+    }
+    // Reopening runs migrations again; existing GPU rows must survive.
+    let reopened = Database::open_at_path(path).unwrap();
+    assert_eq!(persistence::recent_tasks(&reopened, 10, None).unwrap().len(), 1);
+}
