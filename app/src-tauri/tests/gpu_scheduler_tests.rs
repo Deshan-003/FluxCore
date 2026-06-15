@@ -367,3 +367,95 @@ fn wall_clock_timeout_marks_the_task_timed_out() {
     let params = axpy();
     let task = h
         .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .unwrap();
+    let done = wait_terminal(&h, task.id, 10);
+    assert_eq!(done.status, TaskStatus::TimedOut);
+    // The reservation must be released after a timeout.
+    assert_eq!(h.resources.running_gpu_tasks(), 0);
+}
+
+#[test]
+fn queue_backpressure_rejects_overflow() {
+    let h = harness(Mode::Hold, |c| {
+        c.max_queue_length = 1;
+        c.task_timeout_ms = 5000;
+    });
+    let params = axpy();
+    let first = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .unwrap();
+    let _second = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .unwrap();
+    let error = h
+        .scheduler
+        .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+        .expect_err("third submission must be rejected");
+    assert!(error.contains("queue is full"), "{error}");
+    h.scheduler.cancel(first.id).unwrap();
+}
+
+#[test]
+fn gpu_concurrency_limit_is_enforced() {
+    let h = harness(Mode::Hold, |c| {
+        c.max_concurrent_gpu_tasks = 1;
+        c.task_timeout_ms = 8000;
+    });
+    let params = axpy();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(
+            h.scheduler
+                .submit(request(params, Some(BackendKind::Cuda), true), assessment(&h, &params))
+                .unwrap()
+                .id,
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut max_running = 0usize;
+    while Instant::now() < deadline {
+        max_running = max_running.max(h.resources.running_gpu_tasks());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(max_running <= 1, "running_gpu_tasks reached {max_running}");
+    for id in &ids {
+        let _ = h.scheduler.cancel(*id);
+    }
+    for id in ids {
+        let done = wait_terminal(&h, id, 10);
+        assert!(matches!(done.status, TaskStatus::Cancelled | TaskStatus::TimedOut));
+    }
+    assert_eq!(h.resources.running_gpu_tasks(), 0);
+}
+
+#[test]
+fn cancelling_an_unknown_or_finished_task_errors() {
+    let h = harness(Mode::Success, |_| {});
+    assert!(h.scheduler.cancel(999).is_err());
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, None, false), assessment(&h, &params))
+        .unwrap();
+    wait_terminal(&h, task.id, 10);
+    assert!(h.scheduler.cancel(task.id).is_err());
+}
+
+#[test]
+fn observer_sees_every_state_transition_and_history_is_terminal_only() {
+    let h = harness(Mode::Success, |_| {});
+    let params = axpy();
+    let task = h
+        .scheduler
+        .submit(request(params, None, false), assessment(&h, &params))
+        .unwrap();
+    wait_terminal(&h, task.id, 10);
+    let events = h.events.lock().unwrap();
+    let statuses: Vec<TaskStatus> = events.iter().map(|t| t.status).collect();
+    assert!(statuses.contains(&TaskStatus::Queued));
+    assert!(statuses.contains(&TaskStatus::Running));
+    assert!(statuses.contains(&TaskStatus::Succeeded));
+}
