@@ -11,6 +11,7 @@ import { useMonitoringStore } from './stores/monitoring'
 import { useMemoryStore } from './stores/memory'
 import MemoryIntelligencePage from './pages/MemoryIntelligence'
 import OptimizationCenterPage from './pages/OptimizationCenter'
+import GpuAccelerationPage from './pages/GpuAcceleration'
 import {
   Detail, EmptyState, GpuMetric, Panel, ResourceBar, SensorNotice, SettingRow, Toggle,
 } from './components/monitoring'
@@ -29,6 +30,7 @@ const NAV: NavItem[] = [
   { label: 'Storage', icon: HardDrive, group: 'MONITORS' },
   { label: 'Memory Intelligence', icon: BrainCircuit, group: 'MEMORY INTELLIGENCE' },
   { label: 'Optimization Center', icon: Sparkles, group: 'MEMORY INTELLIGENCE' },
+  { label: 'GPU Acceleration', icon: Zap, group: 'GPU INTELLIGENCE' },
   { label: 'Processes', icon: SquareActivity, group: 'SYSTEM' },
   { label: 'Hardware', icon: Database, group: 'SYSTEM' },
   { label: 'Settings', icon: SettingsIcon, group: 'SYSTEM' },
@@ -50,7 +52,8 @@ function ChartPanel({ history, title = 'Resource activity', memory }: { history:
   const { settings } = useMonitoringStore()
   // Window by timestamp so the visible span honors the setting regardless of
   // the collection cadence (1 s live stream vs 5 s SQLite rows).
-  const cutoff = Date.now() - settings.historyDurationMinutes * 60_000
+  const latest = history.reduce((max, point) => Math.max(max, new Date(point.timestamp).getTime()), 0)
+  const cutoff = latest - settings.historyDurationMinutes * 60_000
   const rows = history
     .filter((point) => new Date(point.timestamp).getTime() >= cutoff)
     .map((point) => ({ ...point, label: new Date(point.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }))
@@ -184,13 +187,14 @@ function App() {
       case 'Storage': return <StoragePage storage={snapshot.storage} />
       case 'Memory Intelligence': return <MemoryIntelligencePage />
       case 'Optimization Center': return <OptimizationCenterPage />
+      case 'GPU Acceleration': return <GpuAccelerationPage />
       case 'Processes': return <ProcessesPage processes={snapshot.processes} />
       case 'Hardware': return <HardwarePage cpu={snapshot.cpu} gpus={snapshot.gpus} storage={snapshot.storage} osName={snapshot.hardware.osName} osVersion={snapshot.hardware.osVersion} hostName={snapshot.hardware.hostName} memory={snapshot.memory} />
       case 'Settings': return <SettingsPage />
       default: return <Overview onPage={setPage} />
     }
   }, [snapshot, page, history, status, error, setPage])
-  const grouped = ['WORKSPACE', 'MONITORS', 'MEMORY INTELLIGENCE', 'SYSTEM']
+  const grouped = ['WORKSPACE', 'MONITORS', 'MEMORY INTELLIGENCE', 'GPU INTELLIGENCE', 'SYSTEM']
   return <div className="app-shell">
     <aside className={`sidebar ${navOpen ? '' : 'collapsed'}`}><div className="brand"><div className="brand-mark"><Activity size={18} strokeWidth={2.5} /></div>{navOpen && <div className="brand-name"><strong>fluxcore</strong><span>RESOURCE INTELLIGENCE</span></div>}<button className="collapse-button" onClick={() => setNavOpen(!navOpen)} aria-label="Toggle sidebar"><ChevronDown size={15} /></button></div>
       <div className="system-pill"><span className={`status-light ${status}`} />{navOpen && <><span>{status === 'connected' ? snapshot?.monitoring ? 'Monitoring active' : 'Monitoring paused' : status === 'web-preview' ? 'Desktop app required' : status === 'error' ? 'Connection issue' : 'Starting engine'}</span><span className="system-live">{status === 'connected' ? 'LIVE' : '—'}</span></>}</div>
