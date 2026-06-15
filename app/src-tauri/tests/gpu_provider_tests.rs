@@ -48,3 +48,52 @@ fn cpu_provider_advertises_all_four_workloads() {
         .collect();
     for expected in ["vector_axpy", "vector_scale", "matmul", "row_sum"] {
         assert!(ids.contains(&expected.to_string()), "missing {expected}");
+    }
+    assert!(provider.capabilities().compute_ready);
+}
+
+#[test]
+fn cpu_output_matches_the_reference_digest_for_every_workload() {
+    let provider = cpu();
+    for params in params_set() {
+        let inputs = params.make_inputs();
+        let mut reference = vec![0.0f32; params.output_len()];
+        params
+            .run_cpu(&inputs, &mut reference)
+            .expect("reference must run");
+        let outcome = provider
+            .execute(&request(params, CancelToken::new(), Duration::from_secs(10)))
+            .expect("CPU execution must succeed");
+        assert_eq!(outcome.backend, "cpu");
+        assert_eq!(outcome.output_digest, params.digest(&reference));
+        assert!(outcome.timing.total_ns > 0);
+        // The CPU path is the reference: it must not claim GPU validation.
+        assert!(!outcome.validated);
+        assert_eq!(outcome.max_abs_error, None);
+    }
+}
+
+#[test]
+fn inputs_are_deterministic() {
+    for params in params_set() {
+        assert_eq!(params.make_inputs().x, params.make_inputs().x);
+        assert_eq!(params.make_inputs().y, params.make_inputs().y);
+    }
+}
+
+#[test]
+fn validation_accepts_identical_and_rejects_perturbed_output() {
+    for params in params_set() {
+        let inputs = params.make_inputs();
+        let mut reference = vec![0.0f32; params.output_len()];
+        params.run_cpu(&inputs, &mut reference).unwrap();
+        assert!(params.validate(&reference, &reference, 1e-3).is_ok());
+        let mut wrong = reference.clone();
+        wrong[0] += 1.0;
+        assert!(params.validate(&reference, &wrong, 1e-3).is_err());
+    }
+}
+
+#[test]
+fn cancelled_token_stops_execution() {
+    let provider = cpu();
