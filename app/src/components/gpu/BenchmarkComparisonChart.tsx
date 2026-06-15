@@ -20,3 +20,25 @@ export default function BenchmarkComparisonChart({ records }: { records: Benchma
           <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.15)" />
           <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 11 }} />
           <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} unit=" ms" />
+          <Tooltip
+            contentStyle={{ background: '#0b1220', border: '1px solid #1e293b', borderRadius: 8 }}
+            labelStyle={{ color: '#e2e8f0' }}
+            formatter={(value) => (value === null ? 'did not run' : `${value} ms`)}
+          />
+          <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
+          <Bar dataKey="cpu" name="CPU median" fill="#22d3ee" radius={[3, 3, 0, 0]} />
+          <Bar dataKey="gpu" name="GPU median (end-to-end)" fill="#a78bfa" radius={[3, 3, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+      <ul className="gpu-verdicts">
+        {records.slice(0, 8).map((record) => (
+          <li key={record.id}>
+            <strong>{record.workloadId}</strong>
+            <span>{record.verdict}</span>
+            {record.transferMs !== null && <em>transfer {record.transferMs.toFixed(2)} ms</em>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
