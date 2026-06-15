@@ -120,3 +120,64 @@ describe('ResourceBudgetPanel', () => {
     render(<ResourceBudgetPanel resources={resources} />)
     expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0)
     expect(screen.getByText('GPU utilisation 91% above limit 85%')).toBeTruthy()
+  })
+})
+
+describe('WorkloadRecommendationRow', () => {
+  it('shows classification, reason and measured source, and runs the workload', () => {
+    const onRun = vi.fn()
+    const onSize = vi.fn()
+    render(<WorkloadRecommendationRow workload={workload} busy={false} onRun={onRun} onSize={onSize} />)
+    expect(screen.getByText('GPU recommended')).toBeTruthy()
+    expect(screen.getByText(assessment.reason)).toBeTruthy()
+    expect(screen.getByText('measured')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+    expect(onRun).toHaveBeenCalledWith(workload)
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '65536' } })
+    expect(onSize).toHaveBeenCalledWith(workload, 65_536)
+  })
+})
+
+describe('TaskMonitorTable', () => {
+  it('renders task rows and offers cancel only while active', () => {
+    const onCancel = vi.fn()
+    render(<TaskMonitorTable tasks={[task]} onCancel={onCancel} />)
+    expect(screen.getByText('Vector AXPY')).toBeTruthy()
+    expect(screen.getByText('running')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task 7' }))
+    expect(onCancel).toHaveBeenCalledWith(7)
+  })
+  it('shows an empty hint when there are no tasks', () => {
+    render(<TaskMonitorTable tasks={[]} onCancel={() => undefined} />)
+    expect(screen.getByText(/No tasks yet/)).toBeTruthy()
+  })
+})
+
+describe('BenchmarkComparisonChart', () => {
+  it('shows an empty state without measurements', () => {
+    render(<BenchmarkComparisonChart records={[]} />)
+    expect(screen.getByText('No benchmarks yet')).toBeTruthy()
+  })
+  it('lists honest verdicts including slowdowns', () => {
+    const record = {
+      id: 1,
+      createdAt: '2026-06-08T09:00:00Z',
+      workloadId: 'vector_scale',
+      params: { kind: 'vectorScale', n: 65_536, a: 2 },
+      backend: 'cuda',
+      providerId: 'cuda',
+      deviceId: '0',
+      cpu: { runs: 3, minMs: 0.1, medianMs: 0.2, meanMs: 0.2, maxMs: 0.3, stddevMs: 0.05 },
+      gpu: { runs: 3, minMs: 0.4, medianMs: 0.5, meanMs: 0.5, maxMs: 0.6, stddevMs: 0.05 },
+      transferMs: 0.2,
+      speedup: 0.4,
+      vramUsedBytes: 1024,
+      validated: true,
+      maxAbsError: 0,
+      verdict: 'GPU was 2.50x slower than CPU at this size',
+      environment: null,
+    } as unknown as BenchmarkRecord
+    render(<BenchmarkComparisonChart records={[record]} />)
+    expect(screen.getByText('GPU was 2.50x slower than CPU at this size')).toBeTruthy()
+  })
+})
