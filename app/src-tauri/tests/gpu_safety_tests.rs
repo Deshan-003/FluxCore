@@ -144,3 +144,75 @@ fn default_budget_uses_percent_semantics() {
 }
 
 #[test]
+fn reservation_accounting_is_idempotent() {
+    let (db, _path) = temp_db();
+    let manager = ResourceManager::new(monitor_for(&db));
+    assert!(manager.reserve(7, 1024));
+    assert!(manager.reserve(7, 2048)); // double reserve must not double count
+    assert_eq!(manager.running_gpu_tasks(), 1);
+    manager.release(7);
+    manager.release(7); // double release must not corrupt accounting
+    assert_eq!(manager.running_gpu_tasks(), 0);
+}
+
+#[test]
+fn admission_is_denied_when_no_vram_budget_exists() {
+    let (db, _path) = temp_db();
+    let manager = ResourceManager::new(monitor_for(&db));
+    let config = AccelerationConfig::default();
+    let requirement = WorkloadRequirement {
+        workload_id: "vector_axpy".to_string(),
+        input_size: 1024,
+        device_bytes: 12 * 1024,
+        transfer_bytes: 12 * 1024,
+        timeout: std::time::Duration::from_secs(1),
+    };
+    // On a host without a discrete GPU the budget is zero: admission must deny.
+    let decision = manager.admit(1, &requirement, &config);
+    if manager.budget_bytes(&config) == 0 {
+        assert!(!decision.allowed);
+        assert!(decision.reason.is_some());
+        assert_eq!(manager.running_gpu_tasks(), 0);
+    }
+}
+
+#[test]
+fn task_history_round_trips_through_sqlite() {
+    let (db, _path) = temp_db();
+    let task = sample_task(42);
+    let id = persistence::record_task(&db, &task).unwrap();
+    assert!(id > 0);
+    let recent = persistence::recent_tasks(&db, 10, None).unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].id, 42);
+    assert_eq!(recent[0].warnings, vec!["test note".to_string()]);
+    let filtered = persistence::recent_tasks(&db, 10, Some("matmul")).unwrap();
+    assert!(filtered.is_empty());
+}
+
+#[test]
+fn benchmark_history_round_trips_and_clears() {
+    let (db, _path) = temp_db();
+    let record = sample_benchmark();
+    persistence::record_benchmark(&db, &record).unwrap();
+    let recent = persistence::recent_benchmarks(&db, 10, None).unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].verdict, "test verdict");
+    assert_eq!(recent[0].gpu.map(|g| g.median_ms), Some(2.0));
+    assert_eq!(persistence::clear_benchmarks(&db).unwrap(), 1);
+    assert!(persistence::recent_benchmarks(&db, 10, None).unwrap().is_empty());
+}
+
+#[test]
+fn config_and_workload_settings_round_trip() {
+    let (db, _path) = temp_db();
+    let mut config = AccelerationConfig::default();
+    config.vram_budget_percent = 40.0;
+    config.workload_settings = vec![WorkloadSetting {
+        workload_id: "matmul".to_string(),
+        mode: AccelerationMode::Manual,
+        backend: BackendKind::Cpu,
+        enabled: true,
+        selected_size: 512,
+    }];
+    persistence::save_config(&db, &config).unwrap();
