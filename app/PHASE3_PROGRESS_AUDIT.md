@@ -33,3 +33,39 @@ Present (untracked/modified):
 | Item | Measured value |
 | --- | --- |
 | GPU | NVIDIA GeForce RTX 2050, 4096 MiB dedicated VRAM, WDDM (`nvidia-smi`) |
+| Driver / CUDA driver API | 591.59 / CUDA 13.1; `C:\Windows\System32\nvcuda.dll` present |
+| CUDA toolkit | **absent** (`nvcc` not found, no `CUDA_PATH`) → driver-API + embedded PTX is the only viable CUDA path |
+| Host Rust | cargo/rustc 1.99.1, host `x86_64-pc-windows-msvc`; **no MSVC `link.exe`/`cl.exe`** (the `link.exe` on PATH is Git's coreutils hardlink tool) |
+| Native MSVC build | fails: `linking with link.exe failed … link: extra operand` (build scripts cannot link) |
+| GNU host toolchain | `rustup toolchain install stable-x86_64-pc-windows-gnu` succeeds but its `cargo.exe`/`rustc.exe` are **blocked by Smart App Control (os error 4551)** |
+| Locally compiled exes | allowed: a mingw-gcc-compiled probe executed normally (`sac-probe-ok`) |
+| mingw | `C:\mingw64\bin\gcc.exe` 16.2.0 present (extracted by an earlier phase) |
+| Docker | CLI present, daemon **not running**; Docker Desktop executable absent; `docker-desktop` WSL distro refuses CLI use |
+| WSL | `Ubuntu` distro available (8 vCPU, ~4.9 GB RAM) → used as the Linux verification host (SAC does not apply inside WSL) |
+| Node | v24.22.1 native; frontend builds/tests run natively |
+
+Consequence: Rust verification runs in WSL (Linux host target) and via mingw cross-compilation
+to `x86_64-pc-windows-gnu`. **Correction (final, 2026-11-17):** native execution of cross-built
+Rust binaries turned out to be blocked by this machine's organization Device Guard/WDAC policy;
+real-driver GPU verification was therefore done with the signed Python interpreter + `ctypes`
+against `nvcuda.dll` using the exact shipped PTX (see `PHASE3_TEST_REPORT.md` §5). The policy was
+not bypassed.
+
+## 5. Final audit
+
+The initial matrix above is preserved unchanged. The final feature-by-feature audit (step 12) is
+in `PHASE3_COMPLETION_REPORT.md` §14: all 22 features COMPLETE, with explicit runtime caveats for
+the WDAC-blocked Rust-native execution, the wgpu/DX12 runtime path, and AMD/Intel hardware.
+
+## 2. Feature matrix (state BEFORE continuation work)
+
+| Phase 3 Feature | Existing Implementation | Actual Status | Missing Work | Evidence |
+|---|---|---|---|---|
+| GPU Provider Architecture | `providers/mod.rs` trait + `all_providers`/`initialize_all`; cpu/cuda/wgpu impls | PARTIAL | crate did not compile; no in-situ verification | `wgpu.rs:403` `InstanceDescriptor::from_env_or_default` does not exist in wgpu 30.0.2 (E0599 from WSL `cargo check`) |
+| NVIDIA CUDA Integration | `providers/cuda.rs` nvcuda FFI + `ptx/*.ptx` include_str | UNVERIFIED | runtime JIT/launch never exercised; compile blocked | GPU_BACKEND_NOTES.md admits "PTX/WGSL JIT compile and real GPU execution were therefore not runtime-exercised" |
+| GPU Device Detection | `cuda.rs` cuDeviceGet*, `wgpu.rs` enumerate_adapters, `capability.rs` | UNVERIFIED | never run on hardware | same notes; no test executed |
+| GPU Capability Detection | `capability.rs` detect_providers/environment/status_of | UNVERIFIED | never run | 253 ln present, no execution evidence |
+| GPU Workload Execution | 4 PTX + 4 WGSL kernels, chunked launches | UNVERIFIED | kernels never loaded/launched | notes: support advertised only if module loads — never observed |
+| CPU Workload Execution | `providers/cpu.rs` + `models.rs` run_cpu | UNVERIFIED | provider execute untested (only models inline tests existed, unrun) | `tests/` empty at inspection |
+| Workload Profiler | `profiler.rs` registry/classify/validate_params + inline tests | UNVERIFIED | tests never executed in any environment here | 1002 ln; inline `#[cfg(test)]` present |
+| Intelligent Scheduler | none | MISSING | whole module | `scheduler.rs` = 1-line placeholder |
