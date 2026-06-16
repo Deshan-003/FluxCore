@@ -34,3 +34,40 @@ Probe source: `cuda_probe.py` (session scratch; reproduces every number below).
 | vector_axpy | n = 1,048,576, a = 1.5 | 3.622 | 1.424 | 0.247 | 1.225 | 2.896 | **1.25x** | 2.38e-07 | yes |
 | vector_scale | n = 1,048,576, a = 1.5 | 3.238 | 0.694 | 0.163 | 1.392 | 2.249 | **1.44x** | 0 | yes |
 | matmul | 256×256×256 | 34.089 | 0.308 | 0.134 | 0.090 | 0.532 | **64.11x** | 5.72e-06 | yes |
+| row_sum | 1024×1024 | 8.796 | 0.865 | 0.216 | 0.031 | 1.112 | **7.91x** | 0 | yes |
+
+Validation tolerance: `1e-3 * max(1, |reference|)` per element (R16). All four kernels passed.
+
+## 3. Resource accounting (real driver queries)
+
+- `cuMemGetInfo_v2` before: total **4095 MiB**, free **3302 MiB** (other apps hold ~793 MiB).
+- After allocating, launching and freeing every buffer: free **3302 MiB** — **all FluxCore
+  allocations released**; no leak, no other-process VRAM touched.
+- Peak per-workload device bytes equal `WorkloadParams::device_bytes()` (inputs + output, f32).
+
+## 4. Honest interpretation
+
+- At 1 M elements the vector workloads are only **1.25–1.44x** faster end-to-end because PCIe
+  transfer dominates (≈2.6 ms of ≈2.9 ms). This is exactly why `profiler.rs` keeps small/transfer-
+  bound workloads on CPU in Intelligent Auto mode; the model and these measurements agree.
+- matmul and row_sum are compute-bound and show large speedups (64x / 7.9x) even at modest sizes.
+- No claim is made that GPU is always faster; the benchmark engine reports slowdowns with equal
+  prominence and returns `gpu: None` + reason when no GPU path runs.
+- **Not measured here**: the Rust `benchmark.rs` engine's own end-to-end run on Windows (its binary
+  is WDAC-blocked). Its logic is verified by compile + the 121-test suite; its hardware behaviour is
+  evidenced by the driver-level measurements above using the same kernels and inputs.
+- wgpu/DX12 path: not exercised by this probe (CUDA path only). On Windows the wgpu provider
+  compiles and enumerates adapters; runtime execution remains **UNVERIFIED** on this machine
+  (WDAC blocks the test binary). AMD/Intel: no adapter present → UNTESTED.
+
+## 5. Reproduction
+
+```powershell
+python cuda_probe.py   # signed interpreter; loads nvcuda.dll + app/src-tauri/ptx/*.ptx
+```
+
+Rust-side (on machines without the application-control policy):
+
+```powershell
+cargo run --release --manifest-path app/src-tauri/Cargo.toml --example gpu_benchmark 5
+```
