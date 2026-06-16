@@ -37,3 +37,43 @@ Coverage highlights (all executed):
   never falls back, cooperative cancel of a running task, wall-clock timeout → `TimedOut` with
   reservation released, queue backpressure, GPU concurrency ≤ 1 observed, unknown/finished cancel
   errors, observer sees Queued→Running→Succeeded.
+- Safety: every §5.4 config range rejected; percent-semantics default; idempotent reserve/release;
+  admission denied with zero budget; task/benchmark/config/workload-settings/provider round-trips;
+  migrations 1–4 additive and idempotent across reopen with legacy rows preserved.
+- Regression: Phase 1 snapshot and Phase 2 intelligence still work with the GPU engine constructed.
+
+Linux-host caveat: inside WSL there is no NVIDIA driver and no DX12/Vulkan adapter, so the `cuda` and
+`wgpu` providers report unavailable there (honestly). Real-driver GPU execution on this Windows
+machine is verified separately (§5).
+
+## 3. Frontend — native Windows
+
+| Command | Result |
+| --- | --- |
+| `npm --prefix app run build` (`tsc -b && vite build`) | **PASS** — 2164 modules, dist emitted |
+| `npm --prefix app run test:frontend` (vitest) | **PASS — 48/48 tests, 6 files** (incl. 12 new Phase 3 component tests) |
+| `npm --prefix app run lint` (eslint) | **PASS — 0 errors, 0 warnings** |
+
+Notes:
+- Two lint errors were fixed: pre-existing `App.tsx:55` `Date.now()` in render (`react-hooks/purity`),
+  and a setState-in-effect in the new page (refactored to derived draft state).
+- jsdom lacks `ResizeObserver`; the Phase 3 component test installs a standard stub (test-only).
+- An earlier vitest run reported "no tests / 6 errors" only when a concurrent WSL cargo build exhausted
+  host RAM; run alone it is fully green. Recorded here so the flake is not mistaken for a code defect.
+
+## 4. Bugs discovered and fixed during verification
+
+| # | Bug | Location | Fix |
+| --- | --- | --- | --- |
+| 1 | non-existent wgpu 30 API blocked whole-crate compile | `providers/wgpu.rs:403` | `new_without_display_handle_from_env()` |
+| 2 | CPU provider advertised caps but never enforced them at admission | `providers/cpu.rs::can_execute` | enforce `max_elements` |
+| 3 | **Scheduler self-deadlock**: `submit` held the shared mutex while `ensure_workers` re-locked it | `gpu_engine/scheduler.rs` | pass CPU cap into `ensure_workers` |
+| 4 | VRAM budget = 0 whenever the monitor sees no GPU (Linux/NVML-absent), denying all GPU admission | `gpu_engine/resources.rs`, `mod.rs` | provider-reported VRAM fallback (`set_device_vram_total`) |
+| 5 | regression tests assumed engines ready on first call | `tests/gpu_regression_tests.rs` | bounded readiness polling; monitor drives memory engine |
+| 6 | test-only move error (`for id in ids` twice) | `tests/gpu_scheduler_tests.rs` | iterate by reference |
+| 7 | pre-existing render-purity lint error | `src/App.tsx:55` | anchor chart window to newest sample |
+| 8 | setState-in-effect lint error in new page | `src/pages/GpuAcceleration.tsx` | derived `draftOverride ?? config` |
+
+## 5. Real-GPU native verification (Windows, RTX 2050)
+
+Cross-build succeeded: `cargo build --release --target x86_64-pc-windows-gnu --example gpu_benchmark`
