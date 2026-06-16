@@ -69,3 +69,38 @@ the WDAC-blocked Rust-native execution, the wgpu/DX12 runtime path, and AMD/Inte
 | CPU Workload Execution | `providers/cpu.rs` + `models.rs` run_cpu | UNVERIFIED | provider execute untested (only models inline tests existed, unrun) | `tests/` empty at inspection |
 | Workload Profiler | `profiler.rs` registry/classify/validate_params + inline tests | UNVERIFIED | tests never executed in any environment here | 1002 ln; inline `#[cfg(test)]` present |
 | Intelligent Scheduler | none | MISSING | whole module | `scheduler.rs` = 1-line placeholder |
+| CPU/GPU Execution Selection | `profiler::classify` + `execution.rs` + `mod.rs::submit` decision pinning | PARTIAL | unreachable: scheduler missing | `mod.rs:371-410` calls `self.scheduler.submit` on a placeholder type |
+| GPU Resource Manager | none | MISSING | whole module | `resources.rs` = 1-line placeholder |
+| VRAM Allocation Management | migration-4 tables only | MISSING | budget/admission/accounting | `resources.rs` placeholder; `database.rs` migration 4 DDL present |
+| CPU Fallback Engine | `execution.rs:211-254` fallback control flow | PARTIAL | untested; unreachable without scheduler | execution.rs present, 256 ln |
+| GPU Task Management | `mod.rs` submit/cancel/list wrappers | MISSING | queue/workers/cancel/timeout | scheduler placeholder; commands would not compile |
+| GPU Benchmarking | none | MISSING | engine + example | `benchmark.rs` = 1-line placeholder; `examples/` had only Phase 2 `benchmark.rs` |
+| Acceleration Dashboard | none | MISSING | page + components | `App.tsx` imported a non-existent page → `tsc`/vite build broken |
+| Workload Intelligence UI | none | MISSING | view + rows | no `src/components/gpu/`, no `src/pages/GpuAcceleration.tsx` |
+| Acceleration Center | none | MISSING | config editor wired to commands | no `src/services/gpu.ts`, no `src/stores/gpu.ts` |
+| GPU Task Monitor | none | MISSING | table + cancel wiring | same |
+| Performance Comparison | none | MISSING | chart + history | same |
+| SQLite Integration | migration 4 DDL in `database.rs` + `with_connection`; `gpu_provider_cache` etc. | PARTIAL | all DML | `persistence.rs` = 1-line placeholder; tables created but never written |
+| Automated Tests | inline lib tests (models/profiler/memory/monitoring/database) | MISSING (Phase 3 integration) | `tests/gpu_*.rs`, example | `src-tauri/tests/` empty; no Phase 3 test ever executed |
+| Documentation | PHASE3_ARCHITECTURE.md, PHASE3_CONTRACT_FREEZE.md, GPU_BACKEND_NOTES.md | PARTIAL | implementation/compat/guide/safety/test/benchmark/completion reports | `ls app/*.md` at inspection |
+
+## 3. Bugs found in the pre-existing Phase 3 code
+
+1. **`providers/wgpu.rs:403`** — `wgpu::InstanceDescriptor::from_env_or_default()` is not a wgpu 30.0.2
+   API (real constructors: `new_without_display_handle[_from_env]`, `new_with_display_handle[_from_env]`).
+   This single error prevented the **entire crate** from compiling, i.e. every Phase 3 command was dead.
+2. **`providers/cpu.rs::can_execute`** — advertised `max_elements` caps (matmul ≤ 2048) in
+   `supported_workloads()` but never enforced them at admission (cuda.rs does). Contract §7.1 requires
+   provider-enforced caps.
+3. **Broken frontend import** — `App.tsx` referenced `./pages/GpuAcceleration` which did not exist.
+4. **Placeholder modules wired into `mod.rs`** — the integration layer was written against modules that
+   were never implemented, so the prior wave's "type-check via standalone harness" claim did not cover
+   the real crate.
+5. **Pre-existing lint violation** — `App.tsx:55` `Date.now()` during render (`react-hooks/purity`),
+   failing `npm run lint` independently of Phase 3.
+
+## 4. What was NOT missing (preserved, not rebuilt)
+
+Phase 1 (`monitoring.rs`), Phase 2 (`memory_engine/*`), migrations 1–3, the 17-command Tauri surface,
+`GpuEngine` orchestration (`mod.rs`), `execution.rs` fallback/timing logic, `profiler.rs` decision order,
+`models.rs` contract types, and the provider kernels were all present and were **kept**, not rewritten.
