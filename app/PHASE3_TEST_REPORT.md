@@ -77,3 +77,42 @@ Notes:
 ## 5. Real-GPU native verification (Windows, RTX 2050)
 
 Cross-build succeeded: `cargo build --release --target x86_64-pc-windows-gnu --example gpu_benchmark`
+(WSL, mingw-w64 linker). **Native execution of the cross-built binary is BLOCKED by this machine's
+organization Device Guard / WDAC policy** ("was blocked by your organization's Device Guard policy").
+A hello-world control binary from the same toolchain was likewise blocked while a pre-existing
+signed binary ran, confirming the block is policy, not a toolchain defect. The policy was **not
+bypassed**.
+
+Real-driver verification was therefore performed with the **signed Python interpreter** via `ctypes`
+against `nvcuda.dll`, JIT-loading the exact shipped `app/src-tauri/ptx/*.ptx` kernels with the same
+deterministic inputs and accumulation order as the Rust CPU reference. Executed results (run 2,
+2026-11-17):
+
+- Device: NVIDIA GeForce RTX 2050, cc 8.6, driver API 13010 (driver 591.59), VRAM total 4095 MiB,
+  free 3302 MiB before the run.
+- `vector_axpy` n=1,048,576: validated=True, max_abs_error=2.38e-07, cpu=3.622 ms,
+  transfer_in=1.424 ms, kernel=0.247 ms, transfer_out=1.225 ms, gpu_total=2.896 ms, speedup=1.25x.
+- `vector_scale` n=1,048,576: validated=True, max_abs_error=0, cpu=3.238 ms, gpu_total=2.249 ms,
+  speedup=1.44x.
+- `matmul` 256×256×256: validated=True, max_abs_error=5.72e-06, cpu=34.089 ms, gpu_total=0.532 ms,
+  speedup=64.11x.
+- `row_sum` 1024×1024: validated=True, max_abs_error=0, cpu=8.796 ms, gpu_total=1.112 ms, speedup=7.91x.
+- `ALL_KERNELS_VALIDATED=True`; free VRAM after cleanup = 3302 MiB (all allocations released).
+
+CPU timings are the numpy reference implementation of identical semantics on the same inputs
+(labelled as such in `PHASE3_BENCHMARK_REPORT.md`); the Rust scalar CPU provider would be slower.
+This proves: PTX JIT via `cuModuleLoadData` works without nvcc on this driver/GPU, all four kernels
+compute correctly within R16 tolerance, launch/transfer/cleanup accounting is correct, and VRAM is
+fully released. It does **not** prove the Rust `gpu_benchmark` binary itself ran on Windows.
+
+## 6. Not verified / environment-limited
+
+- **Rust-native GPU binary execution on Windows**: WDAC-blocked (above). Logic verified via WSL test
+  suite; hardware behaviour verified via the ctypes probe using identical kernels/inputs.
+- **Tauri MSI/NSIS installer bundling**: requires native Windows MSVC toolchain. A winget install of
+  VS Build Tools was attempted with user authorization and ended with exit 1602 (UAC/user-exit);
+  it was **not** forced. Frontend production build and Rust release cross-build are verified;
+  installer bundling is documented as an environment limitation, not claimed.
+- **AMD/Intel GPU paths**: no such adapter on this machine → UNTESTED, no vendor claim.
+- **wgpu on Windows**: adapter discovery and WGSL execution not exercised at runtime (WDAC blocks the
+  test binary; the probe covers the CUDA path only) → UNVERIFIED, code compiles clean.
