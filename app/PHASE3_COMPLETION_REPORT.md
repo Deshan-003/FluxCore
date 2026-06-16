@@ -65,3 +65,71 @@ Acceleration Center, Task Monitor, Performance Comparison); every Phase 3 integr
 7. Pre-existing `App.tsx:55` `Date.now()` render-purity lint error. Fixed (chart window anchored to
    newest sample).
 8. setState-in-effect lint error in the new page. Fixed (derived `draftOverride ?? config`).
+
+## 7. Files changed
+
+Modified: `app/src-tauri/{Cargo.toml,Cargo.lock}`, `src-tauri/src/{lib.rs,database.rs}`,
+`app/src/{App.tsx,App.css}`.
+New: `src-tauri/src/gpu_engine/` (resources/scheduler/persistence/benchmark + fixes in
+mod/providers), `src-tauri/ptx/` (4 kernels, pre-existing wave, now verified),
+`src-tauri/migrations/0004_gpu_acceleration.sql`, `src-tauri/tests/gpu_*.rs` (4 files),
+`src-tauri/examples/gpu_benchmark.rs`, `app/src/{types/gpu.ts,services/gpu.ts,stores/gpu.ts,
+pages/GpuAcceleration.tsx,components/gpu/* (7),components/gpu/gpu.test.tsx}`,
+and 10 docs: `PHASE3_PROGRESS_AUDIT.md`, `PHASE3_REMAINING_WORK.md`, `PHASE3_ARCHITECTURE.md` (§17
+as-built), `PHASE3_IMPLEMENTATION.md`, `GPU_COMPATIBILITY.md`, `GPU_ACCELERATION_GUIDE.md`,
+`GPU_SAFETY.md`, `PHASE3_TEST_REPORT.md`, `PHASE3_BENCHMARK_REPORT.md`, this report.
+(`GPU_BACKEND_NOTES.md` / `PHASE3_CONTRACT_FREEZE.md` are prior-wave docs, kept.)
+
+## 8. Tests executed
+
+- WSL Ubuntu (rustc 1.100.0): `cargo check --all-targets`; `cargo test` (lib + 4 integration targets).
+- Native Windows (Node v24.22.1): `npm run build` (`tsc -b && vite build`), `npm run test:frontend`
+  (vitest), `npm run lint` (eslint).
+- Native Windows GPU: `cuda_probe.py` via the **signed Python interpreter** + `ctypes` against
+  `nvcuda.dll`, JIT-loading the exact shipped PTX (2 runs; second with CPU timings).
+- Cross-build: `cargo build --release --target x86_64-pc-windows-gnu --example gpu_benchmark` (WSL).
+
+## 9. Actual test results
+
+| Suite | Result |
+| --- | --- |
+| Rust lib unittests | **91 passed, 0 failed** |
+| gpu_provider_tests | **8 passed, 0 failed** |
+| gpu_scheduler_tests | **10 passed, 0 failed** |
+| gpu_safety_tests | **9 passed, 0 failed** |
+| gpu_regression_tests (Phase 1/2 intact) | **3 passed, 0 failed** |
+| **Rust total** | **121 passed, 0 failed** |
+| Frontend vitest | **48/48 passed (6 files)** |
+| eslint | **0 errors, 0 warnings** |
+| Hardware probe | **4/4 kernels validated** (`ALL_KERNELS_VALIDATED=True`), max_abs_error ≤ 5.72e-06, VRAM fully released |
+
+Details and coverage highlights: `PHASE3_TEST_REPORT.md`.
+
+## 10. Build results
+
+- Frontend production build: **PASS** (`tsc -b && vite build`, 2164 modules, dist emitted).
+- Rust `cargo check --all-targets`: **PASS** (0 errors).
+- Rust release cross-build (`gpu_benchmark.exe`, Windows GNU): **PASS**.
+- **Tauri MSI/NSIS installer: NOT BUILT — environment-blocked.** Native MSVC Build Tools are absent;
+  the authorized `winget install Microsoft.VisualStudio.2022.BuildTools` attempt ended with exit
+  1602 (UAC/user-exit) and was not forced. To build the installer on a permitted machine:
+  install VS Build Tools 2022 with the "Desktop development with C++" workload + Windows SDK,
+  then `npm --prefix app run tauri build`. No installer artifact is claimed.
+
+## 11. Real GPU hardware verification
+
+Machine: Lenovo IdeaPad Gaming 3 class — Ryzen 5 5500H, **RTX 2050 4 GB** (cc 8.6), 8 GB RAM,
+Windows 11 build 26300, driver **591.59**, CUDA driver API **13010**, no CUDA toolkit.
+
+- PTX JIT via `cuModuleLoadData` works on this driver/GPU without nvcc (all 4 shipped kernels).
+- All four workloads executed on the GPU and validated against the CPU reference within R16
+  tolerance (`1e-3 * max(1, |ref|)`): axpy 2.38e-07, scale 0, matmul 5.72e-06, row_sum 0.
+- VRAM accounting: 4095 MiB total / 3302 MiB free before; **3302 MiB free after cleanup** — every
+  allocation released, no other-process VRAM touched.
+- **Method caveat (honest):** this machine's organization Device Guard/WDAC policy blocks execution
+  of unsigned cross-built Rust executables, so the Rust `gpu_benchmark.exe` itself did not run on
+  Windows. Verification used the signed Python interpreter + ctypes issuing the same driver calls
+  with the same PTX and the same deterministic inputs/accumulation order. The policy was not
+  bypassed. Rust-side logic is proven by the 121-test suite (WSL).
+
+## 12. Benchmark measurements (measured, single run after warm-up)
