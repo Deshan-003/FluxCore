@@ -40,3 +40,44 @@ VRAM-exceeding submissions are rejected with a reason.
 
 ## 4. Benchmarks
 
+Performance Comparison → choose workload/size/warm-up/measured runs → **Run benchmark**.
+Identical deterministic inputs on both backends; warm-ups discarded; medians reported with
+min/mean/max/stddev; transfer time shown separately; speedup = CPU median / GPU end-to-end median.
+**A slowdown is displayed as a slowdown.** If no GPU path ran, the GPU column is empty and the
+verdict explains why. Results persist in SQLite and feed future Auto decisions (`estimateSource:
+measured`).
+
+## 5. What to expect on RTX 2050 4 GB / 8 GB RAM
+
+- Default budget = min(50 % of 4 GiB, 1024 MiB cap) = **1 GiB**. 16 M-element vectors (768 MiB of
+  buffers) and 1024³ matmul may be rejected as `InsufficientGpuResources` when other apps hold VRAM —
+  expected, not a bug.
+- Naive matmul and small vectors are often **slower** on GPU once PCIe transfer is included. The UI
+  says so; Auto mode then keeps them on CPU.
+- WDDM TDR (~2 s) is avoided by chunked launches and per-task timeouts; a hung device call surfaces
+  as `TimedOut`, never as a silent success.
+
+## 6. When acceleration is unavailable
+
+The page shows an explicit unsupported state with the real reason (missing driver, PTX JIT failure,
+no DX12/Vulkan adapter, …). CPU workloads, Phase 1 monitoring and Phase 2 memory intelligence keep
+working unchanged. No sample or demo numbers are ever substituted.
+
+## 7. Building / verifying from source
+
+```powershell
+# frontend (native Windows)
+npm --prefix app install
+npm --prefix app run build
+npm --prefix app run test:frontend
+npm --prefix app run lint
+
+# Rust logic tests (WSL Ubuntu or any Linux host with the Tauri deps)
+cargo test --manifest-path app/src-tauri/Cargo.toml
+
+# real CPU-vs-GPU benchmark, no Tauri/DB needed
+cargo run --release --manifest-path app/src-tauri/Cargo.toml --example gpu_benchmark 5
+```
+
+On machines without MSVC Build Tools, cross-compile the Windows binary from Linux/WSL with
+`--target x86_64-pc-windows-gnu` (mingw-w64) and run it natively; see `GPU_COMPATIBILITY.md` §5.
