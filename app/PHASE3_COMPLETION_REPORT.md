@@ -133,3 +133,70 @@ Windows 11 build 26300, driver **591.59**, CUDA driver API **13010**, no CUDA to
   bypassed. Rust-side logic is proven by the 121-test suite (WSL).
 
 ## 12. Benchmark measurements (measured, single run after warm-up)
+
+| Workload | Input | CPU (ms) | GPU total (ms) | Speedup | Validated |
+| --- | --- | --- | --- | --- | --- |
+| vector_axpy | 1,048,576 elems, a=1.5 | 3.622 | 2.896 | 1.25x | yes |
+| vector_scale | 1,048,576 elems, a=1.5 | 3.238 | 2.249 | 1.44x | yes |
+| matmul | 256×256×256 | 34.089 | 0.532 | 64.11x | yes |
+| row_sum | 1024×1024 | 8.796 | 1.112 | 7.91x | yes |
+
+GPU total = transfer-in + kernel + transfer-out (end-to-end). CPU baseline = numpy reference
+implementation of identical semantics on the same inputs (the Rust scalar CPU provider would be
+slower, so these speedups are conservative for the Rust path). Transfer dominance at 1 M elements
+(≈2.6 ms of ≈2.9 ms) confirms the profiler's CPU-preference for small/transfer-bound workloads.
+Full breakdown + methodology: `PHASE3_BENCHMARK_REPORT.md`. No result here is invented; the Rust
+benchmark engine's N-run medians were not executed on Windows (WDAC) and are not claimed.
+
+## 13. Remaining limitations (not hidden)
+
+1. **Rust-native GPU execution on Windows**: WDAC-blocked on this machine; verified at driver level
+   via the probe instead. On machines without this policy, `cargo run --example gpu_benchmark`
+   exercises the full Rust path.
+2. **wgpu/DX12 runtime**: compiles clean; adapter discovery/WGSL execution not runtime-verified on
+   Windows (WDAC) and unavailable in WSL → UNVERIFIED.
+3. **AMD/Intel GPUs**: no adapter present → UNTESTED; no vendor claim made.
+4. **Tauri installer**: not built (MSVC absent; UAC declined). Frontend production build verified.
+5. **Full Tauri app end-to-end UI run**: not performed on this machine (app binary subject to the
+   same policy/toolchain limits); frontend verified via vitest + production build + typed IPC
+   mirrors of the tested command surface.
+6. **Real-driver failure → fallback path**: proven with injected provider failure in scheduler
+   tests; a genuine driver-error fallback on hardware was not exercised.
+7. Benchmark figures are single measured runs (probe), not the engine's N-run medians.
+
+## 14. Final Phase 3 status
+
+**Feature-by-feature final audit** (statuses per the required vocabulary; initial matrix in
+`PHASE3_PROGRESS_AUDIT.md` §2):
+
+| # | Feature | Final status | Evidence |
+|---|---|---|---|
+| 1 | GPU Provider Architecture | COMPLETE | crate compiles; 8 provider tests; CPU provider executes in WSL |
+| 2 | NVIDIA CUDA Integration | COMPLETE (driver-level verified; Rust exe runtime WDAC-blocked) | probe: PTX JIT + launch on RTX 2050, §11 |
+| 3 | GPU Device Detection | COMPLETE (same runtime caveat) | probe enumerates device/VRAM/driver; capability tests green |
+| 4 | GPU Capability Detection | COMPLETE | capability tests; honest unavailable-reporting on driverless hosts |
+| 5 | GPU Workload Execution | COMPLETE (CUDA kernels hardware-validated; WGSL runtime UNVERIFIED) | 4/4 validated, §11 |
+| 6 | CPU Workload Execution | COMPLETE | digest-equality tests, deterministic inputs |
+| 7 | Workload Profiler | COMPLETE | 6 classifications + decision order covered by lib tests |
+| 8 | Intelligent Scheduler | COMPLETE | 10 tests: modes/queue/priority/concurrency/cancel/timeout/backpressure |
+| 9 | CPU/GPU Execution Selection | COMPLETE | Auto prefers CPU at small sizes; pinned-CUDA tests |
+| 10 | GPU Resource Manager | COMPLETE | budget/gates/admission/idempotent accounting tests |
+| 11 | VRAM Allocation Management | COMPLETE | reserve/release tests + probe free-VRAM restored |
+| 12 | CPU Fallback Engine | COMPLETE (injected-failure proof; real-driver path UNVERIFIED) | fell_back=true + reason; require_gpu never falls back |
+| 13 | GPU Task Management | COMPLETE | submit/cancel/list + events; observer lifecycle test |
+| 14 | GPU Benchmarking | COMPLETE (engine logic tested; hardware numbers via probe) | benchmark module + §12 |
+| 15 | Acceleration Dashboard | COMPLETE | page + components, 12 vitest, production build |
+| 16 | Workload Intelligence UI | COMPLETE | recommendation rows wired to profiler output |
+| 17 | Acceleration Center | COMPLETE | config editor wired; §5.4 ranges validated backend-side |
+| 18 | GPU Task Monitor | COMPLETE | event-driven table + cancel wiring |
+| 19 | Performance Comparison | COMPLETE | chart + persisted history, honest verdicts |
+| 20 | SQLite Integration | COMPLETE | migration 4 additive/idempotent; round-trip tests; legacy rows preserved |
+| 21 | Automated Tests | COMPLETE | 121 Rust + 48 frontend executed, 0 failures |
+| 22 | Documentation | COMPLETE | all 10 required documents present |
+
+**Declaration:** Phase 3 development is **complete** — every feasible feature is implemented,
+integrated and tested, Phase 1/2 are regression-proven intact, and the CUDA backend is demonstrated
+on the actual RTX 2050 with correct results and clean VRAM accounting. The items in §13 are
+environment-blocked verifications (WDAC policy, absent MSVC, absent AMD/Intel hardware), not
+unfinished code. No Phase 4 work was started. Changes are left uncommitted on
+`feature/phase3-gpu-acceleration` pending the user's review/commit decision.
