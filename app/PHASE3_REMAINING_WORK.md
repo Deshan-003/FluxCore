@@ -63,3 +63,35 @@ Legend: ✅ done & verified · 🔶 done, verification pending · ⬜ not starte
 ## Known deviations from the frozen contract (reported, not silent)
 
 1. `resources.admit` is called when a worker **dequeues** a GPU task, not at submit (freeze §9 said
+   submit). Admitting at submit would reserve VRAM for queued tasks and let the concurrency gate
+   reject queueing; dequeue-time admission keeps the queue usable while still enforcing budget,
+   gates and concurrency before any GPU execution. Release happens on every exit path.
+2. `ResourceManager::set_queued_gpu_tasks` added (additive) so the UI can show queued vs running
+   truthfully; the frozen surface had no setter.
+3. `ResourceBudgetStatus.allocated_bytes` mirrors `reserved_bytes` (reservations are released exactly
+   when the matching buffers free); subtracting both would double-count the same bytes (R9).
+4. `ResourceManager::set_device_vram_total` added (additive): provider-reported dedicated VRAM is used
+   for the budget only when the Phase 1 monitor snapshot has no GPU (NVML absent / Linux verification
+   host). Without it, every GPU admission was denied on such hosts (found by the scheduler tests).
+
+## Status update — 2026-11-17 (final)
+
+- C1–C6 ✅. H1/H2 ✅ — 121 Rust tests, 0 failures (91 lib + 8 provider + 3 regression + 9 safety +
+  10 scheduler), executed in WSL Ubuntu.
+- H3 ✅ cross-built release `gpu_benchmark.exe` (mingw-w64). Native execution 🚫: organization
+  Device Guard/WDAC policy blocks unsigned cross-built executables; policy **not bypassed**.
+- H4 ✅ via signed-Python `ctypes` probe against `nvcuda.dll` using the exact shipped PTX and the
+  same deterministic inputs: 4/4 kernels validated (max_abs_error ≤ 5.72e-06), VRAM fully released
+  (3302 MiB free before and after). Details: test report §5.
+- H5 ✅ at scheduler level (mock GPU failure → CPU fallback, reason recorded, `fell_back=true`;
+  `require_gpu` never falls back). Real-driver failure-path execution UNVERIFIED (WDAC).
+- M1–M7 ✅. F1 ✅. F2 ✅ (vite build, vitest 48/48, eslint 0 errors).
+- F3 ✅ — `PHASE3_BENCHMARK_REPORT.md` written from measured probe runs: axpy 1M 1.25x, scale 1M
+  1.44x, matmul 256³ 64.11x, row_sum 1024² 7.91x (CPU baseline = numpy reference, labelled).
+- F4 🚫 documented — native MSI/NSIS bundling needs MSVC Build Tools; winget install ended exit
+  1602 (UAC/user-exit) and was not forced. Install instructions in `GPU_ACCELERATION_GUIDE.md` /
+  completion report. Frontend production build + Rust release cross-build verified.
+- F5/F6 ✅ — all 10 documents present; `PHASE3_COMPLETION_REPORT.md` written with the 14 required
+  items; audit matrix final statuses appended there.
+- Additional bug fixed during verification: scheduler self-deadlock (`submit` held the shared mutex
+  while `ensure_workers` re-locked it) — found by a hanging test, fixed by passing the CPU cap in.
