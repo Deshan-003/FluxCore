@@ -30,3 +30,36 @@ Legend: ✅ done & verified · 🔶 done, verification pending · ⬜ not starte
 ## Medium Priority — frontend integration & controls
 
 | # | Task | Why | Initial status | Files | Depends on | Expected result | Verification | Status |
+|---|---|---|---|---|---|---|---|---|
+| M1 | `types/gpu.ts` contract mirrors | type-safe IPC | MISSING | `src/types/gpu.ts` | — | camelCase mirrors, nullable numbers | `tsc -b` | ✅ |
+| M2 | `services/gpu.ts` 17 wrappers + 2 event listeners | wire every command | MISSING | `src/services/gpu.ts` | M1 | 1:1 command mapping | build + tests | ✅ |
+| M3 | `stores/gpu.ts` + localStorage prefs | state + cadence | MISSING | `src/stores/gpu.ts` | M2 | refresh/setMode/saveConfig/submit/cancel/benchmark | vitest | ✅ |
+| M4 | `pages/GpuAcceleration.tsx` 5 tabs | all five required views | MISSING | `src/pages/GpuAcceleration.tsx` | M3 | Overview/Workloads/Center/Tasks/Comparison, no dead controls | vitest + build | ✅ |
+| M5 | `components/gpu/*` (7 components) + `gpu-*` CSS | reuse existing design language | MISSING | `src/components/gpu/*`, `src/App.css` | M1 | cards/rows/table/chart/budget/badge/unsupported | `gpu.test.tsx` | ✅ |
+| M6 | Remove non-functional controls & mocks from production | spec §5.8 | n/a | page | M4 | every control hits a real command | code review + tests | ✅ |
+| M7 | Fix pre-existing `App.tsx` render-purity lint error | `npm run lint` must pass | BROKEN (pre-existing) | `src/App.tsx:55` | — | lint green, chart window preserved | `npm run lint` | ✅ |
+
+## Finalization — testing, bug fixing, documentation, release verification
+
+| # | Task | Why | Initial status | Files | Depends on | Expected result | Verification | Status |
+|---|---|---|---|---|---|---|---|---|
+| F1 | Full Rust suite green (lib + 4 integration targets) | acceptance | MISSING | tests | H1 | 0 failures | WSL `cargo test` | ✅ (121 passed, 0 failed) |
+| F2 | Frontend suite + lint + production vite build green | acceptance | PARTIAL | app | M1–M7 | 48/48 vitest, lint 0 errors, vite build ok | native npm | ✅ (48/48, lint clean, build ok) |
+| F3 | Real CPU-vs-GPU benchmark report | acceptance §9 | MISSING | `PHASE3_BENCHMARK_REPORT.md` | H4 | measured medians, honest verdicts | ctypes probe on RTX 2050 | ✅ (written from measured probe runs; numpy CPU baseline labelled) |
+| F4 | Production Tauri build / documented constraint | acceptance §11 | MISSING | build config | F1 | installer or honest environment limitation | `npm run tauri build` attempt | 🚫 documented: MSVC absent; winget VS BuildTools exit 1602 (UAC declined, not forced) |
+| F5 | Documentation set (architecture/implementation/compat/guide/safety/test/benchmark/completion) | acceptance §10 | PARTIAL | `app/*.md` | F1–F4 | evidence-based reports | review | ✅ (all 10 docs written/updated) |
+| F6 | Update this plan + final audit statuses | keep reports truthful | — | this file, audit | all | statuses match evidence | review | ✅ |
+
+## Environment installs performed (authorized by the user)
+
+- WSL Ubuntu: rustup stable (1.100.0), `gcc-mingw-w64-x86-64-posix`, `gcc`, `pkg-config`,
+  `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`, `libjavascriptcoregtk-4.1-dev`
+  (the same dependency set as `tools/verify/Dockerfile`).
+- Windows: `rustup target add x86_64-pc-windows-gnu` (target std only; the GNU *host* toolchain
+  binaries are SAC-blocked and are not used).
+- **Not installed:** CUDA toolkit (unnecessary — driver API + embedded PTX), MSVC Build Tools
+  (see F4: native MSVC linking is unavailable and SAC policy applies to downloaded toolchains).
+
+## Known deviations from the frozen contract (reported, not silent)
+
+1. `resources.admit` is called when a worker **dequeues** a GPU task, not at submit (freeze §9 said
