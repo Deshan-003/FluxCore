@@ -32,3 +32,38 @@ applications, never converts VRAM into system RAM, and never modifies hardware s
 ## 3. Time bounds and WDDM TDR safety
 
 - Vector launches chunked to ≤ 1,000,000 elements with a cancel/timeout checkpoint between chunks.
+- Per-attempt timeout `task_timeout_ms` (500–60000, default 10000) enforced cooperatively inside
+  providers and by the worker; wgpu readback uses bounded `PollType::Wait`.
+- Matmul capped at m,k,n ≤ 2048 (catalogue default max 1024³) so a single launch stays far below the
+  ~2 s TDR window; row_sum capped at rows*cols ≤ 32 M.
+- A task stuck inside a driver call stays `Running` until the call returns (cooperative cancellation);
+  the timeout then marks it `TimedOut` and releases accounting.
+
+## 4. Cancellation and cleanup
+
+- `CancelToken` (shared `AtomicBool`) checked between chunks by every provider; user cancellation
+  outranks timeout.
+- Scheduler releases the VRAM reservation on **every** exit path (success, failure, cancel, timeout,
+  rejection) under the same lock that decrements the running counter.
+- `Scheduler::Drop` cancels all tokens and joins workers; `GpuEngine::Drop` shuts every provider down.
+- CUDA primary context retained once per session and released on shutdown; wgpu device dropped on
+  unrecoverable error so the next attempt re-initializes.
+
+## 5. Correctness and honesty
+
+- Every GPU result is validated against the CPU reference (`validate_gpu`, tolerance
+  `1e-3 * max(1, |ref|)`); mismatch → `CorrectnessFailed` with the real max absolute error.
+- CPU fallback never reports GPU timings: `fell_back=true`, `gpu_time_ms=None`, reason recorded in
+  `warnings`; `selected_backend` stays the backend that was *attempted*.
+- Benchmarks discard warm-ups, report medians, and state slowdowns with equal prominence; when no GPU
+  path ran, `gpu=None` plus a reason — a GPU time is never invented.
+- Nullable telemetry renders as "Unavailable", never a fabricated 0.
+
+## 6. Phase 1 / Phase 2 non-interference
+
+- No second monitor thread: the engine reads `MonitorEngine::snapshot()` at most once per decision and
+  `MemoryEngine::intelligence()` for RAM context.
+- `gpu_task_history` is written on task completion only, never per monitor tick.
+- Migration 4 is additive (`IF NOT EXISTS`, `INSERT OR IGNORE`, single transaction); Phase 1/2 tables
+  and rows are untouched (tested by `migrations_are_additive_and_idempotent_across_reopen` and
+  `migration_three_preserves_legacy_rows`).
