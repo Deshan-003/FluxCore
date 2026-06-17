@@ -152,3 +152,29 @@ pub struct Recommendation {
     pub requires_approval: bool,
     pub applicable: bool,
     pub severity: Severity,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Action {
+    pub id: String,
+    pub at: i64,
+    pub mode: Mode,
+    pub interval_ms: u64,
+    pub previous_interval_ms: Option<u64>,
+    pub recommendation: Option<String>,
+    pub before: Vec<Observation>,
+    pub outcome: Option<Outcome>,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Outcome {
+    pub verdict: String,
+    pub detail: String,
+    pub before: BTreeMap<String, f64>,
+    pub after: BTreeMap<String, f64>,
