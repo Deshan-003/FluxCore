@@ -101,3 +101,29 @@ pub enum Severity {
     Low,
     Medium,
     High,
+    Critical,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Anomaly {
+    pub id: String,
+    pub metric: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub resolution: Option<String>,
+    pub severity: Severity,
+    pub value: f64,
+    pub threshold: f64,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Forecast {
+    pub metric: String,
+    pub observed_at: i64,
+    pub target_at: i64,
+    pub horizon_minutes: i64,
+    pub value: Option<f64>,
+    pub low: Option<f64>,
