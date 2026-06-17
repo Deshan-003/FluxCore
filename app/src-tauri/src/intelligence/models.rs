@@ -24,3 +24,29 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
+            mode: Mode::AnalysisOnly,
+            paused: false,
+            scan_interval_ms: 15_000,
+            max_scan_interval_ms: 30_000,
+            cooldown_seconds: 300,
+            horizon_minutes: vec![1, 5, 15],
+        }
+    }
+}
+
+impl Policy {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(5_000..=60_000).contains(&self.scan_interval_ms)
+            || !(self.scan_interval_ms..=60_000).contains(&self.max_scan_interval_ms)
+            || !(180..=3600).contains(&self.cooldown_seconds)
+            || self.horizon_minutes.is_empty()
+            || self.horizon_minutes.len() > 3
+            || self.horizon_minutes.iter().any(|n| !(1..=15).contains(n))
+            || self
+                .horizon_minutes
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("Use a process scan interval of 5–60 s within the configured maximum, a cooldown of 180–3600 s, and 1–3 distinct forecast horizons (1–15 min) in ascending order.".into());
+        }
+        Ok(())
