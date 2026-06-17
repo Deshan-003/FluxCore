@@ -78,3 +78,30 @@ pub fn forecasts(history: &[Observation], metric: &str, horizons: &[i64]) -> Vec
     horizons.iter().map(|&horizon| {
         let seconds = horizon * 60;
         let mut result = Forecast { metric: metric.into(), observed_at: now, target_at: now + seconds,
+            horizon_minutes: horizon, actual: None, samples: points.len(), observation_seconds: duration,
+            coverage, confidence: "unavailable".into(), method: "none".into(), value: None,
+            low: None, high: None, explanation: "Needs a current measurement and at least eight recent samples spanning two minutes, without large gaps.".into() };
+        if !current || !continuous || points.len() < 8 || duration < 120 || coverage < 0.75 { return result; }
+        let names = ["rollingMean", "exponentialSmoothing", "linearTrend"];
+        let mut best = (f64::INFINITY, 0, 0);
+        for kind in 0..3 {
+            let mut error = 0.0;
+            let mut count = 0;
+            for end in (5..points.len()).rev().take(12) {
+                // Score recent walk-forward targets at the requested lead or the largest supported lead.
+                let lead = (seconds as f64).min(duration as f64 / 4.0);
+                let train_end = points[..end].partition_point(|p| p.0 <= points[end].0 - lead);
+                if train_end < 4 { continue; }
+                let residual = model(&points[..train_end], kind, points[end].0) - points[end].1;
+                error += residual * residual;
+                count += 1;
+            }
+            if count > 0 && (error / f64::from(count)).sqrt() < best.0 { best = ((error / f64::from(count)).sqrt(), kind, count); }
+        }
+        if best.2 == 0 { return result; }
+        let is_percent = matches!(metric, "cpu" | "ram" | "commit")
+            || ["gpu:", "vram:", "disk:"]
+                .iter()
+                .any(|prefix| metric.starts_with(prefix));
+        let clamp = |value: f64| if is_percent { value.clamp(0.0, 100.0) } else { value.max(0.0) };
+        let raw = model(&points, best.1, seconds as f64);
