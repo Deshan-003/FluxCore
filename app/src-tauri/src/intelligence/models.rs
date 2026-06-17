@@ -178,3 +178,29 @@ pub struct Outcome {
     pub detail: String,
     pub before: BTreeMap<String, f64>,
     pub after: BTreeMap<String, f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceState {
+    pub policy: Policy,
+    pub monitoring: bool,
+    pub history_enabled: bool,
+    pub latest: Option<Observation>,
+    pub health: String,
+    pub insights: Vec<String>,
+    pub status: Option<String>,
+    pub active_interval_ms: Option<u64>,
+    pub recommendations: Vec<Recommendation>,
+    pub forecasts: Vec<Forecast>,
+    pub anomalies: Vec<Anomaly>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceHistory {
+    pub observations: Vec<Observation>,
+    pub comparisons: Vec<Forecast>,
+    pub actions: Vec<Action>,
+    pub decisions: Vec<Recommendation>,
+}
