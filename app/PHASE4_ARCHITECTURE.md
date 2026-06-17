@@ -15,3 +15,7 @@ Resource interpretations use corroborating signals and plain-language limitation
 ## Persistence and resource limits
 
 Additive migration 5 creates local observation, target-time forecast-comparison, bounded recommendation/anomaly/action, and policy tables. Observations are pruned to 7 days, forecast comparisons to 2 days, and records to 30 days. At a 15-second sampling cadence this limits retained observation rows to about 40,320. Only actual measurements inside a 30-second target window are attached to stored forecast records. Database errors fail closed for supported optimization and require the user to re-enable adaptive mode after the storage fault is cleared.
+
+The Phase 4 processing path is synchronous on the existing monitor thread; it analyzes a small bounded window at a 15-second cadence and records no network traffic or model inference. This avoids background-task leaks and additional dependencies.
+
+Measured overhead (release build, WSL Ubuntu, two runs of `examples/intelligence_benchmark.rs` on live collector data): a full sample costs 0.78–0.94 ms every 15 s (analysis 0.10–0.16 ms, SQLite persistence 0.69–0.78 ms), and the gated tick inside the sampling window is below 1 µs. That is roughly 0.05–0.06 ms per second of monitoring. The throwaway database held 4.0 KiB after 40 observations; the benchmark process used 38.4 MiB resident. Native Windows collector and installed-app footprint remain unmeasured. See `PHASE4_TEST_REPORT.md` for the full method and status.
