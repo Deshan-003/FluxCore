@@ -105,3 +105,29 @@ pub fn forecasts(history: &[Observation], metric: &str, horizons: &[i64]) -> Vec
                 .any(|prefix| metric.starts_with(prefix));
         let clamp = |value: f64| if is_percent { value.clamp(0.0, 100.0) } else { value.max(0.0) };
         let raw = model(&points, best.1, seconds as f64);
+        let value = clamp(raw);
+        let extrapolation = 1.0 + seconds as f64 / duration as f64;
+        let floor = if is_percent { 2.0 } else { 16_777_216.0 };
+        let width = (best.0 * 2.0 + floor) * extrapolation;
+        result.method = names[best.1].into();
+        result.value = Some(value);
+        result.low = Some(clamp(value - width));
+        result.high = Some(clamp(value + width));
+        result.confidence = if seconds > duration / 4 || best.2 < 6 || coverage < 0.9 || width > floor * 8.0 || raw != value { "low" } else { "moderate" }.into();
+        result.explanation = "Selected by walk-forward error against recent observations. The range is a heuristic, not a calibrated probability; workload changes can invalidate it.".into();
+        result
+    }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(at: i64, value: f64) -> Observation {
+        Observation {
+            at,
+            values: [("cpu".into(), value)].into(),
+            ..Default::default()
+        }
+    }
+
