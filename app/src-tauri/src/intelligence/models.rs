@@ -75,3 +75,29 @@ mod tests {
         policy.horizon_minutes = vec![1, 5, 16];
         assert!(policy.validate().is_err());
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanCounters {
+    pub count: u64,
+    pub elapsed_us: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Observation {
+    pub at: i64,
+    pub values: BTreeMap<String, f64>,
+    pub pressure: Option<String>,
+    pub process_count: Option<usize>,
+    pub scans: ScanCounters,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Severity {
+    Information,
+    Low,
+    Medium,
+    High,
