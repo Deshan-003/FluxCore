@@ -131,3 +131,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chooses_trend_for_a_ramp_and_bounds_percentages() {
+        let rows: Vec<_> = (0..100).map(|i| sample(i * 10, i as f64 / 2.0)).collect();
+        let f = forecasts(&rows, "cpu", &[1, 15]);
+        assert_eq!(f[0].method, "linearTrend");
+        assert!((f[0].value.unwrap() - 52.5).abs() < 0.01);
+        assert_eq!(f[1].confidence, "low");
+        assert!(f[1].high.unwrap() <= 100.0);
+    }
+
+    #[test]
+    fn no_prediction_on_insufficient_stale_or_sparse_data() {
+        let mut rows: Vec<_> = (0..20).map(|i| sample(i * 10, 5.0)).collect();
+        assert!(forecasts(&rows[..4], "cpu", &[1])[0].value.is_none());
+        rows.push(sample(5000, 12.0));
+        assert!(forecasts(&rows, "cpu", &[1])[0].value.is_none());
+        assert!(forecasts(&rows, "gpu", &[1])[0].value.is_none());
+    }
+
+    #[test]
+    fn baseline_resists_isolated_outliers() {
+        let rows: Vec<_> = (0..20)
+            .map(|i| sample(i * 10, if i == 4 { 100.0 } else { 12.0 }))
+            .collect();
+        assert_eq!(baseline(&rows, "cpu", 250), Some((12.0, 0.0)));
+    }
+}
