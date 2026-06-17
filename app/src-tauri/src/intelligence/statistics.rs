@@ -51,3 +51,30 @@ fn model(points: &[(f64, f64)], kind: usize, at: f64) -> f64 {
             };
             my + slope * (at - mx)
         }
+    }
+}
+
+pub fn forecasts(history: &[Observation], metric: &str, horizons: &[i64]) -> Vec<Forecast> {
+    let now = history.last().map_or(0, |p| p.at);
+    let mut start = history.len().saturating_sub(1);
+    while start > 0
+        && now - history[start - 1].at <= 1800
+        && history[start].at - history[start - 1].at <= MAX_GAP
+    {
+        start -= 1;
+    }
+    let window = &history[start..];
+    let points: Vec<_> = window
+        .iter()
+        .filter_map(|p| p.values.get(metric).map(|v| ((p.at - now) as f64, *v)))
+        .collect();
+    let duration = points
+        .first()
+        .zip(points.last())
+        .map_or(0, |(a, b)| (b.0 - a.0) as i64);
+    let coverage = points.len() as f64 / window.len().max(1) as f64;
+    let current = points.last().is_some_and(|p| p.0 == 0.0);
+    let continuous = points.windows(2).all(|p| p[1].0 - p[0].0 <= MAX_GAP as f64);
+    horizons.iter().map(|&horizon| {
+        let seconds = horizon * 60;
+        let mut result = Forecast { metric: metric.into(), observed_at: now, target_at: now + seconds,
