@@ -127,3 +127,28 @@ pub struct Forecast {
     pub horizon_minutes: i64,
     pub value: Option<f64>,
     pub low: Option<f64>,
+    pub high: Option<f64>,
+    pub actual: Option<f64>,
+    pub samples: usize,
+    pub observation_seconds: i64,
+    pub coverage: f64,
+    pub confidence: String,
+    pub method: String,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recommendation {
+    pub id: String,
+    pub created_at: i64,
+    pub resource: String,
+    pub problem: String,
+    pub evidence: Vec<String>,
+    pub action: String,
+    pub benefit: String,
+    pub risk: String,
+    pub confidence: String,
+    pub requires_approval: bool,
+    pub applicable: bool,
+    pub severity: Severity,
