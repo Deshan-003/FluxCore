@@ -50,3 +50,28 @@ impl Policy {
             return Err("Use a process scan interval of 5–60 s within the configured maximum, a cooldown of 180–3600 s, and 1–3 distinct forecast horizons (1–15 min) in ascending order.".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_limits_reject_unsafe_or_malformed_values() {
+        assert!(Policy::default().validate().is_ok());
+        let mut policy = Policy::default();
+        policy.scan_interval_ms = 4_999;
+        assert!(policy.validate().is_err());
+        policy.scan_interval_ms = 15_000;
+        policy.max_scan_interval_ms = 10_000;
+        assert!(policy.validate().is_err());
+        policy.max_scan_interval_ms = 30_000;
+        policy.cooldown_seconds = 30;
+        assert!(policy.validate().is_err());
+        policy.cooldown_seconds = 300;
+        policy.horizon_minutes = vec![1, 1];
+        assert!(policy.validate().is_err());
+        policy.horizon_minutes = vec![1, 5, 16];
+        assert!(policy.validate().is_err());
+    }
