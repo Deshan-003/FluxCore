@@ -108,3 +108,31 @@ pub fn sample(
         if cleanup {
             tx.execute("DELETE FROM intelligence_observations WHERE observed_at<?1", [row.at - 7 * 86400])?;
             tx.execute("DELETE FROM intelligence_forecasts WHERE observed_at<?1", [row.at - 2 * 86400])?;
+            tx.execute("DELETE FROM intelligence_records WHERE recorded_at<?1", [row.at - 30 * 86400])?;
+        }
+        tx.commit()
+    })
+}
+
+pub fn decide(
+    db: &Database,
+    rec: Option<&Recommendation>,
+    action: Option<&Action>,
+) -> Result<(), String> {
+    db.with_connection(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        if let Some(rec) = rec {
+            record(&tx, "recommendation", &rec.id, rec.created_at, rec)?;
+        }
+        if let Some(action) = action {
+            record(&tx, "action", &action.id, action.at, action)?;
+        }
+        tx.commit()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
