@@ -274,3 +274,72 @@ pub fn findings(
             problem: problem.into(),
             evidence,
             severity,
+            action: action.into(),
+            benefit: benefit.into(),
+            risk: risk.into(),
+            requires_approval: applicable,
+            applicable,
+            confidence: if severity >= Severity::Medium {
+                "moderate"
+            } else {
+                "limited"
+            }
+            .into(),
+            status: "pending".into(),
+        });
+    };
+    let has = |f: fn(&str) -> bool| events.iter().any(|a| f(&a.metric));
+    let cpu = row.values.get("cpu").copied();
+    let high_cpu = cpu.is_some_and(|cpu| cpu >= 85.0) && has(|m| m == "cpu");
+    let pressure = row.pressure.as_ref().and(memory.map(|m| m.pressure.level));
+    let high_ram = pressure.is_some_and(|p| p.rank() >= PressureLevel::High.rank());
+    let paging = high_ram && row.values.get("pageReads").is_some_and(|v| *v >= 20.0);
+    let disk_activity = has(|m| m.starts_with("diskRead:") || m.starts_with("diskWrite:"));
+    if high_ram {
+        let mut evidence = memory.unwrap().pressure.reasons.clone();
+        if paging {
+            let rate = row.values["pageReads"];
+            let context = if disk_activity {
+                " Elevated disk throughput was also sustained."
+            } else {
+                " Disk throughput does not independently confirm contention."
+            };
+            insights.push(format!("Memory pressure coincides with {rate:.1} physical page reads/s.{context} Paging may contribute to a slowdown; the readings do not identify pagefile traffic or prove causation."));
+        }
+        if let Some(p) = memory
+            .unwrap()
+            .processes
+            .iter()
+            .filter(|p| {
+                snapshot
+                    .processes
+                    .iter()
+                    .any(|live| live.pid == p.pid && live.started_at == p.started_at)
+            })
+            .max_by_key(|p| p.private_bytes)
+        {
+            evidence.push(format!(
+                "{} (PID {}) used {:.0} MiB of private committed memory in the last scan.",
+                p.name,
+                p.pid,
+                p.private_bytes as f64 / MIB
+            ));
+        }
+        suggest("memory", "RAM", if pressure == Some(PressureLevel::Critical) { Severity::Critical } else { Severity::High }, "Memory pressure may slow applications", evidence,
+            "Review private-memory consumers in Memory Intelligence. Save work before closing anything you no longer need.", "May free memory and reduce paging.", "Closing applications interrupts work; FluxCore does not close them or change the pagefile.", false);
+    }
+    if high_cpu {
+        let mut evidence = vec![format!(
+            "System CPU is {:.1}% following sustained elevated utilization.",
+            cpu.unwrap()
+        )];
+        if high_ram {
+            evidence.push(
+                "Memory pressure is also elevated; CPU alone does not explain the slowdown.".into(),
+            );
+        }
+        if let Some(p) = snapshot
+            .processes
+            .iter()
+            .filter_map(|p| p.cpu_percent.map(|v| (p, v)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
