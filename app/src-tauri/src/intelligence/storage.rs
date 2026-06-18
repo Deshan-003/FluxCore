@@ -136,3 +136,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn migration_preserves_existing_gpu_config_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flux.sqlite");
+        let db = Database::open_at_path(path.clone()).unwrap();
+        let gpu = crate::gpu_engine::models::AccelerationConfig {
+            max_concurrent_gpu_tasks: 2,
+            ..Default::default()
+        };
+        crate::gpu_engine::persistence::save_config(&db, &gpu).unwrap();
+        db.with_connection(|c| c.execute_batch("DROP TABLE intelligence_observations; DROP TABLE intelligence_forecasts; DROP TABLE intelligence_records; DROP TABLE intelligence_policy; DELETE FROM schema_migrations WHERE version=5;")).unwrap();
+        drop(db);
+        let db = Database::open_at_path(path.clone()).unwrap();
+        assert_eq!(
+            crate::gpu_engine::persistence::load_config(&db)
+                .unwrap()
+                .unwrap()
+                .max_concurrent_gpu_tasks,
+            2
+        );
+        let policy = Policy {
+            mode: Mode::SmartAssist,
+            ..Policy::default()
+        };
+        configure(&db, &policy, None).unwrap();
+        drop(db);
+        assert_eq!(
+            super::policy(&Database::open_at_path(path).unwrap())
