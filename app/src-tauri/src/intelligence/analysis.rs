@@ -205,3 +205,72 @@ impl Detector {
                 Severity::Critical
             } else if value < absolute {
                 Severity::Low.min(severity)
+            } else {
+                severity
+            };
+            let event = Anomaly {
+                id: format!("{key}@{}", current.at),
+                metric: key.clone(),
+                started_at: since,
+                ended_at: None,
+                resolution: None,
+                severity,
+                value,
+                threshold,
+                explanation: if relative < absolute {
+                    "Sustained increase over the recent median/MAD baseline."
+                } else {
+                    "Sustained reading beyond a resource pressure threshold."
+                }
+                .into(),
+            };
+            signal.active = Some(event.clone());
+            changes.push(event);
+        }
+        changes
+    }
+
+    pub fn active(&self) -> Vec<Anomaly> {
+        let mut events: Vec<_> = self.0.values().filter_map(|s| s.active.clone()).collect();
+        events.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.metric.cmp(&b.metric))
+        });
+        events
+    }
+}
+
+pub struct Findings {
+    pub health: String,
+    pub insights: Vec<String>,
+    pub recommendations: Vec<Recommendation>,
+    pub cpu_pressure: bool,
+}
+
+pub fn findings(
+    row: &Observation,
+    snapshot: &SystemSnapshot,
+    memory: Option<&MemoryIntelligenceSnapshot>,
+    events: &[Anomaly],
+    forecasts: &[Forecast],
+    candidate: Option<u64>,
+) -> Findings {
+    let mut insights = Vec::new();
+    let mut recommendations = Vec::new();
+    let mut suggest = |key: &str,
+                       resource: &str,
+                       severity: Severity,
+                       problem: &str,
+                       evidence: Vec<String>,
+                       action: &str,
+                       benefit: &str,
+                       risk: &str,
+                       applicable: bool| {
+        recommendations.push(Recommendation {
+            id: key.into(),
+            created_at: row.at,
+            resource: resource.into(),
+            problem: problem.into(),
+            evidence,
+            severity,
