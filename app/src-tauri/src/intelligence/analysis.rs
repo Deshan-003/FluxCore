@@ -136,3 +136,72 @@ fn thresholds(metric: &str) -> Option<(f64, f64, Severity)> {
         "pageReads" => Some((f64::INFINITY, 20.0, Severity::Low)),
         "disk" => Some((95.0, 8.0, Severity::High)),
         "diskRead" | "diskWrite" => Some((f64::INFINITY, 16.0 * MIB, Severity::Information)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Default)]
+struct Signal {
+    last: i64,
+    pending: Option<i64>,
+    clear_since: Option<i64>,
+    active: Option<Anomaly>,
+}
+
+#[derive(Default)]
+pub struct Detector(HashMap<String, Signal>);
+
+impl Detector {
+    pub fn update(&mut self, history: &[Observation], current: &Observation) -> Vec<Anomaly> {
+        let mut changes = Vec::new();
+        self.0.retain(|key, signal| {
+            if current.values.contains_key(key) && current.at - signal.last <= MAX_GAP {
+                return true;
+            }
+            if let Some(mut event) = signal.active.take() {
+                event.ended_at = Some(current.at);
+                event.resolution = Some("Measurement interrupted; recovery not established".into());
+                changes.push(event);
+            }
+            false
+        });
+        for (key, &value) in &current.values {
+            let Some((absolute, delta, severity)) = thresholds(key) else {
+                continue;
+            };
+            let signal = self.0.entry(key.clone()).or_default();
+            signal.last = current.at;
+            if let Some(event) = signal.active.as_ref() {
+                if value < event.threshold - delta / 2.0 {
+                    if current.at - *signal.clear_since.get_or_insert(current.at) >= 45 {
+                        let mut event = signal.active.take().unwrap();
+                        event.ended_at = Some(current.at);
+                        event.resolution = Some("Recovered below the hysteresis threshold".into());
+                        changes.push(event);
+                        signal.pending = None;
+                        signal.clear_since = None;
+                    }
+                } else {
+                    signal.clear_since = None;
+                }
+                continue;
+            }
+            let relative = baseline(history, key, current.at)
+                .map_or(f64::INFINITY, |(center, mad)| center + delta.max(4.0 * mad));
+            let threshold = if absolute.is_finite() {
+                absolute.min(relative)
+            } else {
+                relative
+            };
+            if value < threshold {
+                signal.pending = None;
+                continue;
+            }
+            let since = *signal.pending.get_or_insert(current.at);
+            if current.at - since < 45 {
+                continue;
+            }
+            let severity = if key == "commit" && value >= 98.0 {
+                Severity::Critical
+            } else if value < absolute {
+                Severity::Low.min(severity)
