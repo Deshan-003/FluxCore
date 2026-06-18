@@ -550,3 +550,72 @@ pub fn evaluate(before: &[Observation], after: &[Observation]) -> Outcome {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(at: i64, cpu: f64) -> Observation {
+        Observation {
+            at,
+            values: [("cpu".into(), cpu), ("ram".into(), 50.0)].into(),
+            process_count: Some(25),
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn isolated_spike_does_not_alert_and_sustained_signal_recovers() {
+        let mut detector = Detector::default();
+        assert!(detector.update(&[], &row(100, 100.0)).is_empty());
+        assert!(detector.update(&[], &row(115, 20.0)).is_empty());
+        for at in [130, 145, 160] {
+            assert!(detector.update(&[], &row(at, 96.0)).is_empty());
+        }
+        assert_eq!(detector.update(&[], &row(175, 96.0)).len(), 1);
+        for at in [190, 205, 220] {
+            assert!(detector.update(&[], &row(at, 40.0)).is_empty());
+        }
+        assert_eq!(detector.update(&[], &row(235, 40.0))[0].ended_at, Some(235));
+    }
+
+    #[test]
+    fn history_gap_is_not_reported_as_recovery() {
+        let mut detector = Detector::default();
+        detector.update(&[], &row(100, 95.0));
+        detector.update(&[], &row(145, 95.0));
+        let changes = detector.update(&[], &row(300, 20.0));
+        assert!(changes[0]
+            .resolution
+            .as_ref()
+            .unwrap()
+            .contains("interrupted"));
+    }
+
+    #[test]
+    fn refuses_to_attribute_overhead_improvement_when_workload_changed() {
+        let make = |start: i64, cpu, cost| {
+            (0..5_i64)
+                .map(|i| {
+                    let mut point = row(start + 15 * i, cpu);
+                    point.scans = ScanCounters {
+                        count: i as u64,
+                        elapsed_us: cost * i as u64,
+                    };
+                    point
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = make(0, 90.0, 1000);
+        assert_eq!(
+            evaluate(&before, &make(90, 87.0, 200)).verdict,
+            "lowerOverhead"
+        );
+        assert_eq!(
+            evaluate(&before, &make(90, 40.0, 200)).verdict,
+            "inconclusive"
+        );
+        assert_eq!(
+            evaluate(&before, &make(90, 91.0, 2000)).verdict,
+            "regression"
+        );
+    }
+}
