@@ -81,3 +81,30 @@ pub fn comparisons(db: &Database, metric: &str, horizon: i64) -> Result<Vec<Fore
         Ok(rows)
     })
 }
+
+pub fn sample(
+    db: &Database,
+    row: &Observation,
+    forecasts: &[Forecast],
+    anomalies: &[Anomaly],
+    recommendations: &[Recommendation],
+    cleanup: bool,
+) -> Result<(), String> {
+    db.with_connection(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO intelligence_observations VALUES(?1,?2)", params![row.at, encode(row)?])?;
+        for (metric, value) in &row.values {
+            if super::analysis::forecast_metric(metric) {
+                tx.execute("UPDATE intelligence_forecasts SET checked=1, actual=?1 WHERE checked=0 AND metric=?2 AND target_at BETWEEN ?3 AND ?4", params![value, metric, row.at - 30, row.at])?;
+            }
+        }
+        tx.execute("UPDATE intelligence_forecasts SET checked=1 WHERE checked=0 AND target_at<?1", [row.at - 30])?;
+        for forecast in forecasts.iter().filter(|f| f.value.is_some()) {
+            tx.execute("INSERT OR IGNORE INTO intelligence_forecasts(observed_at,metric,horizon,target_at,payload) VALUES(?1,?2,?3,?4,?5)",
+                params![forecast.observed_at, forecast.metric, forecast.horizon_minutes, forecast.target_at, encode(forecast)?])?;
+        }
+        for anomaly in anomalies { record(&tx, "anomaly", &anomaly.id, anomaly.started_at, anomaly)?; }
+        for recommendation in recommendations { record(&tx, "recommendation", &recommendation.id, recommendation.created_at, recommendation)?; }
+        if cleanup {
+            tx.execute("DELETE FROM intelligence_observations WHERE observed_at<?1", [row.at - 7 * 86400])?;
+            tx.execute("DELETE FROM intelligence_forecasts WHERE observed_at<?1", [row.at - 2 * 86400])?;
