@@ -300,3 +300,104 @@ impl IntelligenceEngine {
             return Err("The scan limit is blocked when memory pressure is high or unknown".into());
         }
         let expires = Instant::now() + Duration::from_secs(LEASE_SECONDS as u64);
+        let action = Action {
+            id: format!(
+                "scan@{}",
+                Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(at * 1_000_000_000)
+            ),
+            at,
+            mode: state.policy.mode,
+            interval_ms: interval,
+            previous_interval_ms: Some(limit),
+            recommendation: rec.map(|r| r.id.clone()),
+            before: state
+                .rows
+                .iter()
+                .filter(|row| row.at >= at - EVALUATE_SECONDS)
+                .cloned()
+                .collect(),
+            outcome: None,
+            ended_at: None,
+            status: "applied".into(),
+            detail: "Temporary minimum interval applied to detailed FluxCore process scans only"
+                .into(),
+        };
+        storage::decide(&self.db, rec, Some(&action))?;
+        self.memory.set_scan_override(Some((interval, expires)));
+        state.last_action = Some(Instant::now());
+        state.running = Some(Running {
+            action,
+            expires,
+            clear_since: None,
+        });
+        Ok(())
+    }
+
+    fn remove_override(&self, state: &mut State) {
+        self.memory.set_scan_override(None);
+        state.running = None;
+        state.last_action = Some(Instant::now());
+    }
+
+    fn closed(running: &Running, at: i64, status: &str, detail: &str) -> Action {
+        let mut action = running.action.clone();
+        action.ended_at = Some(at);
+        action.status = status.into();
+        action.detail = detail.into();
+        action
+    }
+
+    fn finish(&self, state: &mut State, at: i64, status: &str, detail: &str) -> Result<(), String> {
+        if let Some(running) = state.running.as_ref() {
+            let action = Self::closed(running, at, status, detail);
+            self.remove_override(state);
+            if let Err(error) = storage::decide(&self.db, None, Some(&action)) {
+                state.consent_required = true;
+                state.status = Some(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn revert(&self, id: &str) -> Result<(), String> {
+        let mut state = self.lock()?;
+        if state.running.as_ref().is_none_or(|r| r.action.id != id) {
+            return Err("This change is no longer active".into());
+        }
+        self.finish(
+            &mut state,
+            Utc::now().timestamp(),
+            "reverted",
+            "User restored the Phase 2 scan cadence",
+        )
+    }
+
+    pub(crate) fn collection_status(&self, monitoring: bool, history_enabled: bool) {
+        let Ok(mut state) = self.lock() else { return };
+        if state.monitoring == monitoring && state.history_enabled == history_enabled {
+            return;
+        }
+        if !monitoring || !history_enabled {
+            let _ = self.finish(
+                &mut state,
+                Utc::now().timestamp(),
+                "reverted",
+                "Monitoring or local history was turned off",
+            );
+        }
+        if !monitoring || state.history_enabled != history_enabled {
+            let now = Utc::now().timestamp();
+            let mut events = state.detector.active();
+            for event in &mut events {
+                event.ended_at = Some(now);
+                event.resolution = Some("Collection changed; recovery not established".into());
+                if state.history_enabled {
+                    if let Err(error) = self.db.with_connection(|conn| {
+                        storage::record(conn, "anomaly", &event.id, event.started_at, event)
+                    }) {
+                        state.status = Some(error);
+                    }
+                }
