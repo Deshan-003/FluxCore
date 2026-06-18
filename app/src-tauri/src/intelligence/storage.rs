@@ -53,3 +53,31 @@ pub fn records<T: DeserializeOwned>(
     kind: &str,
     limit: usize,
 ) -> Result<Vec<T>, String> {
+    db.with_connection(|conn| {
+        let mut stmt = conn.prepare_cached("SELECT payload FROM intelligence_records WHERE kind=?1 ORDER BY recorded_at DESC, id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![kind, limit as i64], |r| decode(r.get(0)?))?;
+        rows.collect()
+    })
+}
+
+pub fn observations(db: &Database, cutoff: i64, limit: usize) -> Result<Vec<Observation>, String> {
+    db.with_connection(|conn| {
+        let mut stmt = conn.prepare_cached("SELECT payload FROM intelligence_observations WHERE observed_at>=?1 ORDER BY observed_at DESC LIMIT ?2")?;
+        let mut rows = stmt.query_map(params![cutoff, limit as i64], |r| decode(r.get(0)?))?.collect::<Result<Vec<Observation>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    })
+}
+
+pub fn comparisons(db: &Database, metric: &str, horizon: i64) -> Result<Vec<Forecast>, String> {
+    db.with_connection(|conn| {
+        let mut stmt = conn.prepare_cached("SELECT payload, actual FROM intelligence_forecasts WHERE metric=?1 AND horizon=?2 AND checked=1 AND actual IS NOT NULL ORDER BY observed_at DESC LIMIT 120")?;
+        let mut rows = stmt.query_map(params![metric,horizon], |r| {
+            let mut forecast: Forecast = decode(r.get(0)?)?;
+            forecast.actual = r.get(1)?;
+            Ok(forecast)
+        })?.collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    })
+}
