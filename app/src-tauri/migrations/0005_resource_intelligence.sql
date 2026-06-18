@@ -17,3 +17,12 @@ CREATE TABLE IF NOT EXISTS intelligence_records (
     kind TEXT NOT NULL CHECK(kind IN ('anomaly', 'recommendation', 'action')),
     id TEXT NOT NULL,
     recorded_at INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (kind, id)
+);
+CREATE INDEX IF NOT EXISTS idx_intelligence_records_time ON intelligence_records(kind, recorded_at DESC);
+CREATE TABLE IF NOT EXISTS intelligence_policy (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    payload TEXT NOT NULL
+);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
