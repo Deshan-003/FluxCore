@@ -163,3 +163,31 @@ mod tests {
         drop(db);
         assert_eq!(
             super::policy(&Database::open_at_path(path).unwrap())
+                .unwrap()
+                .mode,
+            Mode::SmartAssist
+        );
+    }
+
+    #[test]
+    fn forecast_comparison_uses_only_real_observations_near_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_at_path(dir.path().join("flux.sqlite")).unwrap();
+        let row = |at| Observation {
+            at,
+            values: [("cpu".into(), 18.0)].into(),
+            ..Default::default()
+        };
+        let mut f = super::super::statistics::forecasts(&[row(180)], "cpu", &[1, 2]);
+        for forecast in &mut f {
+            forecast.value = Some(11.0);
+        }
+        sample(&db, &row(180), &f, &[], &[], false).unwrap();
+        sample(&db, &row(180), &f, &[], &[], false).unwrap();
+        sample(&db, &row(252), &[], &[], &[], false).unwrap();
+        sample(&db, &row(350), &[], &[], &[], false).unwrap();
+        assert_eq!(observations(&db, 0, 20).unwrap().len(), 3);
+        assert_eq!(comparisons(&db, "cpu", 1).unwrap()[0].actual, Some(18.0));
+        assert!(comparisons(&db, "cpu", 2).unwrap().is_empty());
+    }
+}
