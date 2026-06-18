@@ -401,3 +401,103 @@ impl IntelligenceEngine {
                         state.status = Some(error);
                     }
                 }
+            }
+            state.latest = None;
+            state.rows.clear();
+            state.forecasts.clear();
+            state.forecast_at = None;
+            state.detector = analysis::Detector::default();
+            state.anomaly_history.clear();
+            state.recommendations.clear();
+            state.insights.clear();
+        }
+        if monitoring && history_enabled {
+            let now = Utc::now().timestamp();
+            match storage::observations(&self.db, now - WINDOW_SECONDS, 121) {
+                Ok(rows) => state.rows = rows.into_iter().filter(|r| r.at <= now).collect(),
+                Err(error) => state.status = Some(error),
+            }
+            match storage::records(&self.db, "anomaly", 40) {
+                Ok(events) => state.anomaly_history = events,
+                Err(error) => state.status = Some(error),
+            }
+        }
+        state.monitoring = monitoring;
+        state.history_enabled = history_enabled;
+    }
+
+    pub fn tick(&self, snapshot: &SystemSnapshot) {
+        let Ok(date) = DateTime::parse_from_rfc3339(&snapshot.collected_at) else {
+            return;
+        };
+        let at = date.timestamp();
+        let Ok(mut state) = self.lock() else { return };
+        if !state.monitoring
+            || state
+                .latest
+                .as_ref()
+                .is_some_and(|row| at - row.at < SAMPLE_SECONDS && at >= row.at)
+        {
+            return;
+        }
+        if state.rows.last().is_some_and(|r| r.at >= at) {
+            state.rows.retain(|r| r.at < at);
+        }
+        let memory = self.memory.intelligence().ok();
+        let mut current =
+            analysis::observe(at, snapshot, memory.as_ref(), self.memory.scan_counters());
+        if let Some(gpu) = self.gpu.get().and_then(std::sync::Weak::upgrade) {
+            let (resources, tasks) = gpu.intelligence_resources();
+            current
+                .values
+                .insert("gpuRunningTasks".into(), resources.running_gpu_tasks as f64);
+            current
+                .values
+                .insert("gpuQueuedTasks".into(), resources.queued_gpu_tasks as f64);
+            current.values.insert(
+                "gpuBudgetRemaining".into(),
+                resources.remaining_budget_bytes as f64,
+            );
+            let since = state
+                .latest
+                .as_ref()
+                .map_or(at - SAMPLE_SECONDS, |row| row.at)
+                .max(at - 60);
+            for task in tasks
+                .into_iter()
+                .filter(|task| task.validated && !task.fell_back)
+            {
+                if let (Some(ms), Some(backend), Some(finished)) =
+                    (task.total_time_ms, task.selected_backend, task.finished_at)
+                {
+                    let finished = DateTime::parse_from_rfc3339(&finished)
+                        .ok()
+                        .map(|date| date.timestamp());
+                    if (0.0..=1e9).contains(&ms) && finished.is_some_and(|t| t > since && t <= at) {
+                        let key = format!(
+                            "workloadMs:{} · {} · {:?}",
+                            task.workload_id,
+                            backend.as_str(),
+                            task.params
+                        );
+                        current.values.entry(key).or_insert(ms);
+                    }
+                }
+            }
+        }
+        let State { detector, rows, .. } = &mut *state;
+        let changes = detector.update(rows, &current);
+        for event in &changes {
+            if event.ended_at.is_some() {
+                state.anomaly_history.insert(0, event.clone());
+                state.anomaly_history.truncate(40);
+            }
+        }
+        state.rows.retain(|row| at - row.at <= WINDOW_SECONDS);
+        state.rows.push(current.clone());
+        let forecast_due = state
+            .forecast_at
+            .is_none_or(|last| !(0..60).contains(&(at - last)));
+        if forecast_due {
+            state.forecasts = current
+                .values
