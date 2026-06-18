@@ -481,3 +481,72 @@ pub fn findings(
         "No sustained pressure detected in available readings"
     };
     recommendations.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
+    Findings {
+        health: health.into(),
+        insights,
+        recommendations,
+        cpu_pressure: high_cpu && !high_ram,
+    }
+}
+
+pub fn evaluate(before: &[Observation], after: &[Observation]) -> Outcome {
+    fn summarize(rows: &[Observation]) -> BTreeMap<String, f64> {
+        let mut values = BTreeMap::<String, (f64, usize)>::new();
+        for row in rows {
+            for (key, value) in &row.values {
+                let acc = values.entry(key.clone()).or_default();
+                acc.0 += value;
+                acc.1 += 1;
+            }
+            if let Some(count) = row.process_count {
+                let acc = values.entry("processCount".into()).or_default();
+                acc.0 += count as f64;
+                acc.1 += 1;
+            }
+        }
+        let mut out: BTreeMap<_, _> = values
+            .into_iter()
+            .filter(|(_, (_, n))| *n >= 3)
+            .map(|(k, (sum, n))| (k, sum / n as f64))
+            .collect();
+        if let Some((start, end)) = rows.first().zip(rows.last()).filter(|(a, b)| {
+            b.at - a.at >= 40
+                && b.scans.count >= a.scans.count
+                && b.scans.elapsed_us >= a.scans.elapsed_us
+        }) {
+            let minutes = (end.at - start.at) as f64 / 60.0;
+            out.insert(
+                "scansPerMinute".into(),
+                (end.scans.count - start.scans.count) as f64 / minutes,
+            );
+            out.insert(
+                "scanMsPerMinute".into(),
+                (end.scans.elapsed_us - start.scans.elapsed_us) as f64 / minutes / 1000.0,
+            );
+        }
+        out
+    }
+    let a = summarize(before);
+    let b = summarize(after);
+    let paired = |key: &str| a.get(key).zip(b.get(key));
+    let stable = paired("cpu").is_some_and(|(x, y)| (x - y).abs() <= 15.0)
+        && paired("processCount").is_some_and(|(x, y)| (x - y).abs() <= (x * 0.15).max(3.0))
+        && paired("ram").is_some_and(|(x, y)| (x - y).abs() <= 10.0)
+        && a.keys()
+            .filter(|key| key.starts_with("gpu:"))
+            .all(|key| paired(key).is_some_and(|(x, y)| (x - y).abs() <= 20.0));
+    let (verdict, detail) = match paired("scanMsPerMinute") {
+        Some((x, y)) if stable && *x > 0.0 && *y < x * 0.8 => ("lowerOverhead", "Detailed scans took less wall time per minute. This does not establish a system-wide speedup."),
+        Some((x, y)) if stable && *y > (x * 1.2).max(x + 0.5) => ("regression", "Detailed scans took more wall time per minute under comparable observed load."),
+        Some(_) if stable => ("noClearChange", "Scan timing did not show a clear improvement despite comparable observed load."),
+        _ => ("inconclusive", "The surrounding workload changed or required observations were missing; no improvement is attributed to FluxCore."),
+    };
+    Outcome {
+        verdict: verdict.into(),
+        detail: detail.into(),
+        before: a,
+        after: b,
+    }
+}
+
+#[cfg(test)]
