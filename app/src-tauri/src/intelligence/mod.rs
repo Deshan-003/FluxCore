@@ -199,3 +199,104 @@ impl IntelligenceEngine {
         state.policy = policy;
         state.consent_required = false;
         state.forecast_at = None;
+        state.status = None;
+        Ok(())
+    }
+
+    fn can_change(state: &State) -> Result<(), String> {
+        if !state.monitoring
+            || !state.history_enabled
+            || state.policy.paused
+            || state.consent_required
+            || state.status.is_some()
+        {
+            return Err(
+                "Actions require current monitoring, local history, an active policy and a healthy database"
+                    .into(),
+            );
+        }
+        if state.running.is_some() {
+            return Err("Revert the active scan policy before applying another".into());
+        }
+        if state.last_action.is_some_and(|at| {
+            at.elapsed() < Duration::from_secs(state.policy.cooldown_seconds as u64)
+        }) {
+            return Err("The optimization cooldown is active".into());
+        }
+        Ok(())
+    }
+
+    fn fresh(state: &State, now: i64) -> bool {
+        state
+            .latest
+            .as_ref()
+            .is_some_and(|row| (0..=statistics::MAX_GAP).contains(&(now - row.at)))
+    }
+
+    pub fn respond(&self, id: &str, decision: Decision, confirmed: bool) -> Result<(), String> {
+        let mut state = self.lock()?;
+        let mut rec = state
+            .recommendations
+            .iter()
+            .find(|r| r.id == id && r.status == "pending")
+            .cloned()
+            .ok_or("Recommendation is no longer pending; refresh the dashboard")?;
+        if matches!(decision, Decision::Apply) {
+            if !confirmed || state.policy.mode != Mode::SmartAssist || !rec.applicable {
+                return Err("This recommendation is not approvable in the current mode".into());
+            }
+            let now = Utc::now().timestamp();
+            if !Self::fresh(&state, now) {
+                return Err("Measurements are stale".into());
+            }
+            rec.status = "approved".into();
+            let interval = state.policy.scan_interval_ms;
+            self.start(&mut state, interval, now, Some(&rec))?;
+        } else {
+            rec.status = if matches!(decision, Decision::Reject) {
+                "rejected"
+            } else {
+                "dismissed"
+            }
+            .into();
+            if state.history_enabled {
+                storage::decide(&self.db, Some(&rec), None)?;
+            }
+        }
+        if let Some(item) = state.recommendations.iter_mut().find(|r| r.id == id) {
+            *item = rec;
+        }
+        Ok(())
+    }
+
+    pub fn manual(&self, confirmed: bool) -> Result<(), String> {
+        let mut state = self.lock()?;
+        let now = Utc::now().timestamp();
+        if !confirmed || state.policy.mode != Mode::Manual || !Self::fresh(&state, now) {
+            return Err("Manual mode, confirmation and current measurements are required".into());
+        }
+        let interval = state.policy.scan_interval_ms;
+        self.start(&mut state, interval, now, None)
+    }
+
+    fn start(
+        &self,
+        state: &mut State,
+        interval: u64,
+        at: i64,
+        rec: Option<&Recommendation>,
+    ) -> Result<(), String> {
+        Self::can_change(state)?;
+        let limit = self.memory.config().process_scan_interval_ms;
+        if interval <= limit || interval > state.policy.max_scan_interval_ms {
+            return Err("The requested minimum scan interval is not above the Phase 2 configured interval or exceeds your limit".into());
+        }
+        if state
+            .latest
+            .as_ref()
+            .and_then(|r| r.pressure.as_deref())
+            .is_none_or(|p| p == "high" || p == "critical")
+        {
+            return Err("The scan limit is blocked when memory pressure is high or unknown".into());
+        }
+        let expires = Instant::now() + Duration::from_secs(LEASE_SECONDS as u64);
