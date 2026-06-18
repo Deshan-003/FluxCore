@@ -2,8 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{fs, path::PathBuf, sync::Mutex};
 
 use crate::memory_engine::models::{
-    ActionStatus, AuditEntry, MemoryHistoryPoint, OptimizationMode, PolicyConfig, PressureEvent,
-    PressureLevel, ProcessHistoryPoint, Prediction, RiskLevel, StoredRecommendation,
+    ActionStatus, AuditEntry, MemoryHistoryPoint, OptimizationMode, PolicyConfig, Prediction,
+    PressureEvent, PressureLevel, ProcessHistoryPoint, RiskLevel, StoredRecommendation,
 };
 use crate::monitoring::{HistoryPoint, MonitoringSettings, SystemSnapshot};
 
@@ -31,7 +31,7 @@ impl Database {
             .connection
             .lock()
             .map_err(|_| "database lock poisoned".to_string())?;
-        f(&connection).map_err(|error| format!("gpu database operation: {error}"))
+        f(&connection).map_err(|error| format!("database operation: {error}"))
     }
 
     fn open_at(path: PathBuf) -> Result<Self, String> {
@@ -219,6 +219,24 @@ impl Database {
                  COMMIT;"
             ).map_err(|error| format!("apply database migration 4: {error}"))?;
         }
+        let migration = connection
+            .unchecked_transaction()
+            .map_err(|e| format!("start migration 5: {e}"))?;
+        let applied = migration
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 5)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| format!("read migration 5: {e}"))?;
+        if !applied {
+            migration
+                .execute_batch(include_str!("../migrations/0005_resource_intelligence.sql"))
+                .map_err(|e| format!("apply migration 5: {e}"))?;
+        }
+        migration
+            .commit()
+            .map_err(|e| format!("commit migration 5: {e}"))?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -334,17 +352,15 @@ impl Database {
             .map_err(|e| format!("prepare memory history query: {e}"))?;
         let rows = statement
             .query_map([limit as i64], |row| {
-                Ok((
-                    MemoryHistoryPoint {
-                        timestamp: row.get(0)?,
-                        used_bytes: row.get::<_, i64>(1)? as u64,
-                        available_bytes: row.get::<_, i64>(2)? as u64,
-                        committed_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                        compressed_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-                        pagefile_used_bytes: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
-                        pressure_level: parse_level(&row.get::<_, String>(6)?),
-                    },
-                ))
+                Ok((MemoryHistoryPoint {
+                    timestamp: row.get(0)?,
+                    used_bytes: row.get::<_, i64>(1)? as u64,
+                    available_bytes: row.get::<_, i64>(2)? as u64,
+                    committed_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    compressed_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    pagefile_used_bytes: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                    pressure_level: parse_level(&row.get::<_, String>(6)?),
+                },))
             })
             .map_err(|e| format!("read memory history: {e}"))?;
         let mut points: Vec<MemoryHistoryPoint> = rows
@@ -486,7 +502,10 @@ impl Database {
         Ok(points)
     }
 
-    pub fn record_recommendation(&self, recommendation: &StoredRecommendation) -> Result<i64, String> {
+    pub fn record_recommendation(
+        &self,
+        recommendation: &StoredRecommendation,
+    ) -> Result<i64, String> {
         let connection = self
             .connection
             .lock()
@@ -507,7 +526,10 @@ impl Database {
         Ok(connection.last_insert_rowid())
     }
 
-    pub fn stored_recommendations(&self, limit: usize) -> Result<Vec<StoredRecommendation>, String> {
+    pub fn stored_recommendations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredRecommendation>, String> {
         let connection = self
             .connection
             .lock()
@@ -660,16 +682,23 @@ impl Database {
             .lock()
             .map_err(|_| "database lock poisoned".to_string())?;
         let payload: Option<String> = connection
-            .query_row("SELECT payload FROM optimization_policies WHERE id=1", [], |row| row.get(0))
+            .query_row(
+                "SELECT payload FROM optimization_policies WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|e| format!("read policy config: {e}"))?;
         payload
-            .map(|json| serde_json::from_str(&json).map_err(|e| format!("decode policy config: {e}")))
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| format!("decode policy config: {e}"))
+            })
             .transpose()
     }
 
     pub fn save_memory_policy_config(&self, config: &PolicyConfig) -> Result<(), String> {
-        let payload = serde_json::to_string(config).map_err(|e| format!("encode policy config: {e}"))?;
+        let payload =
+            serde_json::to_string(config).map_err(|e| format!("encode policy config: {e}"))?;
         let connection = self
             .connection
             .lock()
@@ -811,7 +840,9 @@ mod tests {
         let mut snapshot = test_snapshot();
         snapshot.cpu.usage_percent = None;
         snapshot.memory.usage_percent = None;
-        database.record_snapshot(&snapshot).expect("record snapshot");
+        database
+            .record_snapshot(&snapshot)
+            .expect("record snapshot");
         let history = database.history().expect("read history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].cpu_percent, None, "failed collections stay NULL");
@@ -844,7 +875,11 @@ mod tests {
         assert_eq!(history[0].cpu_percent, Some(12.5));
         assert_eq!(history[0].memory_percent, Some(42.0));
         let again = Database::open_at(path).expect("reopen");
-        assert_eq!(again.history().expect("read history").len(), 1, "migration is idempotent");
+        assert_eq!(
+            again.history().expect("read history").len(),
+            1,
+            "migration is idempotent"
+        );
     }
 }
 
