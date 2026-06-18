@@ -67,3 +67,72 @@ pub fn observe(
         );
     }
     for (index, gpu) in snapshot.gpus.iter().take(8).enumerate() {
+        let adapter = format!("{} #{}", gpu.name, index + 1);
+        set(
+            format!("gpu:{adapter}"),
+            gpu.utilization_percent.map(f64::from),
+        );
+        set(
+            format!("vram:{adapter}"),
+            gpu.vram_usage_percent.map(f64::from),
+        );
+        set(
+            format!("vramBytes:{adapter}"),
+            gpu.dedicated_used_bytes.map(|v| v as f64),
+        );
+        set(
+            format!("gpuShared:{adapter}"),
+            gpu.shared_used_bytes.map(|v| v as f64),
+        );
+        set(
+            format!("gpuTemp:{adapter}"),
+            gpu.temperature_c.map(f64::from),
+        );
+    }
+    for disk in snapshot.storage.iter().take(24) {
+        set(
+            format!("disk:{}", disk.name),
+            disk.usage_percent.map(f64::from),
+        );
+        if disk.total_bytes > 0 {
+            set(
+                format!("diskFree:{}", disk.name),
+                Some(disk.available_bytes as f64),
+            );
+        }
+        set(
+            format!("diskRead:{}", disk.name),
+            disk.read_bytes_per_second.map(|v| v as f64),
+        );
+        set(
+            format!("diskWrite:{}", disk.name),
+            disk.write_bytes_per_second.map(|v| v as f64),
+        );
+    }
+    if let Some(process) = snapshot
+        .processes
+        .iter()
+        .find(|p| p.pid == std::process::id())
+    {
+        set("fluxCpu".into(), process.cpu_percent.map(f64::from));
+        set("fluxRam".into(), Some(process.memory_bytes as f64));
+    }
+    row
+}
+
+pub fn forecast_metric(key: &str) -> bool {
+    matches!(key, "cpu" | "ram" | "commit")
+        || ["gpu:", "vram:", "vramBytes:", "disk:", "diskFree:"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+fn thresholds(metric: &str) -> Option<(f64, f64, Severity)> {
+    match metric.split(':').next()? {
+        "cpu" | "gpu" => Some((90.0, 20.0, Severity::Medium)),
+        "corePeak" => Some((97.0, 25.0, Severity::Low)),
+        "ram" | "vram" => Some((92.0, 10.0, Severity::Medium)),
+        "commit" => Some((90.0, 10.0, Severity::High)),
+        "pageReads" => Some((f64::INFINITY, 20.0, Severity::Low)),
+        "disk" => Some((95.0, 8.0, Severity::High)),
+        "diskRead" | "diskWrite" => Some((f64::INFINITY, 16.0 * MIB, Severity::Information)),
