@@ -412,3 +412,72 @@ pub fn findings(
         let key = format!("diskFree:{}", disk.name);
         forecasts
             .iter()
+            .find(|f| {
+                f.metric == key
+                    && f.confidence == "moderate"
+                    && f.value
+                        .is_some_and(|value| value <= disk.total_bytes as f64 * 0.05)
+                    && row
+                        .values
+                        .get(&key)
+                        .is_some_and(|value| *value > disk.total_bytes as f64 * 0.05)
+            })
+            .map(|f| (disk.name.as_str(), f))
+    }) {
+        suggest("capacityForecast", "Storage", Severity::Medium, "Recent storage growth may leave little free space", vec![format!("{} is currently {:.1}% full; the {}-minute trend projects about {:.1}% free.", volume, 100.0 - row.values[&format!("disk:{volume}")], forecast.horizon_minutes, forecast.value.unwrap() * 100.0 / snapshot.storage.iter().find(|disk| disk.name == volume).unwrap().total_bytes as f64)], "Review large files and Windows Storage settings before capacity becomes tight.", "May preserve space for updates and application writes.", "This trend extrapolation is uncertain; review files and backups before removing anything. FluxCore will not delete files.", false);
+    }
+    if disk_activity && !paging {
+        insights.push("Disk throughput is above its historical baseline. Throughput alone cannot establish latency or a storage bottleneck.".into());
+    }
+    if let Some(process) = memory.and_then(|m| {
+        m.processes
+            .iter()
+            .filter(|p| {
+                p.leak.is_some()
+                    && snapshot
+                        .processes
+                        .iter()
+                        .any(|live| live.pid == p.pid && live.started_at == p.started_at)
+            })
+            .max_by(|a, b| a.trend_bytes_per_min.total_cmp(&b.trend_bytes_per_min))
+    }) {
+        suggest(
+            "growth",
+            "RAM",
+            Severity::Low,
+            "A process shows sustained memory growth",
+            vec![format!(
+                "{} (PID {}): {:.1} MiB/min across {} s of observations.",
+                process.name,
+                process.pid,
+                process.trend_bytes_per_min / MIB,
+                process.observation_seconds
+            )],
+            "Review the process in Memory Intelligence and correlate the trend with its workload.",
+            "May help identify a workload worth investigating.",
+            "Growth can be expected and is not proof of a leak or malicious activity.",
+            false,
+        );
+    }
+    if let Some(f) = forecasts
+        .iter()
+        .filter(|f| {
+            f.confidence == "moderate"
+                && matches!(f.metric.as_str(), "ram" | "commit")
+                && f.value.is_some_and(|v| v >= 90.0)
+                && row.values.get(&f.metric).is_some_and(|v| *v < 90.0)
+        })
+        .min_by_key(|f| f.horizon_minutes)
+    {
+        insights.push(format!("If the recent pattern continues, {} use may reach {:.0}% in {} min. This is not a guarantee of memory pressure.", f.metric, f.value.unwrap(), f.horizon_minutes));
+    }
+    let health = if high_ram || recommendations.iter().any(|r| r.severity >= Severity::High) {
+        "Resource pressure detected"
+    } else if high_cpu || !events.is_empty() {
+        "Elevated resource activity"
+    } else if cpu.is_none() || !row.values.contains_key("ram") {
+        "Limited telemetry"
+    } else {
+        "No sustained pressure detected in available readings"
+    };
+    recommendations.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
