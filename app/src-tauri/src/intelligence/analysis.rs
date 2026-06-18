@@ -343,3 +343,72 @@ pub fn findings(
             .iter()
             .filter_map(|p| p.cpu_percent.map(|v| (p, v)))
             .max_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            evidence.push(format!("{} (PID {}) accounts for {:.1}% of total logical CPU capacity in the current sample.", p.0.name, p.0.pid, p.1));
+        }
+        suggest(
+            "cpu",
+            "CPU",
+            Severity::Medium,
+            "Sustained CPU load",
+            evidence,
+            "Review active workloads and defer nonessential background work.",
+            "May leave more CPU time for interactive work.",
+            "A busy process may be doing useful work; review it before taking action.",
+            false,
+        );
+    }
+    if let Some(target) = candidate.filter(|_| high_cpu && !high_ram) {
+        suggest(
+            "scan",
+            "Monitoring",
+            Severity::Low,
+            "Optional detailed process scans compete for CPU time",
+            vec![format!(
+                "CPU load is sustained; the proposed minimum scan interval is {} s.",
+                target / 1000
+            )],
+            "Reduce FluxCore's detailed memory-process scan frequency temporarily.",
+            "May reduce FluxCore's scan overhead.",
+            "Detailed process memory and trend readings may update less often.",
+            true,
+        );
+    }
+    if let Some(event) = events
+        .iter()
+        .find(|a| a.metric.starts_with("vram:") || a.metric.starts_with("gpu:"))
+    {
+        let adapter = event.metric.split_once(':').unwrap().1;
+        let evidence = vec![format!(
+            "{adapter} reached {:.1}% on its {} counter during a sustained event.",
+            event.value,
+            if event.metric.starts_with("vram:") {
+                "dedicated VRAM"
+            } else {
+                "GPU utilization"
+            }
+        )];
+        suggest("gpu", "GPU", event.severity, "Limited graphics headroom", evidence, "Check the workload profiler and current budget in GPU Acceleration before submitting more work.", "May reduce queue contention or avoid a workload that exceeds available VRAM.", "CPU execution can take longer. FluxCore only manages its own workloads.", false);
+    }
+    if let Some((disk, value)) = row
+        .values
+        .iter()
+        .filter(|(k, v)| k.starts_with("disk:") && **v >= 95.0)
+        .max_by(|a, b| a.1.total_cmp(b.1))
+    {
+        let drive = disk.trim_start_matches("disk:");
+        suggest(
+            "capacity",
+            "Storage",
+            Severity::High,
+            "A mounted volume has little free space",
+            vec![format!("{drive} is {value:.1}% full.")],
+            "Review large files and Windows Storage settings.",
+            "May preserve space for updates and application writes.",
+            "Review files and backups before removing anything. FluxCore will not delete files.",
+            false,
+        );
+    } else if let Some((volume, forecast)) = snapshot.storage.iter().find_map(|disk| {
+        let key = format!("diskFree:{}", disk.name);
+        forecasts
+            .iter()
