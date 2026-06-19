@@ -20,3 +20,15 @@ export const useResourceStore = create<ResourceStore>((set, get) => ({
     const [state, history] = await Promise.allSettled([
       getResourceIntelligence(),
       metric !== undefined && horizon !== undefined ? getResourceHistory(metric, horizon) : Promise.resolve(null),
+    ])
+    if (id !== request) return
+    if (state.status === 'fulfilled') {
+      set({ data: state.value, error: history.status === 'rejected' ? String(history.reason) : null,
+        ...(history.status === 'fulfilled' && history.value ? { history: { key: `${metric}@${horizon}`, data: history.value } } : {}),
+      })
+    } else set({ error: String(state.reason) })
+  },
+  change: async (operation) => {
+    if (get().busy) return false
+    ++request
+    set({ busy: true, error: null })
