@@ -602,3 +602,104 @@ impl IntelligenceEngine {
                     .cloned()
                     .collect();
                 let outcome = analysis::evaluate(&running.action.before, &after);
+                let regression = outcome.verdict == "regression";
+                running.action.outcome = Some(outcome);
+                if regression && state.policy.mode == Mode::Adaptive {
+                    let _ = self.finish(
+                        state,
+                        now,
+                        "reverted",
+                        "Adaptive policy reverted after overhead regressed",
+                    );
+                    return;
+                }
+                if let Err(error) = storage::decide(&self.db, None, Some(&running.action)) {
+                    state.status = Some(error);
+                    let _ = self.finish(
+                        state,
+                        now,
+                        "reverted",
+                        "Could not save the optimization evaluation",
+                    );
+                    return;
+                }
+            }
+            let clear = if running.action.mode == Mode::Adaptive
+                && current.values.get("cpu").is_some_and(|v| *v < 70.0)
+            {
+                now - *running.clear_since.get_or_insert(now) >= 60
+            } else {
+                running.clear_since = None;
+                false
+            };
+            if clear || expired {
+                let _ = self.finish(
+                    state,
+                    now,
+                    if clear { "reverted" } else { "expired" },
+                    if clear {
+                        "CPU load recovered for at least 60 seconds"
+                    } else {
+                        "Temporary scan limit expired; restored the Phase 2 cadence"
+                    },
+                );
+            }
+            return;
+        }
+        if state.policy.mode == Mode::Adaptive
+            && cpu_pressure
+            && Self::can_change(state).is_ok()
+            && current.pressure.as_deref() == Some("normal")
+        {
+            let rec = state
+                .recommendations
+                .iter()
+                .find(|r| r.applicable && r.status == "pending")
+                .cloned();
+            if let Some(mut rec) = rec {
+                rec.status = "appliedAutomatically".into();
+                match self.start(state, state.policy.scan_interval_ms, now, Some(&rec)) {
+                    Ok(()) => {
+                        if let Some(item) =
+                            state.recommendations.iter_mut().find(|r| r.id == rec.id)
+                        {
+                            *item = rec;
+                        }
+                    }
+                    Err(error) => {
+                        state.status = Some(error);
+                        state.consent_required = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitoring::{CpuMetrics, HardwareInfo, MemoryMetrics};
+
+    fn setup() -> (
+        tempfile::TempDir,
+        Arc<Database>,
+        Arc<MemoryEngine>,
+        IntelligenceEngine,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_at_path(dir.path().join("intelligence.sqlite")).unwrap());
+        let memory = Arc::new(MemoryEngine::new(Arc::clone(&db)));
+        let intelligence = IntelligenceEngine::new(Arc::clone(&db), Arc::clone(&memory));
+        (dir, db, memory, intelligence)
+    }
+
+    fn snapshot() -> SystemSnapshot {
+        SystemSnapshot {
+            collected_at: Utc::now().to_rfc3339(),
+            monitoring: true,
+            cpu: CpuMetrics {
+                name: "test CPU".into(),
+                vendor: "test".into(),
+                architecture: None,
+                physical_cores: Some(2),
