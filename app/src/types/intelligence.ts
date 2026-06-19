@@ -46,3 +46,20 @@ export interface Anomaly {
   explanation: string
 }
 
+export interface Recommendation {
+  id: string
+  createdAt: number
+  resource: string
+  problem: string
+  evidence: string[]
+  action: string
+  benefit: string
+  risk: string
+  confidence: string
+  requiresApproval: boolean
+  applicable: boolean
+  severity: Severity
+  status: string
+}
+
+export interface ResourceAction {
