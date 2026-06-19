@@ -79,3 +79,19 @@ export interface ResourceState {
   policy: ResourcePolicy
   monitoring: boolean
   historyEnabled: boolean
+  latest: Observation | null
+  health: string
+  insights: string[]
+  status: string | null
+  activeIntervalMs: number | null
+  recommendations: Recommendation[]
+  forecasts: Forecast[]
+  anomalies: Anomaly[]
+}
+
+export interface ResourceHistory {
+  observations: Observation[]
+  comparisons: Forecast[]
+  actions: ResourceAction[]
+  decisions: Recommendation[]
+}
