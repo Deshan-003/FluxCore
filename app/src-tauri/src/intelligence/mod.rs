@@ -501,3 +501,104 @@ impl IntelligenceEngine {
         if forecast_due {
             state.forecasts = current
                 .values
+                .keys()
+                .filter(|key| analysis::forecast_metric(key))
+                .flat_map(|key| {
+                    statistics::forecasts(&state.rows, key, &state.policy.horizon_minutes)
+                })
+                .collect();
+            state.forecast_at = Some(at);
+        } else {
+            state
+                .forecasts
+                .retain(|forecast| current.values.contains_key(&forecast.metric));
+        }
+        let candidate = (state.policy.scan_interval_ms
+            > self.memory.config().process_scan_interval_ms
+            && state.history_enabled)
+            .then_some(state.policy.scan_interval_ms);
+        let mut findings = analysis::findings(
+            &current,
+            snapshot,
+            memory.as_ref(),
+            &state.detector.active(),
+            &state.forecasts,
+            candidate,
+        );
+        let mut new = Vec::new();
+        for rec in &mut findings.recommendations {
+            let prefix = format!("{}@", rec.id);
+            if let Some(previous) = state
+                .recommendations
+                .iter()
+                .find(|r| r.id.starts_with(&prefix))
+            {
+                rec.id.clone_from(&previous.id);
+                rec.created_at = previous.created_at;
+                rec.status.clone_from(&previous.status);
+            } else {
+                rec.id = format!("{prefix}{at}");
+                new.push(rec.clone());
+            }
+        }
+        state.recommendations = findings.recommendations;
+        state.health = findings.health;
+        state.insights = findings.insights;
+        if state.history_enabled {
+            let cleanup = state
+                .cleanup_at
+                .is_none_or(|last| at - last >= 3600 || at < last);
+            match storage::sample(
+                &self.db,
+                &current,
+                if forecast_due { &state.forecasts } else { &[] },
+                &changes,
+                &new,
+                cleanup,
+            ) {
+                Ok(()) => {
+                    if cleanup {
+                        state.cleanup_at = Some(at);
+                    }
+                    if !state.consent_required {
+                        state.status = None;
+                    }
+                }
+                Err(error) => {
+                    state.status = Some(error);
+                    state.consent_required = true;
+                    let _ = self.finish(&mut state, at, "reverted", "Local history unavailable");
+                }
+            }
+        }
+        state.latest = Some(current.clone());
+        self.manage(&mut state, &current, findings.cpu_pressure);
+    }
+
+    fn manage(&self, state: &mut State, current: &Observation, cpu_pressure: bool) {
+        let now = current.at;
+        if let Some(running) = state.running.as_mut() {
+            if current
+                .pressure
+                .as_deref()
+                .is_none_or(|p| p == "high" || p == "critical")
+            {
+                let _ = self.finish(
+                    state,
+                    now,
+                    "reverted",
+                    "Memory pressure is high or unavailable; detailed scans take priority",
+                );
+                return;
+            }
+            let expired = Instant::now() >= running.expires;
+            if running.action.outcome.is_none() && now - running.action.at >= EVALUATE_SECONDS {
+                let after: Vec<_> = state
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.at > running.action.at && row.at <= running.action.at + LEASE_SECONDS
+                    })
+                    .cloned()
+                    .collect();
+                let outcome = analysis::evaluate(&running.action.before, &after);
