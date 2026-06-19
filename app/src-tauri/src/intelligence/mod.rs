@@ -803,3 +803,104 @@ mod tests {
                 benefit: "May reduce FluxCore scan overhead".into(),
                 risk: "Process details update less often".into(),
                 confidence: "moderate".into(),
+                requires_approval: true,
+                applicable: true,
+                severity: Severity::Low,
+                status: "pending".into(),
+            });
+        }
+        assert!(intelligence
+            .respond("scan@test", Decision::Apply, false)
+            .is_err());
+        intelligence
+            .respond("scan@test", Decision::Apply, true)
+            .unwrap();
+        assert_eq!(
+            intelligence.state().unwrap().active_interval_ms,
+            Some(15_000)
+        );
+        let action = storage::records::<Action>(&db, "action", 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(action.recommendation.as_deref(), Some("scan@test"));
+        assert_eq!(action.status, "applied");
+        intelligence.revert(&action.id).unwrap();
+    }
+
+    #[test]
+    fn adaptive_mode_requires_confirmation_and_stale_measurements_block_actions() {
+        let (_dir, _db, _memory, intelligence) = setup();
+        let policy = Policy {
+            mode: Mode::Adaptive,
+            ..Policy::default()
+        };
+        assert!(intelligence.configure(policy.clone(), false).is_err());
+        intelligence.configure(policy, true).unwrap();
+        intelligence.collection_status(true, true);
+        let mut snapshot = snapshot();
+        snapshot.collected_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        intelligence.memory.tick(&snapshot);
+        intelligence.tick(&snapshot);
+        assert!(intelligence.manual(true).is_err());
+    }
+
+    #[test]
+    fn restart_marks_an_unfinished_override_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.sqlite");
+        let db = Arc::new(Database::open_at_path(path.clone()).unwrap());
+        let memory = Arc::new(MemoryEngine::new(Arc::clone(&db)));
+        let intelligence = IntelligenceEngine::new(Arc::clone(&db), Arc::clone(&memory));
+        intelligence
+            .configure(
+                Policy {
+                    mode: Mode::Manual,
+                    ..Policy::default()
+                },
+                false,
+            )
+            .unwrap();
+        intelligence.collection_status(true, true);
+        let snapshot = snapshot();
+        intelligence.memory.tick(&snapshot);
+        intelligence.tick(&snapshot);
+        intelligence.manual(true).unwrap();
+        let running = storage::records::<Action>(&db, "action", 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(running.status, "applied");
+        assert_eq!(
+            intelligence.state().unwrap().active_interval_ms,
+            Some(15_000)
+        );
+        drop(intelligence);
+        drop(memory);
+        drop(db);
+
+        let db = Arc::new(Database::open_at_path(path).unwrap());
+        let memory = Arc::new(MemoryEngine::new(Arc::clone(&db)));
+        let intelligence = IntelligenceEngine::new(Arc::clone(&db), Arc::clone(&memory));
+        let action = storage::records::<Action>(&db, "action", 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(action.id, running.id);
+        assert_eq!(action.status, "interrupted");
+        assert!(action.ended_at.is_some());
+        assert_eq!(intelligence.state().unwrap().active_interval_ms, None);
+    }
+
+    #[test]
+    fn disabling_monitoring_clears_the_live_view_and_fails_closed() {
+        let (_dir, _db, _memory, intelligence) = setup();
+        intelligence.collection_status(true, true);
+        let snapshot = snapshot();
+        intelligence.memory.tick(&snapshot);
+        intelligence.tick(&snapshot);
+        assert!(intelligence.state().unwrap().latest.is_some());
+        intelligence.collection_status(false, true);
+        let state = intelligence.state().unwrap();
+        assert!(state.latest.is_none());
+        assert!(state.forecasts.is_empty());
+        assert_eq!(state.health, "Waiting for live measurements");
+    }
+}
