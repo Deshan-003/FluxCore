@@ -32,3 +32,14 @@ export const useResourceStore = create<ResourceStore>((set, get) => ({
     if (get().busy) return false
     ++request
     set({ busy: true, error: null })
+    try {
+      await operation()
+      set({ busy: false })
+      await get().refresh()
+      return true
+    } catch (error) {
+      set({ busy: false, error: String(error) })
+      return false
+    }
+  },
+}))
