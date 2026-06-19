@@ -703,3 +703,103 @@ mod tests {
                 vendor: "test".into(),
                 architecture: None,
                 physical_cores: Some(2),
+                logical_processors: 4,
+                usage_percent: Some(30.0),
+                frequency_mhz: None,
+                max_frequency_mhz: None,
+                temperature_c: None,
+                cores: vec![],
+            },
+            memory: MemoryMetrics {
+                total_bytes: 8 * 1024u64.pow(3),
+                used_bytes: 4 * 1024u64.pow(3),
+                available_bytes: 4 * 1024u64.pow(3),
+                free_bytes: None,
+                usage_percent: Some(50.0),
+                cached_bytes: None,
+                committed_bytes: None,
+                commit_limit_bytes: None,
+                pagefile_used_bytes: None,
+                pagefile_total_bytes: None,
+            },
+            gpus: vec![],
+            storage: vec![],
+            processes: vec![],
+            hardware: HardwareInfo {
+                os_name: "test OS".into(),
+                os_version: "test".into(),
+                host_name: "test host".into(),
+                gpus: vec![],
+            },
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn manual_policy_is_explicit_reversible_bounded_and_persisted() {
+        let (_dir, db, _memory, intelligence) = setup();
+        let mut policy = Policy {
+            mode: Mode::Manual,
+            ..Policy::default()
+        };
+        policy.cooldown_seconds = 180;
+        intelligence.configure(policy.clone(), false).unwrap();
+        intelligence.collection_status(true, true);
+        let snapshot = snapshot();
+        let epoch = DateTime::parse_from_rfc3339(&snapshot.collected_at)
+            .unwrap()
+            .timestamp();
+        intelligence.memory.tick(&snapshot);
+        intelligence.tick(&snapshot);
+        assert!(intelligence.manual(false).is_err());
+        assert!(intelligence.manual(true).is_ok());
+        let state = intelligence.state().unwrap();
+        let action = storage::records::<Action>(&db, "action", 2)
+            .unwrap()
+            .remove(0);
+        assert_eq!(state.active_interval_ms, Some(policy.scan_interval_ms));
+        assert_eq!(action.previous_interval_ms, Some(5000));
+        assert_eq!(action.ended_at, None);
+        assert!(action.at >= epoch - 1 && action.at <= Utc::now().timestamp());
+        intelligence.revert(&action.id).unwrap();
+        assert_eq!(intelligence.state().unwrap().active_interval_ms, None);
+        let action = storage::records::<Action>(&db, "action", 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(action.status, "reverted");
+        assert!(action.ended_at.is_some());
+        assert_eq!(storage::policy(&db).unwrap().mode, Mode::Manual);
+    }
+
+    #[test]
+    fn smart_assist_approval_requires_confirmation_for_a_supported_action() {
+        let (_dir, db, _memory, intelligence) = setup();
+        intelligence
+            .configure(
+                Policy {
+                    mode: Mode::SmartAssist,
+                    ..Policy::default()
+                },
+                false,
+            )
+            .unwrap();
+        intelligence.collection_status(true, true);
+        let now = Utc::now().timestamp();
+        {
+            let mut state = intelligence.state.lock().unwrap();
+            state.latest = Some(Observation {
+                at: now,
+                values: [("cpu".into(), 95.0)].into(),
+                pressure: Some("normal".into()),
+                ..Default::default()
+            });
+            state.recommendations.push(Recommendation {
+                id: "scan@test".into(),
+                created_at: now,
+                resource: "Monitoring".into(),
+                problem: "Optional process scans compete for CPU time".into(),
+                evidence: vec!["Sustained CPU pressure".into()],
+                action: "Reduce optional process scan frequency".into(),
+                benefit: "May reduce FluxCore scan overhead".into(),
+                risk: "Process details update less often".into(),
+                confidence: "moderate".into(),
