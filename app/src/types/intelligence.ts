@@ -63,3 +63,19 @@ export interface Recommendation {
 }
 
 export interface ResourceAction {
+  id: string
+  at: number
+  mode: ResourceMode
+  intervalMs: number
+  previousIntervalMs: number | null
+  before: Observation[]
+  outcome: { verdict: string; detail: string; before: Record<string, number>; after: Record<string, number> } | null
+  endedAt: number | null
+  status: string
+  detail: string
+}
+
+export interface ResourceState {
+  policy: ResourcePolicy
+  monitoring: boolean
+  historyEnabled: boolean
