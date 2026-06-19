@@ -30,3 +30,19 @@ export interface Forecast {
   observationSeconds: number
   coverage: number
   confidence: string
+  method: string
+  explanation: string
+}
+
+export interface Anomaly {
+  id: string
+  metric: string
+  startedAt: number
+  endedAt: number | null
+  resolution: string | null
+  severity: Severity
+  value: number
+  threshold: number
+  explanation: string
+}
+
