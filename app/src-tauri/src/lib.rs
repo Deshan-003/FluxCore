@@ -1,5 +1,6 @@
 pub mod database;
 pub mod gpu_engine;
+pub mod intelligence;
 pub mod memory_engine;
 pub mod monitoring;
 
@@ -8,7 +9,9 @@ use memory_engine::models::{
     OptimizationMode, PolicyConfig,
 };
 use memory_engine::MemoryEngine;
-use monitoring::{HardwareCheckReport, HistoryPoint, MonitorEngine, MonitoringSettings, SystemSnapshot};
+use monitoring::{
+    HardwareCheckReport, HistoryPoint, MonitorEngine, MonitoringSettings, SystemSnapshot,
+};
 use std::sync::Arc;
 use tauri::{Manager, State};
 
@@ -22,6 +25,7 @@ struct AppState {
     engine: Arc<MonitorEngine>,
     memory: Arc<MemoryEngine>,
     gpu: Arc<gpu_engine::GpuEngine>,
+    intelligence: Arc<intelligence::IntelligenceEngine>,
 }
 
 #[tauri::command]
@@ -50,13 +54,20 @@ fn check_hardware(state: State<'_, AppState>) -> Result<HardwareCheckReport, Str
 }
 
 #[tauri::command]
-fn get_memory_intelligence(state: State<'_, AppState>) -> Result<MemoryIntelligenceSnapshot, String> {
+fn get_memory_intelligence(
+    state: State<'_, AppState>,
+) -> Result<MemoryIntelligenceSnapshot, String> {
     state.memory.intelligence()
 }
 
 #[tauri::command]
-fn get_memory_history_series(limit: Option<usize>, state: State<'_, AppState>) -> Result<MemoryHistorySeries, String> {
-    state.memory.history_series(limit.unwrap_or(720).clamp(1, 5000))
+fn get_memory_history_series(
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<MemoryHistorySeries, String> {
+    state
+        .memory
+        .history_series(limit.unwrap_or(720).clamp(1, 5000))
 }
 
 #[tauri::command]
@@ -90,7 +101,10 @@ fn get_memory_policy_config(state: State<'_, AppState>) -> Result<PolicyConfig, 
 }
 
 #[tauri::command]
-fn update_memory_policy_config(config: PolicyConfig, state: State<'_, AppState>) -> Result<(), String> {
+fn update_memory_policy_config(
+    config: PolicyConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     state.memory.set_config(config)
 }
 
@@ -137,7 +151,10 @@ fn list_gpu_providers(state: State<'_, AppState>) -> Result<Vec<ProviderStatus>,
 }
 
 #[tauri::command]
-fn probe_gpu_providers(force: bool, state: State<'_, AppState>) -> Result<Vec<ProviderStatus>, String> {
+fn probe_gpu_providers(
+    force: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProviderStatus>, String> {
     Ok(state.gpu.probe(force))
 }
 
@@ -218,14 +235,76 @@ fn get_gpu_environment(state: State<'_, AppState>) -> Result<AccelerationEnviron
     Ok(state.gpu.environment())
 }
 
+#[tauri::command]
+fn get_resource_intelligence(
+    state: State<'_, AppState>,
+) -> Result<intelligence::models::ResourceState, String> {
+    state.intelligence.state()
+}
+
+#[tauri::command]
+fn get_resource_history(
+    metric: String,
+    horizon: i64,
+    state: State<'_, AppState>,
+) -> Result<intelligence::models::ResourceHistory, String> {
+    state.intelligence.history(&metric, horizon)
+}
+
+#[tauri::command]
+fn configure_resource_intelligence(
+    policy: intelligence::models::Policy,
+    confirmed: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.intelligence.configure(policy, confirmed)
+}
+
+#[tauri::command]
+fn respond_to_resource_recommendation(
+    id: String,
+    decision: intelligence::Decision,
+    confirmed: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.intelligence.respond(&id, decision, confirmed)
+}
+
+#[tauri::command]
+fn apply_resource_policy(confirmed: bool, state: State<'_, AppState>) -> Result<(), String> {
+    state.intelligence.manual(confirmed)
+}
+
+#[tauri::command]
+fn revert_resource_policy(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.intelligence.revert(&id)
+}
+
 pub fn run() {
     let database =
         Arc::new(database::Database::open().expect("failed to initialize FluxCore local database"));
     let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
-    let engine = Arc::new(MonitorEngine::new(Arc::clone(&database), Arc::clone(&memory)));
-    let gpu = Arc::new(gpu_engine::GpuEngine::new(Arc::clone(&database), Arc::clone(&engine)));
+    let intelligence = Arc::new(intelligence::IntelligenceEngine::new(
+        Arc::clone(&database),
+        Arc::clone(&memory),
+    ));
+    let engine = Arc::new(MonitorEngine::with_intelligence(
+        Arc::clone(&database),
+        Arc::clone(&memory),
+        Some(Arc::clone(&intelligence)),
+    ));
+    let gpu = Arc::new(gpu_engine::GpuEngine::new(
+        Arc::clone(&database),
+        Arc::clone(&engine),
+    ));
+    intelligence.attach_gpu(&gpu);
     tauri::Builder::default()
-        .manage(AppState { engine, memory, gpu })
+        .manage(AppState {
+            engine,
+            memory,
+            gpu,
+            intelligence,
+        })
         .setup(|app| {
             let state = app.state::<AppState>();
             state.engine.set_app_handle(app.handle().clone());
@@ -263,7 +342,13 @@ pub fn run() {
             run_benchmark,
             get_benchmark_history,
             clear_benchmark_history,
-            get_gpu_environment
+            get_gpu_environment,
+            get_resource_intelligence,
+            get_resource_history,
+            configure_resource_intelligence,
+            respond_to_resource_recommendation,
+            apply_resource_policy,
+            revert_resource_policy
         ])
         .run(tauri::generate_context!())
         .expect("error while running FluxCore");
