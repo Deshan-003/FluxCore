@@ -14,3 +14,19 @@ export interface ResourcePolicy {
 export interface Observation {
   at: number
   values: Record<string, number>
+  pressure: string | null
+}
+
+export interface Forecast {
+  metric: string
+  observedAt: number
+  targetAt: number
+  horizonMinutes: number
+  value: number | null
+  low: number | null
+  high: number | null
+  actual: number | null
+  samples: number
+  observationSeconds: number
+  coverage: number
+  confidence: string
