@@ -135,3 +135,30 @@ fn main() {
             ),
             None => println!("[footprint] unavailable on this platform"),
         },
+    }
+
+    match intelligence.state() {
+        Ok(state) => println!(
+            "[engine] serving live intelligence: health=\"{}\" forecasts={} anomalies={} recommendations={}",
+            state.health,
+            state.forecasts.len(),
+            state.anomalies.len(),
+            state.recommendations.len()
+        ),
+        Err(error) => println!("[engine] intelligence state unavailable: {error}"),
+    }
+
+    drop(intelligence);
+    drop(memory);
+    drop(database);
+    let removed = [
+        db_path.clone(),
+        db_path.with_extension("sqlite-wal"),
+        db_path.with_extension("sqlite-shm"),
+    ]
+    .iter()
+    .map(|path| std::fs::remove_file(path).map(|_| 1).unwrap_or(0))
+    .sum::<u32>();
+    println!("--------------------------------------------------------------------------------");
+    println!("benchmark database removed ({removed} file(s)); no system state was modified");
+}
