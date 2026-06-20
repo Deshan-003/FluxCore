@@ -73,3 +73,27 @@ function PolicyView({ data, onChange, onManual, busy }: { data: ResourceState; o
   const [draft, setDraft] = useState<Partial<ResourcePolicy>>({})
   const [horizons, setHorizons] = useState<string | null>(null)
   const policy = { ...data.policy, ...draft }
+  const disabled = busy || !data.monitoring || !data.historyEnabled || !!data.status
+  const update = async (next: ResourcePolicy) => { if (await onChange(next)) { setDraft({}); setHorizons(null) } }
+  return <Panel title="Adaptive optimization" icon={SlidersHorizontal}>
+    <Detail label="Active mode" value={modes[data.policy.mode]} />
+    <Detail label="Policy status" value={data.policy.paused ? 'Paused' : data.activeIntervalMs ? `Temporary scan minimum: ${data.activeIntervalMs / 1000} s` : disabled ? 'Actions unavailable' : 'No active override'} />
+    <form onSubmit={(e) => { e.preventDefault(); void update({ ...policy, horizonMinutes: (horizons ?? policy.horizonMinutes.join(',')).split(',').map((n) => Number(n.trim())) }) }}>
+      <SettingRow title="Optimization mode" description="Adaptive Optimization must be explicitly enabled. Analysis continues in all modes."><select aria-label="Optimization mode" className="setting-select" value={policy.mode} onChange={(e) => setDraft({ ...draft, mode: e.target.value as ResourceMode })}>{Object.entries(modes).map(([value, name]) => <option value={value} key={value}>{name}</option>)}</select></SettingRow>
+      <SettingRow title="Minimum scan interval" description="Affects detailed FluxCore memory-process scans only; it does not slow hardware collection."><input className="setting-select" aria-label="Minimum scan interval in seconds" type="number" min={5} max={60} required value={policy.scanIntervalMs / 1000} onChange={(e) => setDraft({ ...draft, scanIntervalMs: Number(e.target.value) * 1000 })} /></SettingRow>
+      <SettingRow title="Maximum scan interval" description="Upper limit for the temporary policy (60 seconds maximum)."><input className="setting-select" aria-label="Maximum scan interval in seconds" type="number" min={5} max={60} required value={policy.maxScanIntervalMs / 1000} onChange={(e) => setDraft({ ...draft, maxScanIntervalMs: Number(e.target.value) * 1000 })} /></SettingRow>
+      <SettingRow title="Cooldown" description="Minimum time before another change may be applied."><input className="setting-select" aria-label="Cooldown in seconds" type="number" min={180} max={3600} required value={policy.cooldownSeconds} onChange={(e) => setDraft({ ...draft, cooldownSeconds: Number(e.target.value) })} /></SettingRow>
+      <SettingRow title="Forecast horizons" description="Up to three ascending comma-separated values from 1 to 15 minutes."><input className="setting-select" aria-label="Forecast horizons in minutes" value={horizons ?? policy.horizonMinutes.join(', ')} onChange={(e) => setHorizons(e.target.value)} /></SettingRow>
+      <div className="intelligence-controls"><button className="diagnostic-button" disabled={busy}>{policy.mode === 'adaptive' && data.policy.mode !== 'adaptive' ? 'Enable Adaptive Optimization' : 'Save policy'}</button>
+        <button className="diagnostic-button" type="button" disabled={busy} onClick={() => void update({ ...data.policy, paused: !data.policy.paused })}>{data.policy.paused ? 'Resume policy' : 'Pause policy'}</button>
+        <button className="diagnostic-button" type="button" disabled={busy} onClick={() => void update(defaultPolicy)}>Reset policy</button>
+        {data.policy.mode === 'manual' && <button className="diagnostic-button" type="button" disabled={disabled || data.policy.paused || !!data.activeIntervalMs} onClick={onManual}>Apply saved scan interval</button>}
+      </div>
+    </form>
+    <SensorNotice text="An override expires after three minutes. High memory pressure takes priority. CPU scheduling, GPU mode, concurrency, and VRAM budgets are not changed here; GPU Acceleration retains its own controls." />
+  </Panel>
+}
+
+export default function ResourceIntelligencePage() {
+  const { data, history, error, busy, refresh, change } = useResourceStore()
+  const [section, setSection] = useState<(typeof sections)[number]>('System health')
