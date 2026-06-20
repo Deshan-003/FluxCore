@@ -97,3 +97,28 @@ function PolicyView({ data, onChange, onManual, busy }: { data: ResourceState; o
 export default function ResourceIntelligencePage() {
   const { data, history, error, busy, refresh, change } = useResourceStore()
   const [section, setSection] = useState<(typeof sections)[number]>('System health')
+  const [metric, setMetric] = useState('cpu')
+  const [horizonChoice, setHorizon] = useState(1)
+  const [workloads, setWorkloads] = useState<SuitabilityAssessment[] | null>(null)
+  const [gpuError, setGpuError] = useState<string | null>(null)
+  const [gpuBusy, setGpuBusy] = useState(false)
+  const horizon = data?.policy.horizonMinutes.includes(horizonChoice) ? horizonChoice : data?.policy.horizonMinutes[0] ?? 1
+  const loadHistory = section === 'History' || section === 'Forecasts'
+  useEffect(() => {
+    const read = () => { if (!document.hidden) void (loadHistory ? refresh(metric, horizon) : refresh()) }
+    read()
+    const timer = window.setInterval(read, 15_000)
+    document.addEventListener('visibilitychange', read)
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', read) }
+  }, [loadHistory, metric, horizon, refresh])
+  const currentHistory = history?.key === `${metric}@${horizon}` ? history.data : null
+  if (!data) return <Panel title="System intelligence" icon={BrainCircuit}><EmptyState title="Waiting for resource intelligence" detail={error ?? 'Open the desktop app and wait for the first sample.'} /></Panel>
+  const values = data.latest?.values ?? {}
+  const applyAllowed = data.monitoring && data.historyEnabled && !data.policy.paused && !data.activeIntervalMs && !data.status
+  const gpuAdvice = async () => {
+    setGpuBusy(true); setGpuError(null)
+    try { setWorkloads(await getWorkloadRecommendations()) } catch (error) { setGpuError(String(error)) } finally { setGpuBusy(false) }
+  }
+  return <div className="page-main wide-page intelligence-page">
+    <nav className="intelligence-controls" aria-label="Resource Intelligence sections">{sections.map((name) => <button className="diagnostic-button" aria-pressed={section === name} key={name} onClick={() => setSection(name)}>{name}</button>)}</nav>
+    {(error || data.status) && <p className="inline-warning" role="alert">{error ?? data.status}</p>}
