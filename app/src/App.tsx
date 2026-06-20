@@ -8,10 +8,12 @@ import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { useMonitoringStore } from './stores/monitoring'
+import { useResourceStore } from './stores/intelligence'
 import { useMemoryStore } from './stores/memory'
 import MemoryIntelligencePage from './pages/MemoryIntelligence'
 import OptimizationCenterPage from './pages/OptimizationCenter'
 import GpuAccelerationPage from './pages/GpuAcceleration'
+import ResourceIntelligencePage from './pages/ResourceIntelligence'
 import {
   Detail, EmptyState, GpuMetric, Panel, ResourceBar, SensorNotice, SettingRow, Toggle,
 } from './components/monitoring'
@@ -24,6 +26,7 @@ import './App.css'
 type NavItem = { label: string; icon: LucideIcon; group: string }
 const NAV: NavItem[] = [
   { label: 'Overview', icon: LayoutDashboard, group: 'WORKSPACE' },
+  { label: 'Resource Intelligence', icon: BrainCircuit, group: 'WORKSPACE' },
   { label: 'CPU', icon: Cpu, group: 'MONITORS' },
   { label: 'Memory', icon: MemoryStick, group: 'MONITORS' },
   { label: 'GPU', icon: MonitorCog, group: 'MONITORS' },
@@ -150,6 +153,15 @@ function App() {
   const [clock, setClock] = useState(new Date())
   useEffect(() => { void initialize() }, [initialize])
   useEffect(() => {
+    const visible = page === 'Resource Intelligence' && !document.hidden
+    if (status === 'connected') void useResourceStore.getState().refresh()
+    if (!visible) return
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void useResourceStore.getState().refresh()
+    }, 15000)
+    return () => window.clearInterval(timer)
+  }, [page, status])
+  useEffect(() => {
     if (status !== 'connected') return
     const timer = window.setInterval(() => void memoryRefresh(), Math.max(2000, settings.refreshIntervalMs))
     void memoryRefresh()
@@ -179,6 +191,7 @@ function App() {
     return () => media?.removeEventListener('change', resolve)
   }, [settings.theme])
   const pageContent = useMemo(() => {
+    if (page === 'Resource Intelligence' && status === 'connected') return <ResourceIntelligencePage />
     if (!snapshot) return <div className="content-empty"><EmptyState title={status === 'web-preview' ? 'Open FluxCore for Windows' : status === 'error' ? 'Monitoring engine unavailable' : 'Connecting to Windows monitoring'} detail={error ?? 'Waiting for the first hardware sample.'} /></div>
     switch (page) {
       case 'CPU': return <CpuPage cpu={snapshot.cpu} history={history} />
