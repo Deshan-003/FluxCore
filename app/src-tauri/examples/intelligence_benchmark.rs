@@ -25,3 +25,31 @@ use fluxcore_lib::monitoring::benchmark_intelligence;
 
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// Resident/peak footprint from /proc on non-Windows platforms, in MiB.
+#[cfg(not(windows))]
+fn linux_footprint_mib() -> Option<(f64, f64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = |key: &str| {
+        status
+            .lines()
+            .find(|line| line.starts_with(key))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    Some((kb("VmRSS:")? as f64 / 1024.0, kb("VmHWM:")? as f64 / 1024.0))
+}
+
+#[cfg(windows)]
+fn linux_footprint_mib() -> Option<(f64, f64)> {
+    None
+}
+
+fn main() {
+    let iterations: u32 = std::env::args()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20)
+        .clamp(2, 40);
+
