@@ -122,3 +122,28 @@ export default function ResourceIntelligencePage() {
   return <div className="page-main wide-page intelligence-page">
     <nav className="intelligence-controls" aria-label="Resource Intelligence sections">{sections.map((name) => <button className="diagnostic-button" aria-pressed={section === name} key={name} onClick={() => setSection(name)}>{name}</button>)}</nav>
     {(error || data.status) && <p className="inline-warning" role="alert">{error ?? data.status}</p>}
+    {!data.monitoring && <SensorNotice text="Monitoring is paused or still initializing. Resource readings will resume with the next live collection." />}
+    {data.monitoring && !data.historyEnabled && <SensorNotice text="Local history is off. Analysis uses only in-memory observations; optimization actions and persisted forecast comparisons are disabled." />}
+    {section === 'System health' && <><Panel title={data.health} icon={BrainCircuit}>
+      <p className="muted-note">{data.latest ? `Observed ${localTime(data.latest.at)} · Local statistical analysis` : 'No current sample'}</p>
+      {data.insights.map((insight) => <p className="section-description" key={insight}>{insight}</p>)}
+      <div className="intelligence-readings">{['cpu', 'corePeak', 'cpuMHz', 'cpuTemp', 'ram', 'ramAvailable', 'commit', 'pagefileBytes', 'pageReads'].map((key) => <Detail key={key} label={metricLabel(key)} value={reading(key, values[key])} />)}
+      <Detail label="Memory pressure" value={data.latest?.pressure ? readable(data.latest.pressure) : 'Unavailable'} />
+      {['gpu:', 'vram:', 'disk:'].filter((prefix) => !Object.keys(values).some((key) => key.startsWith(prefix))).map((prefix) => <Detail key={prefix} label={metricLabel(prefix.slice(0, -1))} value="Unavailable" />)}
+      {Object.keys(values).filter((key) => key.includes(':')).map((key) => <Detail key={key} label={metricLabel(key)} value={reading(key, values[key])} />)}</div>
+    </Panel><Panel title="Highlights" icon={Activity}>
+      <Detail label="Active anomalies" value={String(data.anomalies.filter((a) => a.endedAt == null).length)} />
+      <Detail label="Pending recommendations" value={String(data.recommendations.filter((r) => r.status === 'pending').length)} />
+      {data.forecasts.filter((f) => f.value != null && f.horizonMinutes === data.policy.horizonMinutes[0] && ['cpu', 'ram', 'commit'].includes(f.metric)).map((f) => <Detail key={f.metric} label={`${metricLabel(f.metric)} · ${f.horizonMinutes} min estimate`} value={`${reading(f.metric, f.value)} (${f.confidence} confidence)`} />)}
+    </Panel></>}
+    {section === 'Forecasts' && <ForecastView data={data} history={currentHistory} metric={metric} setMetric={setMetric} horizon={horizon} setHorizon={setHorizon} />}
+    {section === 'Recommendations' && <><Panel title="Optimization recommendations" icon={Lightbulb}>
+      {!data.recommendations.length && <EmptyState title="No active recommendations" detail="FluxCore needs supporting measurements before it suggests a change." />}
+      {data.recommendations.map((rec) => <article className="intelligence-record" key={rec.id}>
+        <h3>{rec.problem}</h3><p className="muted-note">{rec.resource} · {readable(rec.severity)} · {rec.confidence} confidence · {readable(rec.status)}</p>
+        <ul>{rec.evidence.map((fact, i) => <li key={i}>{fact}</li>)}</ul><p>{rec.action}</p>
+        <details><summary>Benefit, risks and approval</summary><p>{rec.benefit} {rec.risk}</p><p>{rec.requiresApproval ? 'Smart Assist requires your approval; Adaptive can act only after opt-in.' : 'Guidance only; FluxCore will not act on this recommendation.'}</p></details>
+        {rec.status === 'pending' && <div className="intelligence-controls">
+          {rec.applicable && data.policy.mode === 'smartAssist' && <button className="diagnostic-button" disabled={busy || !applyAllowed} onClick={() => { if (window.confirm('Apply this temporary FluxCore scan interval?')) void change(() => respondToResourceRecommendation(rec.id, 'apply', true)) }}>Approve & apply</button>}
+          <button className="diagnostic-button" disabled={busy} onClick={() => void change(() => respondToResourceRecommendation(rec.id, 'reject'))}>Reject</button>
+          <button className="diagnostic-button" disabled={busy} onClick={() => void change(() => respondToResourceRecommendation(rec.id, 'dismiss'))}>Dismiss</button>
