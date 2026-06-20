@@ -53,3 +53,30 @@ fn main() {
         .unwrap_or(20)
         .clamp(2, 40);
 
+    println!("FluxCore Phase 4 benchmark — {iterations} sampled observations per pass");
+    println!("--------------------------------------------------------------------------------");
+
+    let db_path = std::env::temp_dir().join(format!(
+        "fluxcore-intelligence-benchmark-{}.sqlite",
+        std::process::id()
+    ));
+    let database = Arc::new(
+        Database::open_at_path(db_path.clone()).expect("failed to open benchmark database"),
+    );
+    let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
+    memory.set_dashboard_active(true);
+    let intelligence = IntelligenceEngine::new(Arc::clone(&database), Arc::clone(&memory));
+
+    let result = benchmark_intelligence(iterations, &memory, &intelligence);
+
+    println!(
+        "[phase 1] collector pass            avg {:>9} μs",
+        result.collect_us
+    );
+    println!(
+        "[phase 2] memory engine tick        avg {:>9} μs",
+        result.memory_tick_us
+    );
+    println!(
+        "[phase 4] analysis-only sample      avg {:>9} μs   (no SQLite write)",
+        result.analysis_us
