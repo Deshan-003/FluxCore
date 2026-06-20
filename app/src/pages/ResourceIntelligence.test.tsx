@@ -36,3 +36,15 @@ describe('Resource Intelligence', () => {
     expect(screen.getByText('CPU utilization').parentElement?.textContent).toContain('94.0%')
     fireEvent.click(screen.getByRole('button', { name: 'Recommendations' }))
     fireEvent.click(screen.getByRole('button', { name: 'Approve & apply' }))
+    await waitFor(() => expect(respondToResourceRecommendation).toHaveBeenCalledWith('scan@1800000000', 'apply', true))
+    expect(window.confirm).toHaveBeenCalled()
+  })
+
+  it('does not offer adaptive actions without current monitoring and local history', () => {
+    useResourceStore.setState({ data: { ...state, historyEnabled: false } })
+    render(<ResourceIntelligencePage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Recommendations' }))
+    expect(screen.getByText(/Local history is off/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Approve & apply' })).toHaveProperty('disabled', true)
+  })
+})
