@@ -23,3 +23,16 @@ fn monitor_loop_feeds_the_intelligence_engine() {
         Arc::clone(&memory),
     ));
     let monitor = MonitorEngine::with_intelligence(
+        Arc::clone(&db),
+        Arc::clone(&memory),
+        Some(Arc::clone(&intelligence)),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(state) = intelligence.state() {
+            if state.monitoring {
+                if let Some(latest) = state.latest.as_ref() {
+                    assert!(!latest.values.is_empty(), "observation has no metrics");
+                    assert!(latest.at > 0, "observation must carry a UTC timestamp");
+                    assert!(!state.health.is_empty());
