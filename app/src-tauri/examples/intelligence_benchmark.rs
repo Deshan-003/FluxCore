@@ -80,3 +80,30 @@ fn main() {
     println!(
         "[phase 4] analysis-only sample      avg {:>9} μs   (no SQLite write)",
         result.analysis_us
+    );
+    println!(
+        "[phase 4] full sample + persistence avg {:>9} μs",
+        result.sample_us
+    );
+    println!(
+        "[phase 4] persistence delta         avg {:>9} μs   ({:.1}% of a full sample)",
+        result.persistence_us,
+        if result.sample_us > 0 {
+            result.persistence_us as f64 * 100.0 / result.sample_us as f64
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "[phase 4] gated tick (<15 s window) avg {:>9} μs   (paid on every monitoring tick)",
+        result.gate_us
+    );
+
+    let phase12 = result.collect_us.saturating_add(result.memory_tick_us);
+    let overhead = if phase12 > 0 {
+        result.sample_us as f64 * 100.0 / phase12 as f64
+    } else {
+        0.0
+    };
+    println!(
+        "[combined] Phase 4 overhead         {overhead:>8.1}% of the Phase 1+2 pipeline per sample"
