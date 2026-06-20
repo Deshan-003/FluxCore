@@ -106,7 +106,7 @@ export default function GpuAccelerationPage() {
       </div>
     )
   }
-  if (!state || !config || !draft) {
+  if (!state || !config) {
     return (
       <div className="gpu-page">
         <EmptyState title="Loading GPU engine" detail="Reading provider capabilities and resource budget…" />
