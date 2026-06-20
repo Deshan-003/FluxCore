@@ -147,3 +147,28 @@ export default function ResourceIntelligencePage() {
           {rec.applicable && data.policy.mode === 'smartAssist' && <button className="diagnostic-button" disabled={busy || !applyAllowed} onClick={() => { if (window.confirm('Apply this temporary FluxCore scan interval?')) void change(() => respondToResourceRecommendation(rec.id, 'apply', true)) }}>Approve & apply</button>}
           <button className="diagnostic-button" disabled={busy} onClick={() => void change(() => respondToResourceRecommendation(rec.id, 'reject'))}>Reject</button>
           <button className="diagnostic-button" disabled={busy} onClick={() => void change(() => respondToResourceRecommendation(rec.id, 'dismiss'))}>Dismiss</button>
+        </div>}
+      </article>)}
+    </Panel><Panel title="Supported CPU/GPU workloads" icon={Zap} action={<button className="diagnostic-button" disabled={gpuBusy} onClick={() => void gpuAdvice()}>{gpuBusy ? 'Checking…' : 'Assess workloads'}</button>}>
+      <p className="muted-note">The existing workload profiler evaluates built-in workloads at their default sizes. Recommendations do not accelerate unrelated applications or start tasks.</p>
+      {gpuError && <p role="alert">{gpuError}</p>}
+      {workloads?.map((w) => <article className="intelligence-record" key={w.workloadId}><h3>{readable(w.workloadId.replaceAll('_', ' '))}</h3><p>{readable(w.classification)} · {w.inputSize.toLocaleString()} input size · {readable(w.estimateSource)} evidence</p><p>{w.reason}</p><Detail label="Required VRAM / available VRAM" value={`${fmtBytes(w.requiredVramBytes)} / ${fmtBytes(w.availableVramBytes)}`} /></article>)}
+    </Panel></>}
+    {section === 'Adaptive controls' && <PolicyView data={data} busy={busy} onChange={(policy) => change(() => configureResourceIntelligence(policy, policy.mode === 'adaptive'))} onManual={() => { if (window.confirm('Apply your saved scan interval for up to three minutes?')) void change(applyResourcePolicy) }} />}
+    {section === 'Anomalies' && <Panel title="Resource anomalies" icon={ShieldCheck}>
+      {!data.anomalies.length && <EmptyState title="No detected anomalies" detail="Brief spikes are filtered out. Missing measurements are not interpreted as recovery." />}
+      {data.anomalies.map((a) => <article className="intelligence-record" key={a.id}><h3>{metricLabel(a.metric)}</h3><p className="muted-note">{readable(a.severity)} · {localDate(a.startedAt)} · {a.endedAt == null ? 'Active' : `Ended ${localDate(a.endedAt)}`}</p><p>{a.explanation} {a.resolution}</p><Detail label="Reading / detection threshold" value={`${reading(a.metric, a.value)} / ${reading(a.metric, a.threshold)}`} /><p>Review the associated workload and recommendations. This is not a security alert.</p></article>)}
+    </Panel>}
+    {section === 'History' && <><Panel title="Optimization history" icon={History} action={<button className="diagnostic-button" onClick={() => void refresh(metric, horizon)}>Refresh history</button>}>
+      {!currentHistory?.actions.length && <EmptyState title={currentHistory ? 'No recorded optimizations' : 'Loading history'} detail="Real policy changes and their evaluations appear here." />}
+      {currentHistory?.actions.map((action) => <article className="intelligence-record" key={action.id}>
+        <h3>Detailed process scan interval · {readable(action.status)}</h3><p className="muted-note">{localDate(action.at)} · {modes[action.mode]}</p><p>{action.detail}</p>
+        <Detail label="Phase 2 setting / temporary minimum" value={`${action.previousIntervalMs == null ? 'Unavailable' : `${action.previousIntervalMs / 1000} s`} / ${action.intervalMs / 1000} s`} />
+        {action.outcome ? <><p><strong>{readable(action.outcome.verdict)}:</strong> {action.outcome.detail}</p><details><summary>Before and after averages</summary>{Object.keys({ ...action.outcome.before, ...action.outcome.after }).sort().map((key) => <Detail key={key} label={metricLabel(key)} value={`${reading(key, action.outcome?.before[key])} → ${reading(key, action.outcome?.after[key])}`} />)}</details></> : <p className="muted-note">{action.before.length} baseline observations · {action.endedAt == null ? 'Evaluation pending' : 'No comparable post-action measurement was recorded'}</p>}
+        {action.endedAt == null && data.activeIntervalMs && <button className="diagnostic-button" disabled={busy} onClick={() => void change(() => revertResourcePolicy(action.id)).then((ok) => { if (ok) void refresh(metric, horizon) })}>Revert change</button>}
+      </article>)}
+    </Panel><Panel title="Recommendation decisions" icon={Lightbulb}>{(currentHistory?.decisions ?? []).filter((r) => r.status !== 'pending').map((r) => <Detail key={r.id} label={r.problem} value={readable(r.status)} />)}
+      {!currentHistory?.decisions.some((r) => r.status !== 'pending') && <p className="muted-note">No recorded decisions.</p>}
+    </Panel></>}
+  </div>
+}
