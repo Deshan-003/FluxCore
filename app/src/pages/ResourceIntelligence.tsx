@@ -23,3 +23,28 @@ function reading(key: string, value: number | null | undefined) {
   if (unit === 'cpuMHz') return `${Math.round(value)} MHz`
   if (unit.endsWith('Temp')) return `${value.toFixed(1)} °C`
   if (unit === 'pageReads') return `${value.toFixed(1)}/s`
+  if (unit === 'scansPerMinute' || unit === 'processCount') return value.toFixed(1)
+  if (unit === 'scanMsPerMinute') return `${value.toFixed(2)} ms/min`
+  return `${value.toFixed(1)}%`
+}
+const localTime = (at: number) => new Date(at * 1000).toLocaleTimeString()
+const localDate = (at: number) => new Date(at * 1000).toLocaleString()
+const readable = (value: string) => titleCase(value.replace(/([a-z])([A-Z])/g, '$1 $2'))
+
+function ForecastView({ data, history, metric, setMetric, horizon, setHorizon }: {
+  data: ResourceState; history: ResourceHistory | null; metric: string; setMetric: (v: string) => void; horizon: number; setHorizon: (v: number) => void
+}) {
+  const options = Array.from(new Set(['cpu', 'ram', 'commit', ...data.forecasts.map((f) => f.metric)]))
+  const forecast = data.forecasts.find((f) => f.metric === metric && f.horizonMinutes === horizon)
+  const rows: { at: number; measured: number | null; estimate: number | null }[] = (history?.observations ?? []).map((row) => ({ at: row.at, measured: row.values[metric] ?? null, estimate: row.at === forecast?.observedAt ? row.values[metric] ?? null : null }))
+  if (forecast?.value != null && rows.some((row) => row.at === forecast.observedAt && row.estimate != null)) {
+    rows.push({ at: forecast.targetAt, measured: null, estimate: forecast.value })
+    rows.sort((a, b) => a.at - b.at)
+  }
+  const comparisons = history?.comparisons.slice(-10) ?? []
+  return <Panel title="Performance forecasts" icon={ChartNoAxesCombined}>
+    <div className="intelligence-controls">
+      <label>Metric <select value={metric} onChange={(e) => setMetric(e.target.value)}>{!options.includes(metric) && <option value={metric}>{metricLabel(metric)}</option>}{options.map((key) => <option key={key} value={key}>{metricLabel(key)}</option>)}</select></label>
+      <label>Horizon <select value={horizon} onChange={(e) => setHorizon(Number(e.target.value))}>{data.policy.horizonMinutes.map((value) => <option key={value} value={value}>{value} min</option>)}</select></label>
+    </div>
+    {forecast?.value != null ? <>
