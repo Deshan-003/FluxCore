@@ -107,3 +107,31 @@ fn main() {
     };
     println!(
         "[combined] Phase 4 overhead         {overhead:>8.1}% of the Phase 1+2 pipeline per sample"
+    );
+    println!(
+        "[combined] sample cadence           one full Phase 4 sample every 15 s; gated ticks otherwise"
+    );
+
+    match std::fs::metadata(&db_path) {
+        Ok(metadata) => println!(
+            "[database] throwaway file            {:>9.1} KiB after {} observations",
+            metadata.len() as f64 / 1024.0,
+            result.iterations * 2
+        ),
+        Err(error) => println!("[database] size unavailable: {error}"),
+    }
+
+    match read_process(std::process::id()) {
+        Some(reading) => println!(
+            "[footprint] fluxcore benchmark     private {:.1} MiB · working set {:.1} MiB · peak WS {:.1} MiB",
+            mib(reading.private_bytes),
+            mib(reading.working_set_bytes),
+            mib(reading.peak_working_set_bytes)
+        ),
+        None => match linux_footprint_mib() {
+            Some((rss, peak)) => println!(
+                "[footprint] fluxcore benchmark     resident {:.1} MiB · peak resident {:.1} MiB (non-Windows platform)",
+                rss, peak
+            ),
+            None => println!("[footprint] unavailable on this platform"),
+        },
