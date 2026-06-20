@@ -48,3 +48,28 @@ function ForecastView({ data, history, metric, setMetric, horizon, setHorizon }:
       <label>Horizon <select value={horizon} onChange={(e) => setHorizon(Number(e.target.value))}>{data.policy.horizonMinutes.map((value) => <option key={value} value={value}>{value} min</option>)}</select></label>
     </div>
     {forecast?.value != null ? <>
+      <Detail label={`Estimate at ${localTime(forecast.targetAt)}`} value={reading(metric, forecast.value)} />
+      <Detail label="Indicative uncertainty range" value={`${reading(metric, forecast.low)} – ${reading(metric, forecast.high)}`} />
+      <Detail label="Confidence / method" value={`${readable(forecast.confidence)} · ${readable(forecast.method)}`} />
+      <p className="muted-note">{forecast.explanation}</p>
+    </> : <EmptyState title="Forecast unavailable" detail={forecast?.explanation ?? 'No recent measurements exist for this metric.'} />}
+    {forecast && <Detail label="Historical data quality" value={`${forecast.samples} samples · ${Math.round(forecast.observationSeconds / 60)} min · ${Math.round(forecast.coverage * 100)}% coverage`} />}
+    {rows.filter((r) => r.measured != null).length > 1 && <div className="chart-wrap" aria-label="Measured history and dashed forecast"><ResponsiveContainer width="100%" height="100%"><LineChart data={rows} margin={{ top: 10, right: 22, bottom: 6, left: 8 }}>
+      <CartesianGrid stroke="#344154" strokeDasharray="3 5" vertical={false} />
+      <XAxis type="number" dataKey="at" domain={['dataMin', 'dataMax']} tickFormatter={localTime} minTickGap={45} />
+      <YAxis tickFormatter={(value: number) => reading(metric, value)} />
+      <Tooltip labelFormatter={(value) => localTime(Number(value))} formatter={(value: number, name: string) => [reading(metric, value), name]} contentStyle={{ background: '#101a29', borderColor: '#2b3749' }} />
+      <Legend /><Line name="Measured" dataKey="measured" stroke="#56c7e8" strokeWidth={2} dot={false} isAnimationActive={false} />
+      <Line name="Estimate" dataKey="estimate" stroke="#f4b75e" strokeDasharray="5 5" strokeWidth={2} connectNulls dot={false} isAnimationActive={false} />
+    </LineChart></ResponsiveContainer></div>}
+    <h3>Past estimates vs. measurements</h3>
+    {comparisons.length ? <div className="process-table-wrap"><table className="process-table"><thead><tr><th>Target time</th><th>Estimate</th><th>Measured</th><th>Absolute error</th></tr></thead><tbody>
+      {comparisons.map((item) => <tr key={item.targetAt}><td>{localDate(item.targetAt)}</td><td>{reading(metric, item.value)}</td><td>{reading(metric, item.actual)}</td><td>{item.actual == null || item.value == null ? '—' : reading(metric, Math.abs(item.actual - item.value))}</td></tr>)}
+    </tbody></table></div> : <p className="muted-note">No eligible target-time measurements yet. Results are recorded only when local history is enabled.</p>}
+  </Panel>
+}
+
+function PolicyView({ data, onChange, onManual, busy }: { data: ResourceState; onChange: (p: ResourcePolicy) => Promise<boolean>; onManual: () => void; busy: boolean }) {
+  const [draft, setDraft] = useState<Partial<ResourcePolicy>>({})
+  const [horizons, setHorizons] = useState<string | null>(null)
+  const policy = { ...data.policy, ...draft }
