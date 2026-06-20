@@ -36,3 +36,15 @@ fn monitor_loop_feeds_the_intelligence_engine() {
                     assert!(!latest.values.is_empty(), "observation has no metrics");
                     assert!(latest.at > 0, "observation must carry a UTC timestamp");
                     assert!(!state.health.is_empty());
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor loop never delivered a Phase 4 observation"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(monitor);
+}
