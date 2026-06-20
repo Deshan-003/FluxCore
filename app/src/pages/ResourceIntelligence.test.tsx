@@ -23,3 +23,16 @@ const state = {
 }
 
 beforeEach(() => {
+  vi.stubGlobal('confirm', vi.fn(() => true))
+  vi.mocked(getResourceIntelligence).mockResolvedValue(state)
+  useResourceStore.setState({ data: state, history: null, error: null, busy: false })
+})
+afterEach(() => vi.unstubAllGlobals())
+
+describe('Resource Intelligence', () => {
+  it('shows measured system health and gates recommendation approval on explicit confirmation', async () => {
+    render(<ResourceIntelligencePage />)
+    expect(await screen.findByText('CPU utilization')).toBeTruthy()
+    expect(screen.getByText('CPU utilization').parentElement?.textContent).toContain('94.0%')
+    fireEvent.click(screen.getByRole('button', { name: 'Recommendations' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Approve & apply' }))
