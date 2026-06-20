@@ -10,3 +10,16 @@ use fluxcore_lib::memory_engine::MemoryEngine;
 use fluxcore_lib::monitoring::MonitorEngine;
 
 #[test]
+fn monitor_loop_feeds_the_intelligence_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("phase4-integration.sqlite");
+    // The monitor thread keeps running until the engine is dropped; keep the
+    // directory alive for the duration rather than deleting it under SQLite.
+    std::mem::forget(dir);
+    let db = Arc::new(Database::open_at_path(path).unwrap());
+    let memory = Arc::new(MemoryEngine::new(Arc::clone(&db)));
+    let intelligence = Arc::new(IntelligenceEngine::new(
+        Arc::clone(&db),
+        Arc::clone(&memory),
+    ));
+    let monitor = MonitorEngine::with_intelligence(
