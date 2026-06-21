@@ -80,3 +80,31 @@ jobs:
         run: cargo test --locked
 
       - name: Native Phase 4 overhead benchmark
+        working-directory: app/src-tauri
+        shell: pwsh
+        run: |
+          cargo run --locked --release --example intelligence_benchmark |
+            Tee-Object -FilePath native_benchmark_output.txt
+
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-benchmark-output
+          path: app/src-tauri/native_benchmark_output.txt
+          if-no-files-found: warn
+
+  installer:
+    name: MSI + NSIS installer build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
