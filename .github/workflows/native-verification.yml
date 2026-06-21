@@ -1,0 +1,27 @@
+name: Native verification (Windows)
+
+# Runs, on a GitHub-hosted Windows runner, the checks that Smart App Control
+# blocks on the developer's own machine (os error 4551). A hosted runner has no
+# such code-integrity policy, so the unsigned binaries execute normally.
+#
+# This produces the native evidence Phase 4 still lacks:
+#   - the Rust suite executing natively on Windows/MSVC (incl. the fluxcore_lib harness)
+#   - a native Phase 4 overhead benchmark run
+#   - the MSI and NSIS installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "feature/**"]
+    paths:
+      - "app/**"
+      - ".github/workflows/native-verification.yml"
+  pull_request:
+    paths:
+      - "app/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-verification-${{ github.ref }}
