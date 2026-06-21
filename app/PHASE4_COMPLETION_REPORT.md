@@ -24,3 +24,11 @@
 | --- | --- | --- |
 | `main` | `d7953fe` | Phase 1–2; ancestor of both Phase 3 branches and of the Phase 4 branch. |
 | `feature/phase3-gpu-acceleration` | `49c902b` | Phase 1–3; Phase 4 branch is based on this tip. |
+| `backup/phase3-june-200` | `be1363c` | Content-identical to `feature/phase3-gpu-acceleration` (`git diff --quiet` returns clean); no unique work to cherry-pick. |
+| `feature/phase4-resource-intelligence` | `49c902b` + working tree | Contains every other branch's content plus Phase 4. |
+
+`git for-each-ref` lists no further local/remote branches and `git stash list` is empty, so no branch or
+stash holds additional Phase 4 work. Phase 4 is therefore built on the union of all existing branches;
+the changes remain uncommitted on the Phase 4 branch, and nothing was pushed.
+
+## Known limitations
