@@ -34,3 +34,21 @@ in-memory samples and 20 persisted samples.
 | Persistence delta (SQLite transaction) | 775 µs (82.5%) | 685 µs (87.6%) |
 | Phase 4 gated tick inside the 15 s window | < 1 µs | < 1 µs |
 | Phase 4 share of the Phase 1+2 pipeline per sample | 14.2% | 13.0% |
+| SQLite file after 40 observations | 4.0 KiB | 4.0 KiB |
+| Benchmark process resident footprint | 38.4 MiB | 38.4 MiB |
+
+Interpretation: a full Phase 4 sample costs **0.78–0.94 ms** and runs every 15 seconds, i.e. roughly
+**0.05–0.06 ms per second of monitoring (about 0.006% of one core)**. Monitoring ticks inside the
+sampling window pay less than one microsecond. SQLite persistence dominates the sample; the analysis
+itself is 0.10–0.16 ms. These figures are from the Linux logic path, where GPU and storage-I/O
+collectors are stubbed; native Windows collector cost and the installed-app footprint are not
+measured by this harness.
+
+## Native Windows build and runtime (2026-11-20)
+
+The user authorized installing the native toolchain, so Visual Studio 2022 Build Tools 17.14.45
+(MSVC 14.44.35207, Windows SDK 10.0.26100) was installed via winget. WebView2 runtime was already
+present.
+
+| Native step | Result |
+| --- | --- |
