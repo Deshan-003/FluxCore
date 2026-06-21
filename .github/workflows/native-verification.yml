@@ -25,3 +25,31 @@ permissions:
 
 concurrency:
   group: native-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend (lint, unit tests, production build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test:frontend
+      - run: npm run build
+
+  rust-native:
+    name: Rust suite + native overhead benchmark (Windows, MSVC)
+    runs-on: windows-latest
+    steps:
