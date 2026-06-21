@@ -92,3 +92,34 @@ The engine never sacrifices system stability for a better-looking number: it can
 trim, purge, resize or disable anything belonging to Windows or other applications. The worst
 case of any FluxCore action is degraded *FluxCore* telemetry quality, which the side-effect
 descriptors state up front.
+
+## Phase 4 — adaptive optimization safety
+
+Phase 4 defaults to Analysis Only and adds no new destructive capability. Its only supported action
+sets a **minimum** interval for the existing Phase 2 detailed process scans; it changes neither
+hardware sampling nor any Windows or third-party setting. Smart Assist and Manual modes require an
+explicit user confirmation. Adaptive Optimization is separately opt-in.
+
+Backend validation for the scan action requires all of: monitoring and persistent history enabled,
+a current sample, normal memory pressure, a healthy database, interval 5–60 s, interval above the
+Phase 2 configured value, within the persisted maximum, no active override, and the 180–3600 s
+cooldown elapsed. The override is leased for three minutes and is reverted on expiry, high or
+missing memory pressure, collection/policy changes, explicit pause, rollback, or a measured
+regression in Adaptive mode. Adaptive mode also restores the cadence after CPU load stays below
+its recovery threshold for 60 s. A restart does not restore an OS setting; it marks the unfinished
+audit record as interrupted.
+
+The tradeoff is stated in the UI: fewer detailed scans means less frequent private-memory and
+process-growth detail. Outcome comparison measures FluxCore's own scan wall time and count, and
+reports `inconclusive` when CPU/RAM/process/GPU context changed or observations are missing. It
+never claims a system-wide speedup.
+
+Phase 4 does not terminate applications; trim working sets; purge standby memory; change, disable
+or resize the pagefile; change registry values or services; alter security settings; overclock;
+touch GPU voltage/firmware; or automatically change GPU mode, concurrency or VRAM budgets. GPU
+guidance remains read-only and never launches a workload. Local resource history can include
+process names already collected by Phase 1/2; nothing is uploaded to an external model or service.
+
+If SQLite writes fail, supported adaptation fails closed and Adaptive mode must be re-enabled by
+the user after recovery. See [ADAPTIVE_OPTIMIZATION.md](ADAPTIVE_OPTIMIZATION.md) for modes and
+[PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md) for measured evidence.
