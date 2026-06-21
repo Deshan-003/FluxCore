@@ -87,3 +87,21 @@ that were produced ran or failed according to the SAC policy above.
 - Monitor-loop integration: the existing Phase 1 loop delivers a real Phase 4 observation without any extra collector or thread.
 - Resource Intelligence UI fixture test for current metric display, user confirmation, and action disabling without persistent history.
 
+Synthetic series are used only in unit tests, never in production data or the shipped dashboard.
+
+## Not verified / measured
+
+- Native Windows Tauri UI session, signed-app verification and MSI/NSIS installer remain unexecuted. The MSVC toolchain is now installed and native compilation succeeds, but Smart App Control blocks executing the unsigned build scripts, app and library test harness (os error 4551). The one native integration test that passed before enforcement remains genuine runtime evidence for the monitor loop only.
+- Phase 3 reported CUDA driver-level results apply to its earlier code and were not re-run against this Phase 4 branch. AMD/Intel, wgpu/DX12 runtime, and new Phase 4 GPU telemetry remain unverified here.
+- Native Windows Phase 4 overhead, installed-app working set and cold-start cost remain unmeasured because the benchmark binary cannot run under SAC. The benchmark figures above are the Linux logic path only and must not be presented as Windows numbers.
+- Real-world prediction accuracy, calibration, and anomaly false-positive rate remain unmeasured.
+
+## Evidence-based status
+
+- Analysis, statistical forecasting, anomaly rules and recommendations: **COMPLETE for tested implementation; real-world calibration UNVERIFIED**.
+- Safe adaptive optimization path: **COMPLETE for tested backend path; native Windows UX unverified**.
+- UI, IPC and SQLite persistence: **COMPLETE for type/build/unit and Linux SQLite test scope; installed-app E2E UNVERIFIED**.
+- Outcome evaluation: **PARTIAL** (measures FluxCore scan cost; reports inconclusive when conditions change; never claims overall system speedup).
+- Phase 4 resource-overhead measurement: **COMPLETE for the Linux logic path** (0.78–0.94 ms per 15 s sample; <1 µs gated tick); native Windows **BLOCKED** by SAC.
+- Native Windows compilation: **COMPLETE** with MSVC; native runtime/UI, library-test execution and installer: **BLOCKED by Smart App Control** (user chose to keep SAC enabled).
+- Overall acceptance: **PARTIAL**, not complete until native Windows runtime/installer verification is permitted by policy and real-workload calibration is done.
