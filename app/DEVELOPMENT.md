@@ -37,3 +37,15 @@ Schema version 1 is represented in `src-tauri/migrations/0001_initial.sql` and m
 ## Benchmarking
 
 No fixed resource budget is claimed without measurement. For a release build, use Windows Task Manager/Performance Monitor to record idle CPU and working set during a 5-minute run at 1-second UI refresh, with and without NVML; compare against 5-second and 10-second intervals. The collector currently keeps a bounded in-memory frontend series and writes aggregate history at a five-second cadence.
+
+Two harnesses measure real cost without modifying system state:
+
+```powershell
+cargo run --release --manifest-path src-tauri/Cargo.toml --example benchmark [iterations]
+cargo run --release --manifest-path src-tauri/Cargo.toml --example intelligence_benchmark [iterations]
+```
+
+The first covers the Phase 1 collector and Phase 2 tick; the second adds Phase 4 analysis, SQLite
+persistence, the gated monitoring tick, database growth and process footprint. Both use a throwaway
+database in the temp directory. Record measured results in the relevant phase report rather than
+reusing numbers from another phase or host.
