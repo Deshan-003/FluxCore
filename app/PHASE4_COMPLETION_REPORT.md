@@ -32,3 +32,12 @@ stash holds additional Phase 4 work. Phase 4 is therefore built on the union of 
 the changes remain uncommitted on the Phase 4 branch, and nothing was pushed.
 
 ## Known limitations
+
+- Predictions extrapolate recent samples over up to 15 minutes and carry heuristic uncertainty, not calibrated likelihoods. A changing workload invalidates the trend.
+- Existing history cannot be treated as correctly keyed per adapter/volume for Phase 4 forecasts, so Phase 4 starts a distinct history rather than reinterpret legacy aggregates.
+- Adaptive optimization is intentionally narrow. It does not tune GPU settings, RAM/pagefile behavior, Windows processes, system settings or third-party software.
+- Optional OS metrics, device temperatures and per-process hardware attribution remain subject to provider support.
+- Overhead figures come from the WSL Linux logic path with stubbed GPU/I/O collectors. Native Windows collector cost, installed-app working set, cold start and long-run behaviour are not measured here.
+- Native Windows execution is policy-blocked: VS Build Tools 2022 and Windows SDK 10.0.26100 are installed and native compilation passes, but Smart App Control rejects the unsigned app, library test harness and newly built scripts (os error 4551). No installer or native benchmark result exists, and no security setting was changed. The native debug build also showed intermittent proc-macro artifact-resolution errors during partial rebuilds; those are build-environment conditions, not source defects (the same sources pass 137 tests under WSL).
+
+Run status, suite details, warnings and unmeasured items are recorded in [PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md). No Phase 5 work was started.
