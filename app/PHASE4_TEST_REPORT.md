@@ -69,3 +69,21 @@ environment-blocked even though the compiler is now installed and native compila
 
 A separate build-environment issue was observed while rebuilding: intermittent
 `E0463 can't find crate for <proc-macro>` for `document_features`, `tauri_macros` and
+`zerofrom_derive`. rustc's metadata log reported "Rejecting via proc macro: expected false got
+true", i.e. a stale/ambiguous artifact after partial rebuilds. Cleaning the affected crate
+sometimes restored a loadable artifact. This is an artifact-resolution condition, not a source
+defect: the same sources compile cleanly and pass 137 tests under WSL, and the native binaries
+that were produced ran or failed according to the SAC policy above.
+
+## Coverage
+
+- Forecast walk-forward model selection, unavailable conditions, uncertainty confidence and percentage bounds.
+- Anomaly duration, recovery hysteresis, interrupted/missing samples and outlier-resistant baselines.
+- Before/after scan-cost evaluation with stable workload and changed workload cases.
+- SQLite migration 5 additive/repeatable behavior, existing GPU config preservation, forecast matching to actual values only near the target.
+- Adaptive policy validation, Smart Assist confirmation, explicit adaptive enablement, stale telemetry rejection, monitor/history-off clearing, manual apply, expiry/rollback logic and persistence.
+- Phase 1/2/3 regression coverage, GPU provider/scheduler/resource safety paths.
+- Restart behaviour: an unfinished temporary override is marked interrupted and the new process starts with no active override.
+- Monitor-loop integration: the existing Phase 1 loop delivers a real Phase 4 observation without any extra collector or thread.
+- Resource Intelligence UI fixture test for current metric display, user confirmation, and action disabling without persistent history.
+
