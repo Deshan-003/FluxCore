@@ -52,3 +52,20 @@ present.
 
 | Native step | Result |
 | --- | --- |
+| MSVC compile/link, debug (`cargo build`, `cargo test --no-run`) | **PASS** — library, all six test targets and the app binary (29.3 MB) were produced |
+| `intelligence_integration_tests` (monitor loop, real Windows collectors) | **PASS** — executed natively, exit 0 |
+| `fluxcore_lib` test harness | **FAILED TO EXECUTE** — `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139); an earlier attempt was blocked with os error 4551 |
+| App launch (`fluxcore.exe`) | **BLOCKED** — "An Application Control policy has blocked this file" (os error 4551) |
+| Rebuilding new build scripts / cleaned packages | **BLOCKED** — os error 4551 |
+| MSI/NSIS installer | **NOT BUILT** — blocked by the same policy |
+| Native Phase 4 benchmark run | **NOT RUN** — execution blocked |
+
+Policy evidence: `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy\VerifiedAndReputablePolicyState = 1`
+(Smart App Control enabled). Per the user's explicit decision on 2026-11-20, Smart App Control was
+**left enabled**; no exclusion or other security change was made. Disabling SAC is irreversible
+without resetting Windows and remains the machine owner's decision. Consequence: native
+runtime/UI verification, native overhead measurement and installer creation remain
+environment-blocked even though the compiler is now installed and native compilation succeeds.
+
+A separate build-environment issue was observed while rebuilding: intermittent
+`E0463 can't find crate for <proc-macro>` for `document_features`, `tauri_macros` and
