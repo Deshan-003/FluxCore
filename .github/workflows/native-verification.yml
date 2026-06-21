@@ -53,3 +53,30 @@ jobs:
     name: Rust suite + native overhead benchmark (Windows, MSVC)
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # tauri-build / generate_context! expect frontendDist (../dist) to exist,
+      # so build the assets the same way a local run does before compiling.
+      - name: Build frontend assets
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - name: cargo test --locked (native Windows)
+        working-directory: app/src-tauri
+        run: cargo test --locked
+
+      - name: Native Phase 4 overhead benchmark
