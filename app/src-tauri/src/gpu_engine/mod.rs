@@ -177,9 +177,7 @@ impl GpuEngine {
     ) -> profiler::ClassifyInputs<'a> {
         let gpu_enabled = config.mode != AccelerationMode::CpuOnly
             && capabilities.providers.iter().any(|provider| {
-                provider.available
-                    && provider.compute_ready
-                    && provider.kind != ProviderKind::Cpu
+                provider.available && provider.compute_ready && provider.kind != ProviderKind::Cpu
             });
         profiler::ClassifyInputs {
             config,
@@ -280,7 +278,8 @@ impl GpuEngine {
         safety_notes.extend(resources.gates.clone());
         safety_notes.extend(capabilities.notes.clone());
         if config.mode == AccelerationMode::CpuOnly {
-            safety_notes.push("CPU Only mode: all supported workloads execute on the CPU.".to_string());
+            safety_notes
+                .push("CPU Only mode: all supported workloads execute on the CPU.".to_string());
         }
 
         GpuAccelerationState {
@@ -295,6 +294,13 @@ impl GpuEngine {
             safety_notes,
             environment: capabilities.environment.clone(),
         }
+    }
+
+    pub(crate) fn intelligence_resources(&self) -> (ResourceBudgetStatus, Vec<GpuTask>) {
+        (
+            self.resources.status(&self.read_config()),
+            self.scheduler.list(8, None),
+        )
     }
 
     pub fn providers(&self) -> Vec<ProviderStatus> {
@@ -330,7 +336,8 @@ impl GpuEngine {
         resources::ResourceManager::validate_config(&config)?;
         persistence::save_config(&self.database, &config)?;
         persistence::save_workload_settings(&self.database, &config.workload_settings)?;
-        self.emit_events.store(config.emit_events, Ordering::Relaxed);
+        self.emit_events
+            .store(config.emit_events, Ordering::Relaxed);
         self.scheduler.set_config(config.clone());
         if let Ok(mut slot) = self.config.write() {
             *slot = config.clone();
@@ -365,8 +372,9 @@ impl GpuEngine {
         let inputs = Self::classify_inputs(&config, &capabilities, &resources, &summaries);
 
         let defs: Vec<&WorkloadDef> = match workload_id {
-            Some(id) => vec![profiler::find(&id)
-                .ok_or_else(|| format!("unknown workload id: {id}"))?],
+            Some(id) => {
+                vec![profiler::find(&id).ok_or_else(|| format!("unknown workload id: {id}"))?]
+            }
             None => profiler::registry().iter().collect(),
         };
         let mut out = Vec::with_capacity(defs.len());
@@ -425,7 +433,8 @@ impl GpuEngine {
     }
 
     pub fn list_tasks(&self, limit: Option<usize>, status: Option<TaskStatus>) -> Vec<GpuTask> {
-        self.scheduler.list(limit.unwrap_or(100).clamp(1, 500), status)
+        self.scheduler
+            .list(limit.unwrap_or(100).clamp(1, 500), status)
     }
 
     pub fn clear_finished(&self) -> usize {
@@ -485,7 +494,9 @@ impl GpuEngine {
             transfer_bytes: normalized.params.transfer_bytes(),
             timeout: Duration::from_millis(config.task_timeout_ms),
         };
-        let admission = self.resources.admit(BENCHMARK_SLOT_ID, &requirement, &config);
+        let admission = self
+            .resources
+            .admit(BENCHMARK_SLOT_ID, &requirement, &config);
         if !admission.allowed {
             return Err(admission
                 .reason

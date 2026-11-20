@@ -39,6 +39,16 @@ cargo run --release --manifest-path src-tauri/Cargo.toml --example benchmark [it
 
 It uses a throwaway SQLite database in the temp directory and removes it on exit.
 
+Phase 4 adds a second harness for the intelligence engine: analysis-only cost, full sample with
+SQLite persistence, the gated tick inside the 15-second window, database growth and process
+footprint. It also uses live collector data and a throwaway database:
+
+```powershell
+cargo run --release --manifest-path src-tauri/Cargo.toml --example intelligence_benchmark [iterations]
+```
+
+Measured results (Linux logic path) are recorded in [PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md).
+
 ## Note for machines with Smart App Control
 
 Windows Smart App Control (SAC) blocks locally built, unsigned executables — including cargo

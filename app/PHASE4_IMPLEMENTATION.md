@@ -1,0 +1,20 @@
+# Phase 4 implementation status
+
+## Delivered on `feature/phase4-resource-intelligence`
+
+- CPU/RAM/GPU/VRAM/storage capacity and rate observations use the existing Phase 1 snapshot, not new hardware collectors. Metrics remain optional; GPU adapters and volumes retain separate identities. Memory pressure, commit charge, physical page reads, Phase 2 process private bytes and growth, Phase 3 GPU queue, resources, profiler decisions and validated workload runtimes are correlated where actual counters exist.
+- An offline, lightweight statistical analyzer stores bounded 15-second observations; uses walk-forward-selected mean/exponential/trend forecasts with heuristic uncertainty and data-quality information; evaluates sustained anomalies against thresholds and recent median/MAD baselines with hysteresis; correlates CPU/memory/paging indicators; and emits evidence-based, risk-described recommendations. It uses the existing OS pressure detector and Phase 2 memory forecast rather than duplicating their logic.
+- Phase 4 adds one additive SQLite migration for observations, forecast/actual target comparisons, bounded anomaly/action/recommendation records and persistent policy. It does not replace existing Phase 1–3 tables or configuration.
+- The Resource Intelligence dashboard presents system health, metric forecasts, measured-vs-estimated separation, forecast target errors, evidence/risk/confidence, anomaly history, policy controls, outcomes, and the existing GPU workload-profiler advice. All actions and state are backed by Tauri IPC; GPU advice never launches work.
+- Modes default to Analysis Only. Smart Assist applies an individual owned action only after confirmation. Adaptive Optimization requires a separate explicit user opt-in and is limited to a reversible three-minute lower-priority Phase 2 detailed process scan cadence during sustained CPU load when memory pressure is normal, monitoring and local history are enabled, storage is healthy, and cooldown/limits permit. It never closes applications, trims/purges memory, adjusts the pagefile, changes Windows settings, or modifies the GPU engine.
+- The monitor loop now incorporates this same-module policy, samples resource observations every 15 seconds, and tracks measured detailed-scan time/count for before/after evaluation.
+- Measured Phase 4 overhead with `examples/intelligence_benchmark.rs` (release, WSL Ubuntu, live collector, two runs): 0.78–0.94 ms per 15-second sample (analysis 0.10–0.16 ms, SQLite 0.69–0.78 ms), below 1 µs for the gated tick, 4.0 KiB of SQLite after 40 observations. Native Windows overhead is not measured.
+- Fixed an existing CPU counter normalization issue: sysinfo reports process CPU on an aggregate multi-logical-processor scale. CPU-heavy process attribution is now normalized to total machine capacity instead of discarding valid processes above 100% raw.
+
+## Deliberate gaps / limits
+
+- No workload-level RAM requirement model, new GPU scheduler, per-process GPU attribution, disk latency/busy-time counter, SMART storage health, measured absolute predictive confidence interval, or automatic tuning of GPU budget/concurrency has been added. Where the existing interfaces do not measure a field, it is unavailable rather than synthesized.
+- The low-complexity regression bands are heuristic; predictions are advisory and use only a short local history. The storage-history estimates do not yet attribute capacity growth to individual processes.
+- The initial recovery comparison requires stable CPU, RAM, process count and (when exposed) GPU load plus three readings per metric. In a first-release low-frequency Phase 2 sampling environment it may report `inconclusive`; it does not assert causal system speedup. FluxCore-owned scan wall time is measured directly.
+- UI mode settings persist through the policy table; GPU settings and memory-engine thresholds remain in their original Phase 3 and Phase 2 stores respectively.
+- Final evidence is listed in [PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md). Phase 4 is not represented as a general-purpose ML, security, third-party app optimization, or hardware driver tool.

@@ -71,7 +71,11 @@ Benchmark harness (real measurements; never modifies system state):
 
 ```powershell
 cargo run --release --manifest-path src-tauri/Cargo.toml --example benchmark
+cargo run --release --manifest-path src-tauri/Cargo.toml --example intelligence_benchmark [iterations]
 ```
+
+The second harness measures the Phase 4 intelligence overhead (analysis, SQLite persistence and the
+gated monitoring tick) on live collector data. See [PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md).
 
 ## Documentation
 
@@ -82,3 +86,5 @@ cargo run --release --manifest-path src-tauri/Cargo.toml --example benchmark
 - [BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md) — build, test and packaging
 - [DEVELOPMENT.md](DEVELOPMENT.md), [HARDWARE_COMPATIBILITY.md](HARDWARE_COMPATIBILITY.md)
 - [PHASE1_COMPLETION_REPORT.md](PHASE1_COMPLETION_REPORT.md), [PHASE1_FEATURE_MATRIX.md](PHASE1_FEATURE_MATRIX.md), [PHASE1_TEST_REPORT.md](PHASE1_TEST_REPORT.md) — Phase 1 audit, implementation and executed-verification record
+- [PHASE4_ARCHITECTURE.md](PHASE4_ARCHITECTURE.md), [AI_RESOURCE_INTELLIGENCE.md](AI_RESOURCE_INTELLIGENCE.md), [PERFORMANCE_PREDICTION.md](PERFORMANCE_PREDICTION.md), [ANOMALY_DETECTION.md](ANOMALY_DETECTION.md), [ADAPTIVE_OPTIMIZATION.md](ADAPTIVE_OPTIMIZATION.md) — Phase 4 intelligence engine
+- [PHASE4_PROGRESS_AUDIT.md](PHASE4_PROGRESS_AUDIT.md), [PHASE4_IMPLEMENTATION.md](PHASE4_IMPLEMENTATION.md), [PHASE4_TEST_REPORT.md](PHASE4_TEST_REPORT.md), [PHASE4_COMPLETION_REPORT.md](PHASE4_COMPLETION_REPORT.md) — Phase 4 evidence record

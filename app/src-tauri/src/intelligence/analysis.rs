@@ -1,0 +1,621 @@
+use super::models::*;
+use super::statistics::{baseline, MAX_GAP};
+use crate::memory_engine::models::{MemoryIntelligenceSnapshot, PressureLevel};
+use crate::monitoring::SystemSnapshot;
+use std::collections::{BTreeMap, HashMap};
+
+const MIB: f64 = 1_048_576.0;
+
+pub fn observe(
+    at: i64,
+    snapshot: &SystemSnapshot,
+    memory: Option<&MemoryIntelligenceSnapshot>,
+    scans: ScanCounters,
+) -> Observation {
+    let mut row = Observation {
+        at,
+        scans,
+        process_count: (!snapshot.processes.is_empty()).then_some(snapshot.processes.len()),
+        ..Observation::default()
+    };
+    let mut set = |key: String, value: Option<f64>| {
+        if let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) {
+            row.values.insert(key, value);
+        }
+    };
+    set("cpu".into(), snapshot.cpu.usage_percent.map(f64::from));
+    set(
+        "cpuMHz".into(),
+        snapshot.cpu.frequency_mhz.map(|v| v as f64),
+    );
+    set("cpuTemp".into(), snapshot.cpu.temperature_c.map(f64::from));
+    set(
+        "corePeak".into(),
+        snapshot
+            .cpu
+            .cores
+            .iter()
+            .map(|c| f64::from(c.usage_percent))
+            .reduce(f64::max),
+    );
+    set("ram".into(), snapshot.memory.usage_percent.map(f64::from));
+    if snapshot.memory.total_bytes > 0 {
+        set(
+            "ramAvailable".into(),
+            Some(snapshot.memory.available_bytes as f64),
+        );
+        set("ramTotal".into(), Some(snapshot.memory.total_bytes as f64));
+        set("ramUsed".into(), Some(snapshot.memory.used_bytes as f64));
+    }
+    if let Some(memory) = memory.filter(|m| m.analysis.total_bytes > 0) {
+        row.pressure = Some(memory.pressure.level.as_str().into());
+        set(
+            "commit".into(),
+            memory.analysis.commit_percent.map(f64::from),
+        );
+        set(
+            "commitBytes".into(),
+            memory.analysis.committed_bytes.map(|v| v as f64),
+        );
+        set(
+            "pageReads".into(),
+            memory.analysis.hard_faults_per_sec.map(f64::from),
+        );
+        set(
+            "pagefileBytes".into(),
+            memory.analysis.pagefile_used_bytes.map(|v| v as f64),
+        );
+    }
+    for (index, gpu) in snapshot.gpus.iter().take(8).enumerate() {
+        let adapter = format!("{} #{}", gpu.name, index + 1);
+        set(
+            format!("gpu:{adapter}"),
+            gpu.utilization_percent.map(f64::from),
+        );
+        set(
+            format!("vram:{adapter}"),
+            gpu.vram_usage_percent.map(f64::from),
+        );
+        set(
+            format!("vramBytes:{adapter}"),
+            gpu.dedicated_used_bytes.map(|v| v as f64),
+        );
+        set(
+            format!("gpuShared:{adapter}"),
+            gpu.shared_used_bytes.map(|v| v as f64),
+        );
+        set(
+            format!("gpuTemp:{adapter}"),
+            gpu.temperature_c.map(f64::from),
+        );
+    }
+    for disk in snapshot.storage.iter().take(24) {
+        set(
+            format!("disk:{}", disk.name),
+            disk.usage_percent.map(f64::from),
+        );
+        if disk.total_bytes > 0 {
+            set(
+                format!("diskFree:{}", disk.name),
+                Some(disk.available_bytes as f64),
+            );
+        }
+        set(
+            format!("diskRead:{}", disk.name),
+            disk.read_bytes_per_second.map(|v| v as f64),
+        );
+        set(
+            format!("diskWrite:{}", disk.name),
+            disk.write_bytes_per_second.map(|v| v as f64),
+        );
+    }
+    if let Some(process) = snapshot
+        .processes
+        .iter()
+        .find(|p| p.pid == std::process::id())
+    {
+        set("fluxCpu".into(), process.cpu_percent.map(f64::from));
+        set("fluxRam".into(), Some(process.memory_bytes as f64));
+    }
+    row
+}
+
+pub fn forecast_metric(key: &str) -> bool {
+    matches!(key, "cpu" | "ram" | "commit")
+        || ["gpu:", "vram:", "vramBytes:", "disk:", "diskFree:"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+fn thresholds(metric: &str) -> Option<(f64, f64, Severity)> {
+    match metric.split(':').next()? {
+        "cpu" | "gpu" => Some((90.0, 20.0, Severity::Medium)),
+        "corePeak" => Some((97.0, 25.0, Severity::Low)),
+        "ram" | "vram" => Some((92.0, 10.0, Severity::Medium)),
+        "commit" => Some((90.0, 10.0, Severity::High)),
+        "pageReads" => Some((f64::INFINITY, 20.0, Severity::Low)),
+        "disk" => Some((95.0, 8.0, Severity::High)),
+        "diskRead" | "diskWrite" => Some((f64::INFINITY, 16.0 * MIB, Severity::Information)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Default)]
+struct Signal {
+    last: i64,
+    pending: Option<i64>,
+    clear_since: Option<i64>,
+    active: Option<Anomaly>,
+}
+
+#[derive(Default)]
+pub struct Detector(HashMap<String, Signal>);
+
+impl Detector {
+    pub fn update(&mut self, history: &[Observation], current: &Observation) -> Vec<Anomaly> {
+        let mut changes = Vec::new();
+        self.0.retain(|key, signal| {
+            if current.values.contains_key(key) && current.at - signal.last <= MAX_GAP {
+                return true;
+            }
+            if let Some(mut event) = signal.active.take() {
+                event.ended_at = Some(current.at);
+                event.resolution = Some("Measurement interrupted; recovery not established".into());
+                changes.push(event);
+            }
+            false
+        });
+        for (key, &value) in &current.values {
+            let Some((absolute, delta, severity)) = thresholds(key) else {
+                continue;
+            };
+            let signal = self.0.entry(key.clone()).or_default();
+            signal.last = current.at;
+            if let Some(event) = signal.active.as_ref() {
+                if value < event.threshold - delta / 2.0 {
+                    if current.at - *signal.clear_since.get_or_insert(current.at) >= 45 {
+                        let mut event = signal.active.take().unwrap();
+                        event.ended_at = Some(current.at);
+                        event.resolution = Some("Recovered below the hysteresis threshold".into());
+                        changes.push(event);
+                        signal.pending = None;
+                        signal.clear_since = None;
+                    }
+                } else {
+                    signal.clear_since = None;
+                }
+                continue;
+            }
+            let relative = baseline(history, key, current.at)
+                .map_or(f64::INFINITY, |(center, mad)| center + delta.max(4.0 * mad));
+            let threshold = if absolute.is_finite() {
+                absolute.min(relative)
+            } else {
+                relative
+            };
+            if value < threshold {
+                signal.pending = None;
+                continue;
+            }
+            let since = *signal.pending.get_or_insert(current.at);
+            if current.at - since < 45 {
+                continue;
+            }
+            let severity = if key == "commit" && value >= 98.0 {
+                Severity::Critical
+            } else if value < absolute {
+                Severity::Low.min(severity)
+            } else {
+                severity
+            };
+            let event = Anomaly {
+                id: format!("{key}@{}", current.at),
+                metric: key.clone(),
+                started_at: since,
+                ended_at: None,
+                resolution: None,
+                severity,
+                value,
+                threshold,
+                explanation: if relative < absolute {
+                    "Sustained increase over the recent median/MAD baseline."
+                } else {
+                    "Sustained reading beyond a resource pressure threshold."
+                }
+                .into(),
+            };
+            signal.active = Some(event.clone());
+            changes.push(event);
+        }
+        changes
+    }
+
+    pub fn active(&self) -> Vec<Anomaly> {
+        let mut events: Vec<_> = self.0.values().filter_map(|s| s.active.clone()).collect();
+        events.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.metric.cmp(&b.metric))
+        });
+        events
+    }
+}
+
+pub struct Findings {
+    pub health: String,
+    pub insights: Vec<String>,
+    pub recommendations: Vec<Recommendation>,
+    pub cpu_pressure: bool,
+}
+
+pub fn findings(
+    row: &Observation,
+    snapshot: &SystemSnapshot,
+    memory: Option<&MemoryIntelligenceSnapshot>,
+    events: &[Anomaly],
+    forecasts: &[Forecast],
+    candidate: Option<u64>,
+) -> Findings {
+    let mut insights = Vec::new();
+    let mut recommendations = Vec::new();
+    let mut suggest = |key: &str,
+                       resource: &str,
+                       severity: Severity,
+                       problem: &str,
+                       evidence: Vec<String>,
+                       action: &str,
+                       benefit: &str,
+                       risk: &str,
+                       applicable: bool| {
+        recommendations.push(Recommendation {
+            id: key.into(),
+            created_at: row.at,
+            resource: resource.into(),
+            problem: problem.into(),
+            evidence,
+            severity,
+            action: action.into(),
+            benefit: benefit.into(),
+            risk: risk.into(),
+            requires_approval: applicable,
+            applicable,
+            confidence: if severity >= Severity::Medium {
+                "moderate"
+            } else {
+                "limited"
+            }
+            .into(),
+            status: "pending".into(),
+        });
+    };
+    let has = |f: fn(&str) -> bool| events.iter().any(|a| f(&a.metric));
+    let cpu = row.values.get("cpu").copied();
+    let high_cpu = cpu.is_some_and(|cpu| cpu >= 85.0) && has(|m| m == "cpu");
+    let pressure = row.pressure.as_ref().and(memory.map(|m| m.pressure.level));
+    let high_ram = pressure.is_some_and(|p| p.rank() >= PressureLevel::High.rank());
+    let paging = high_ram && row.values.get("pageReads").is_some_and(|v| *v >= 20.0);
+    let disk_activity = has(|m| m.starts_with("diskRead:") || m.starts_with("diskWrite:"));
+    if high_ram {
+        let mut evidence = memory.unwrap().pressure.reasons.clone();
+        if paging {
+            let rate = row.values["pageReads"];
+            let context = if disk_activity {
+                " Elevated disk throughput was also sustained."
+            } else {
+                " Disk throughput does not independently confirm contention."
+            };
+            insights.push(format!("Memory pressure coincides with {rate:.1} physical page reads/s.{context} Paging may contribute to a slowdown; the readings do not identify pagefile traffic or prove causation."));
+        }
+        if let Some(p) = memory
+            .unwrap()
+            .processes
+            .iter()
+            .filter(|p| {
+                snapshot
+                    .processes
+                    .iter()
+                    .any(|live| live.pid == p.pid && live.started_at == p.started_at)
+            })
+            .max_by_key(|p| p.private_bytes)
+        {
+            evidence.push(format!(
+                "{} (PID {}) used {:.0} MiB of private committed memory in the last scan.",
+                p.name,
+                p.pid,
+                p.private_bytes as f64 / MIB
+            ));
+        }
+        suggest("memory", "RAM", if pressure == Some(PressureLevel::Critical) { Severity::Critical } else { Severity::High }, "Memory pressure may slow applications", evidence,
+            "Review private-memory consumers in Memory Intelligence. Save work before closing anything you no longer need.", "May free memory and reduce paging.", "Closing applications interrupts work; FluxCore does not close them or change the pagefile.", false);
+    }
+    if high_cpu {
+        let mut evidence = vec![format!(
+            "System CPU is {:.1}% following sustained elevated utilization.",
+            cpu.unwrap()
+        )];
+        if high_ram {
+            evidence.push(
+                "Memory pressure is also elevated; CPU alone does not explain the slowdown.".into(),
+            );
+        }
+        if let Some(p) = snapshot
+            .processes
+            .iter()
+            .filter_map(|p| p.cpu_percent.map(|v| (p, v)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            evidence.push(format!("{} (PID {}) accounts for {:.1}% of total logical CPU capacity in the current sample.", p.0.name, p.0.pid, p.1));
+        }
+        suggest(
+            "cpu",
+            "CPU",
+            Severity::Medium,
+            "Sustained CPU load",
+            evidence,
+            "Review active workloads and defer nonessential background work.",
+            "May leave more CPU time for interactive work.",
+            "A busy process may be doing useful work; review it before taking action.",
+            false,
+        );
+    }
+    if let Some(target) = candidate.filter(|_| high_cpu && !high_ram) {
+        suggest(
+            "scan",
+            "Monitoring",
+            Severity::Low,
+            "Optional detailed process scans compete for CPU time",
+            vec![format!(
+                "CPU load is sustained; the proposed minimum scan interval is {} s.",
+                target / 1000
+            )],
+            "Reduce FluxCore's detailed memory-process scan frequency temporarily.",
+            "May reduce FluxCore's scan overhead.",
+            "Detailed process memory and trend readings may update less often.",
+            true,
+        );
+    }
+    if let Some(event) = events
+        .iter()
+        .find(|a| a.metric.starts_with("vram:") || a.metric.starts_with("gpu:"))
+    {
+        let adapter = event.metric.split_once(':').unwrap().1;
+        let evidence = vec![format!(
+            "{adapter} reached {:.1}% on its {} counter during a sustained event.",
+            event.value,
+            if event.metric.starts_with("vram:") {
+                "dedicated VRAM"
+            } else {
+                "GPU utilization"
+            }
+        )];
+        suggest("gpu", "GPU", event.severity, "Limited graphics headroom", evidence, "Check the workload profiler and current budget in GPU Acceleration before submitting more work.", "May reduce queue contention or avoid a workload that exceeds available VRAM.", "CPU execution can take longer. FluxCore only manages its own workloads.", false);
+    }
+    if let Some((disk, value)) = row
+        .values
+        .iter()
+        .filter(|(k, v)| k.starts_with("disk:") && **v >= 95.0)
+        .max_by(|a, b| a.1.total_cmp(b.1))
+    {
+        let drive = disk.trim_start_matches("disk:");
+        suggest(
+            "capacity",
+            "Storage",
+            Severity::High,
+            "A mounted volume has little free space",
+            vec![format!("{drive} is {value:.1}% full.")],
+            "Review large files and Windows Storage settings.",
+            "May preserve space for updates and application writes.",
+            "Review files and backups before removing anything. FluxCore will not delete files.",
+            false,
+        );
+    } else if let Some((volume, forecast)) = snapshot.storage.iter().find_map(|disk| {
+        let key = format!("diskFree:{}", disk.name);
+        forecasts
+            .iter()
+            .find(|f| {
+                f.metric == key
+                    && f.confidence == "moderate"
+                    && f.value
+                        .is_some_and(|value| value <= disk.total_bytes as f64 * 0.05)
+                    && row
+                        .values
+                        .get(&key)
+                        .is_some_and(|value| *value > disk.total_bytes as f64 * 0.05)
+            })
+            .map(|f| (disk.name.as_str(), f))
+    }) {
+        suggest("capacityForecast", "Storage", Severity::Medium, "Recent storage growth may leave little free space", vec![format!("{} is currently {:.1}% full; the {}-minute trend projects about {:.1}% free.", volume, 100.0 - row.values[&format!("disk:{volume}")], forecast.horizon_minutes, forecast.value.unwrap() * 100.0 / snapshot.storage.iter().find(|disk| disk.name == volume).unwrap().total_bytes as f64)], "Review large files and Windows Storage settings before capacity becomes tight.", "May preserve space for updates and application writes.", "This trend extrapolation is uncertain; review files and backups before removing anything. FluxCore will not delete files.", false);
+    }
+    if disk_activity && !paging {
+        insights.push("Disk throughput is above its historical baseline. Throughput alone cannot establish latency or a storage bottleneck.".into());
+    }
+    if let Some(process) = memory.and_then(|m| {
+        m.processes
+            .iter()
+            .filter(|p| {
+                p.leak.is_some()
+                    && snapshot
+                        .processes
+                        .iter()
+                        .any(|live| live.pid == p.pid && live.started_at == p.started_at)
+            })
+            .max_by(|a, b| a.trend_bytes_per_min.total_cmp(&b.trend_bytes_per_min))
+    }) {
+        suggest(
+            "growth",
+            "RAM",
+            Severity::Low,
+            "A process shows sustained memory growth",
+            vec![format!(
+                "{} (PID {}): {:.1} MiB/min across {} s of observations.",
+                process.name,
+                process.pid,
+                process.trend_bytes_per_min / MIB,
+                process.observation_seconds
+            )],
+            "Review the process in Memory Intelligence and correlate the trend with its workload.",
+            "May help identify a workload worth investigating.",
+            "Growth can be expected and is not proof of a leak or malicious activity.",
+            false,
+        );
+    }
+    if let Some(f) = forecasts
+        .iter()
+        .filter(|f| {
+            f.confidence == "moderate"
+                && matches!(f.metric.as_str(), "ram" | "commit")
+                && f.value.is_some_and(|v| v >= 90.0)
+                && row.values.get(&f.metric).is_some_and(|v| *v < 90.0)
+        })
+        .min_by_key(|f| f.horizon_minutes)
+    {
+        insights.push(format!("If the recent pattern continues, {} use may reach {:.0}% in {} min. This is not a guarantee of memory pressure.", f.metric, f.value.unwrap(), f.horizon_minutes));
+    }
+    let health = if high_ram || recommendations.iter().any(|r| r.severity >= Severity::High) {
+        "Resource pressure detected"
+    } else if high_cpu || !events.is_empty() {
+        "Elevated resource activity"
+    } else if cpu.is_none() || !row.values.contains_key("ram") {
+        "Limited telemetry"
+    } else {
+        "No sustained pressure detected in available readings"
+    };
+    recommendations.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
+    Findings {
+        health: health.into(),
+        insights,
+        recommendations,
+        cpu_pressure: high_cpu && !high_ram,
+    }
+}
+
+pub fn evaluate(before: &[Observation], after: &[Observation]) -> Outcome {
+    fn summarize(rows: &[Observation]) -> BTreeMap<String, f64> {
+        let mut values = BTreeMap::<String, (f64, usize)>::new();
+        for row in rows {
+            for (key, value) in &row.values {
+                let acc = values.entry(key.clone()).or_default();
+                acc.0 += value;
+                acc.1 += 1;
+            }
+            if let Some(count) = row.process_count {
+                let acc = values.entry("processCount".into()).or_default();
+                acc.0 += count as f64;
+                acc.1 += 1;
+            }
+        }
+        let mut out: BTreeMap<_, _> = values
+            .into_iter()
+            .filter(|(_, (_, n))| *n >= 3)
+            .map(|(k, (sum, n))| (k, sum / n as f64))
+            .collect();
+        if let Some((start, end)) = rows.first().zip(rows.last()).filter(|(a, b)| {
+            b.at - a.at >= 40
+                && b.scans.count >= a.scans.count
+                && b.scans.elapsed_us >= a.scans.elapsed_us
+        }) {
+            let minutes = (end.at - start.at) as f64 / 60.0;
+            out.insert(
+                "scansPerMinute".into(),
+                (end.scans.count - start.scans.count) as f64 / minutes,
+            );
+            out.insert(
+                "scanMsPerMinute".into(),
+                (end.scans.elapsed_us - start.scans.elapsed_us) as f64 / minutes / 1000.0,
+            );
+        }
+        out
+    }
+    let a = summarize(before);
+    let b = summarize(after);
+    let paired = |key: &str| a.get(key).zip(b.get(key));
+    let stable = paired("cpu").is_some_and(|(x, y)| (x - y).abs() <= 15.0)
+        && paired("processCount").is_some_and(|(x, y)| (x - y).abs() <= (x * 0.15).max(3.0))
+        && paired("ram").is_some_and(|(x, y)| (x - y).abs() <= 10.0)
+        && a.keys()
+            .filter(|key| key.starts_with("gpu:"))
+            .all(|key| paired(key).is_some_and(|(x, y)| (x - y).abs() <= 20.0));
+    let (verdict, detail) = match paired("scanMsPerMinute") {
+        Some((x, y)) if stable && *x > 0.0 && *y < x * 0.8 => ("lowerOverhead", "Detailed scans took less wall time per minute. This does not establish a system-wide speedup."),
+        Some((x, y)) if stable && *y > (x * 1.2).max(x + 0.5) => ("regression", "Detailed scans took more wall time per minute under comparable observed load."),
+        Some(_) if stable => ("noClearChange", "Scan timing did not show a clear improvement despite comparable observed load."),
+        _ => ("inconclusive", "The surrounding workload changed or required observations were missing; no improvement is attributed to FluxCore."),
+    };
+    Outcome {
+        verdict: verdict.into(),
+        detail: detail.into(),
+        before: a,
+        after: b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(at: i64, cpu: f64) -> Observation {
+        Observation {
+            at,
+            values: [("cpu".into(), cpu), ("ram".into(), 50.0)].into(),
+            process_count: Some(25),
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn isolated_spike_does_not_alert_and_sustained_signal_recovers() {
+        let mut detector = Detector::default();
+        assert!(detector.update(&[], &row(100, 100.0)).is_empty());
+        assert!(detector.update(&[], &row(115, 20.0)).is_empty());
+        for at in [130, 145, 160] {
+            assert!(detector.update(&[], &row(at, 96.0)).is_empty());
+        }
+        assert_eq!(detector.update(&[], &row(175, 96.0)).len(), 1);
+        for at in [190, 205, 220] {
+            assert!(detector.update(&[], &row(at, 40.0)).is_empty());
+        }
+        assert_eq!(detector.update(&[], &row(235, 40.0))[0].ended_at, Some(235));
+    }
+
+    #[test]
+    fn history_gap_is_not_reported_as_recovery() {
+        let mut detector = Detector::default();
+        detector.update(&[], &row(100, 95.0));
+        detector.update(&[], &row(145, 95.0));
+        let changes = detector.update(&[], &row(300, 20.0));
+        assert!(changes[0]
+            .resolution
+            .as_ref()
+            .unwrap()
+            .contains("interrupted"));
+    }
+
+    #[test]
+    fn refuses_to_attribute_overhead_improvement_when_workload_changed() {
+        let make = |start: i64, cpu, cost| {
+            (0..5_i64)
+                .map(|i| {
+                    let mut point = row(start + 15 * i, cpu);
+                    point.scans = ScanCounters {
+                        count: i as u64,
+                        elapsed_us: cost * i as u64,
+                    };
+                    point
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = make(0, 90.0, 1000);
+        assert_eq!(
+            evaluate(&before, &make(90, 87.0, 200)).verdict,
+            "lowerOverhead"
+        );
+        assert_eq!(
+            evaluate(&before, &make(90, 40.0, 200)).verdict,
+            "inconclusive"
+        );
+        assert_eq!(
+            evaluate(&before, &make(90, 91.0, 2000)).verdict,
+            "regression"
+        );
+    }
+}

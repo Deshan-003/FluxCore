@@ -51,6 +51,8 @@ struct EngineState {
     background_paused_until: Option<Instant>,
     force_scan: bool,
     last_activity: Instant,
+    scan_override: Option<(u64, Instant)>,
+    scan_counters: crate::intelligence::models::ScanCounters,
 }
 
 pub struct MemoryEngine {
@@ -64,7 +66,11 @@ pub struct MemoryEngine {
 
 impl MemoryEngine {
     pub fn new(db: Arc<Database>) -> Self {
-        let config = db.load_memory_policy_config().ok().flatten().unwrap_or_default();
+        let config = db
+            .load_memory_policy_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let now = Instant::now();
         Self {
             db,
@@ -91,6 +97,8 @@ impl MemoryEngine {
                 background_paused_until: None,
                 force_scan: false,
                 last_activity: now,
+                scan_override: None,
+                scan_counters: Default::default(),
             }),
             counters: Mutex::new(analyzer::WindowsMemoryCounters::new()),
             config: RwLock::new(config),
@@ -100,7 +108,10 @@ impl MemoryEngine {
     }
 
     pub fn mode(&self) -> OptimizationMode {
-        self.state.lock().map(|state| state.mode).unwrap_or(OptimizationMode::AnalysisOnly)
+        self.state
+            .lock()
+            .map(|state| state.mode)
+            .unwrap_or(OptimizationMode::AnalysisOnly)
     }
 
     pub fn set_mode(&self, mode: OptimizationMode) {
@@ -110,7 +121,10 @@ impl MemoryEngine {
     }
 
     pub fn config(&self) -> PolicyConfig {
-        self.config.read().map(|config| config.clone()).unwrap_or_default()
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_config(&self, config: PolicyConfig) -> Result<(), String> {
@@ -124,7 +138,9 @@ impl MemoryEngine {
         {
             return Err("thresholds must be ordered: critical < high < elevated (availability) and elevated < high < critical (commit)".into());
         }
-        if !(1..=600).contains(&config.upgrade_min_seconds) || !(1..=3600).contains(&config.downgrade_min_seconds) {
+        if !(1..=600).contains(&config.upgrade_min_seconds)
+            || !(1..=3600).contains(&config.downgrade_min_seconds)
+        {
             return Err("hysteresis durations must be between 1 and 3600 seconds".into());
         }
         if !(1000..=60000).contains(&config.process_scan_interval_ms) {
@@ -137,7 +153,10 @@ impl MemoryEngine {
             return Err("retention must be between 1 and 90 days".into());
         }
         self.db.save_memory_policy_config(&config)?;
-        *self.config.write().map_err(|_| "policy lock poisoned".to_string())? = config;
+        *self
+            .config
+            .write()
+            .map_err(|_| "policy lock poisoned".to_string())? = config;
         Ok(())
     }
 
@@ -173,6 +192,19 @@ impl MemoryEngine {
         })
     }
 
+    pub(crate) fn scan_counters(&self) -> crate::intelligence::models::ScanCounters {
+        self.state
+            .lock()
+            .map(|state| state.scan_counters)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_scan_override(&self, interval: Option<(u64, Instant)>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.scan_override = interval;
+        }
+    }
+
     /// One monitoring tick: analysis → pressure → processes → prediction →
     /// policies → recommendations → persistence → dashboard snapshot.
     pub fn tick(&self, snapshot: &SystemSnapshot) {
@@ -180,8 +212,12 @@ impl MemoryEngine {
         let ts = Utc::now().to_rfc3339();
         let epoch = Utc::now().timestamp() as f64;
         let config = self.config();
-        let Ok(mut state) = self.state.lock() else { return };
-        let Ok(mut counters) = self.counters.lock() else { return };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Ok(mut counters) = self.counters.lock() else {
+            return;
+        };
 
         let reading = counters.read();
         let status = analyzer::memory_status();
@@ -207,8 +243,12 @@ impl MemoryEngine {
         self.track_pressure_event(&mut state, &pressure, &analysis, &ts);
 
         let idle = !self.dashboard_active.load(Ordering::Acquire)
-            || now.duration_since(state.last_activity) > Duration::from_secs(config.idle_after_seconds);
-        let paused = state.background_paused_until.map(|until| now < until).unwrap_or(false);
+            || now.duration_since(state.last_activity)
+                > Duration::from_secs(config.idle_after_seconds);
+        let paused = state
+            .background_paused_until
+            .map(|until| now < until)
+            .unwrap_or(false);
 
         let (active_policies, detail_boost) =
             policies::evaluate(&pressure, &analysis, &state.current_processes_view(), idle);
@@ -216,15 +256,31 @@ impl MemoryEngine {
         let scan_interval = if paused {
             Duration::from_secs(u64::MAX / 2)
         } else if idle {
-            Duration::from_millis(config.idle_refresh_interval_ms.max(config.process_scan_interval_ms * 2))
+            Duration::from_millis(
+                config
+                    .idle_refresh_interval_ms
+                    .max(config.process_scan_interval_ms * 2),
+            )
         } else if detail_boost {
             Duration::from_millis(config.process_scan_interval_ms / 2)
         } else {
             Duration::from_millis(config.process_scan_interval_ms)
         };
-        let scan_due = state.force_scan || now.duration_since(state.last_process_scan) >= scan_interval;
+        let scan_interval = match state.scan_override {
+            Some((ms, expires))
+                if now < expires && pressure.level.rank() < PressureLevel::High.rank() =>
+            {
+                scan_interval.max(Duration::from_millis(ms))
+            }
+            _ => scan_interval,
+        };
+        let scan_due =
+            state.force_scan || now.duration_since(state.last_process_scan) >= scan_interval;
         if scan_due {
+            let scan_started = Instant::now();
             self.scan_processes(&mut state, snapshot, epoch);
+            state.scan_counters.count += 1;
+            state.scan_counters.elapsed_us += scan_started.elapsed().as_micros() as u64;
             state.last_process_scan = now;
             state.force_scan = false;
         }
@@ -237,7 +293,12 @@ impl MemoryEngine {
         let started: std::collections::HashMap<u32, String> = snapshot
             .processes
             .iter()
-            .filter_map(|process| process.started_at.clone().map(|started| (process.pid, started)))
+            .filter_map(|process| {
+                process
+                    .started_at
+                    .clone()
+                    .map(|started| (process.pid, started))
+            })
             .collect();
         let processes = process_analyzer::analyze(
             &state.current,
@@ -249,7 +310,11 @@ impl MemoryEngine {
 
         let compression_info = compression::analyze(&analysis, &processes);
         let pagefile_config = {
-            let cached = self.pagefile_config.read().map(|cached| cached.clone()).unwrap_or(None);
+            let cached = self
+                .pagefile_config
+                .read()
+                .map(|cached| cached.clone())
+                .unwrap_or(None);
             match cached {
                 Some(config) => config,
                 None => {
@@ -263,7 +328,9 @@ impl MemoryEngine {
         };
         let virtual_memory_info = virtual_memory::analyze(&analysis, pagefile_config);
 
-        if now.duration_since(state.last_prediction) >= Duration::from_secs(15) || state.prediction.is_none() {
+        if now.duration_since(state.last_prediction) >= Duration::from_secs(15)
+            || state.prediction.is_none()
+        {
             let prediction = prediction::predict(
                 &state.window,
                 &processes,
@@ -292,7 +359,9 @@ impl MemoryEngine {
             state.history_points.pop_front();
         }
 
-        if now.duration_since(state.last_persist) >= Duration::from_millis(config.persist_interval_ms) {
+        if now.duration_since(state.last_persist)
+            >= Duration::from_millis(config.persist_interval_ms)
+        {
             if let Err(error) = self.db.record_memory_snapshot(&point) {
                 eprintln!("FluxCore memory history persistence error: {error}");
             }
@@ -342,7 +411,9 @@ impl MemoryEngine {
             time_to_high_pressure_minutes: None,
             growing_processes: Vec::new(),
             summary: "Not enough observations yet for a forecast.".to_string(),
-            disclaimer: "Forecast based on recent trends only; actual behavior depends on workload changes.".to_string(),
+            disclaimer:
+                "Forecast based on recent trends only; actual behavior depends on workload changes."
+                    .to_string(),
         });
 
         state.snapshot = Some(MemoryIntelligenceSnapshot {
@@ -375,7 +446,8 @@ impl MemoryEngine {
         if pressure.level == state.last_level {
             if let Some(open) = state.open_event.as_mut() {
                 open.min_available_bytes = open.min_available_bytes.min(analysis.available_bytes);
-                open.peak_commit_percent = match (open.peak_commit_percent, analysis.commit_percent) {
+                open.peak_commit_percent = match (open.peak_commit_percent, analysis.commit_percent)
+                {
                     (Some(previous), Some(current)) => Some(previous.max(current)),
                     (Some(previous), None) => Some(previous),
                     (None, current) => current,
@@ -445,7 +517,10 @@ impl MemoryEngine {
         ts: &str,
     ) {
         for recommendation in recommendations {
-            if !state.persisted_recommendations.insert(recommendation.id.clone()) {
+            if !state
+                .persisted_recommendations
+                .insert(recommendation.id.clone())
+            {
                 continue;
             }
             let mut stored = history::stored_recommendation(recommendation, ts);
@@ -486,23 +561,29 @@ impl MemoryEngine {
             ));
         }
         let Some(descriptor) = optimizer::descriptor(action_id) else {
-            return Ok(self.audit(ActionResult {
-                action_id: action_id.to_string(),
-                status: ActionStatus::Rejected,
-                detail: "Unknown action id; nothing was executed.".to_string(),
-                executed_at: ts,
-                duration_ms: 0,
-            }, confirmed));
+            return Ok(self.audit(
+                ActionResult {
+                    action_id: action_id.to_string(),
+                    status: ActionStatus::Rejected,
+                    detail: "Unknown action id; nothing was executed.".to_string(),
+                    executed_at: ts,
+                    duration_ms: 0,
+                },
+                confirmed,
+            ));
         };
         let mode = self.mode();
         if let Err(reason) = safety::validate(mode, &descriptor, confirmed) {
-            return Ok(self.audit(ActionResult {
-                action_id: action_id.to_string(),
-                status: ActionStatus::Rejected,
-                detail: reason,
-                executed_at: ts,
-                duration_ms: started.elapsed().as_millis() as u64,
-            }, confirmed));
+            return Ok(self.audit(
+                ActionResult {
+                    action_id: action_id.to_string(),
+                    status: ActionStatus::Rejected,
+                    detail: reason,
+                    executed_at: ts,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+                confirmed,
+            ));
         }
 
         let outcome = self.run_action(action_id);
@@ -535,7 +616,9 @@ impl MemoryEngine {
                     return Err("memory engine lock poisoned".into());
                 };
                 let before = state.window.samples().len() + state.history_points.len();
-                state.history_points.retain(|point| point.timestamp >= cutoff_iso(config.retention_days));
+                state
+                    .history_points
+                    .retain(|point| point.timestamp >= cutoff_iso(config.retention_days));
                 while state.window.samples().len() > 512 {
                     state.window.drop_oldest();
                 }
@@ -559,7 +642,10 @@ impl MemoryEngine {
                     return Err("memory engine lock poisoned".into());
                 };
                 state.background_paused_until = Some(now + Duration::from_secs(300));
-                Ok("FluxCore background scanning and persistence paused for 5 minutes.".to_string())
+                Ok(
+                    "FluxCore background scanning and persistence paused for 5 minutes."
+                        .to_string(),
+                )
             }
             recommendations::ACTION_REFRESH_DATA => {
                 let Ok(mut state) = self.state.lock() else {
@@ -576,7 +662,14 @@ impl MemoryEngine {
                     .current_processes_view()
                     .iter()
                     .take(5)
-                    .map(|process| format!("{} (PID {}, {} private)", process.name, process.pid, bytes_label(process.private_bytes)))
+                    .map(|process| {
+                        format!(
+                            "{} (PID {}, {} private)",
+                            process.name,
+                            process.pid,
+                            bytes_label(process.private_bytes)
+                        )
+                    })
                     .collect();
                 Ok(format!(
                     "Top private-memory consumers right now: {}. Review them in Task Manager and close only what you do not need; FluxCore never terminates processes.",
@@ -595,9 +688,31 @@ impl MemoryEngine {
                 let Ok(state) = self.state.lock() else {
                     return Err("memory engine lock poisoned".into());
                 };
-                let vm = state.snapshot.as_ref().map(|snapshot| snapshot.virtual_memory.clone());
+                let vm = state
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.virtual_memory.clone());
                 let layout: Vec<String> = vm
-                    .map(|vm| vm.pagefile_config.iter().map(|entry| format!("{} ({})", entry.path, if entry.system_managed { "system managed".to_string() } else { format!("{}-{} MB", entry.initial_size_mb.unwrap_or(0), entry.maximum_size_mb.unwrap_or(0)) })).collect())
+                    .map(|vm| {
+                        vm.pagefile_config
+                            .iter()
+                            .map(|entry| {
+                                format!(
+                                    "{} ({})",
+                                    entry.path,
+                                    if entry.system_managed {
+                                        "system managed".to_string()
+                                    } else {
+                                        format!(
+                                            "{}-{} MB",
+                                            entry.initial_size_mb.unwrap_or(0),
+                                            entry.maximum_size_mb.unwrap_or(0)
+                                        )
+                                    }
+                                )
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 Ok(format!(
                     "Current pagefile layout: {}. To change it: System Properties → Advanced → Performance Settings → Advanced → Virtual memory → Change. Consequences: a too-small pagefile lowers the commit limit and can cause allocation failures; a fixed size on a slow volume can increase paging latency. Retention is {} days; FluxCore never changes these settings.",
@@ -681,7 +796,10 @@ mod tests {
 
     fn test_db() -> Arc<Database> {
         let directory = tempfile::tempdir().expect("temporary database directory");
-        Arc::new(Database::open_at_path(directory.path().join("memory.sqlite3")).expect("open test database"))
+        Arc::new(
+            Database::open_at_path(directory.path().join("memory.sqlite3"))
+                .expect("open test database"),
+        )
     }
 
     fn snapshot(available_percent: f32) -> SystemSnapshot {
@@ -742,7 +860,11 @@ mod tests {
         let intelligence = engine.intelligence().expect("snapshot after tick");
         assert_eq!(intelligence.analysis.total_bytes, 32 * 1024u64.pow(3));
         assert_eq!(intelligence.pressure.level, PressureLevel::Normal);
-        assert!(intelligence.policies.active.iter().any(|policy| policy.id == policies::POLICY_BACKGROUND));
+        assert!(intelligence
+            .policies
+            .active
+            .iter()
+            .any(|policy| policy.id == policies::POLICY_BACKGROUND));
         assert!(intelligence.recommendations.is_empty());
         assert!(intelligence.prediction.disclaimer.contains("trends only"));
     }
@@ -756,7 +878,10 @@ mod tests {
             .expect("result");
         assert_eq!(result.status, ActionStatus::Rejected);
         let intelligence_history = engine.history_series(10).expect("history");
-        assert!(intelligence_history.actions.iter().any(|entry| entry.status == ActionStatus::Rejected));
+        assert!(intelligence_history
+            .actions
+            .iter()
+            .any(|entry| entry.status == ActionStatus::Rejected));
     }
 
     #[test]

@@ -170,6 +170,11 @@ pub struct HistoryPoint {
 
 /// Percentage of `part` over `total`, or `None` when the total is unknown so a
 /// failed collection is never presented as a real zero.
+fn normalize_process_cpu(raw_percent: f32, logical_processors: usize) -> Option<f32> {
+    (logical_processors > 0 && raw_percent.is_finite())
+        .then(|| (raw_percent / logical_processors as f32).clamp(0.0, 100.0))
+}
+
 fn percent(part: u64, total: u64) -> Option<f32> {
     if total == 0 {
         None
@@ -218,38 +223,96 @@ impl SystemSnapshot {
     pub fn hardware_check(&self) -> HardwareCheckReport {
         let mut checks = vec![
             HardwareCheckItem {
-                component: "CPU".into(), status: if self.cpu.logical_processors > 0 { "available" } else { "unavailable" }.into(),
+                component: "CPU".into(),
+                status: if self.cpu.logical_processors > 0 {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+                .into(),
                 provider: "Windows CPU counters / sysinfo".into(),
-                detail: if self.cpu.logical_processors > 0 { format!("{} · {} logical processors · live usage available", self.cpu.name, self.cpu.logical_processors) } else { "CPU counters were not returned by Windows.".into() },
+                detail: if self.cpu.logical_processors > 0 {
+                    format!(
+                        "{} · {} logical processors · live usage available",
+                        self.cpu.name, self.cpu.logical_processors
+                    )
+                } else {
+                    "CPU counters were not returned by Windows.".into()
+                },
             },
             HardwareCheckItem {
-                component: "Physical memory".into(), status: if self.memory.total_bytes > 0 { "available" } else { "unavailable" }.into(),
+                component: "Physical memory".into(),
+                status: if self.memory.total_bytes > 0 {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+                .into(),
                 provider: "Windows memory status API".into(),
-                detail: if self.memory.total_bytes > 0 { format!("{} total · {} available", self.memory.total_bytes, self.memory.available_bytes) } else { "Physical memory counters were unavailable.".into() },
+                detail: if self.memory.total_bytes > 0 {
+                    format!(
+                        "{} total · {} available",
+                        self.memory.total_bytes, self.memory.available_bytes
+                    )
+                } else {
+                    "Physical memory counters were unavailable.".into()
+                },
             },
             HardwareCheckItem {
-                component: "Storage capacity".into(), status: if self.storage.is_empty() { "unavailable" } else { "available" }.into(),
+                component: "Storage capacity".into(),
+                status: if self.storage.is_empty() {
+                    "unavailable"
+                } else {
+                    "available"
+                }
+                .into(),
                 provider: "Mounted filesystem API".into(),
-                detail: if self.storage.is_empty() { "No mounted filesystem volumes were returned.".into() } else { format!("{} mounted volume(s); I/O rates from storage performance counters, device health (SMART) unavailable.", self.storage.len()) },
+                detail: if self.storage.is_empty() {
+                    "No mounted filesystem volumes were returned.".into()
+                } else {
+                    format!("{} mounted volume(s); I/O rates from storage performance counters, device health (SMART) unavailable.", self.storage.len())
+                },
             },
             HardwareCheckItem {
-                component: "Processes".into(), status: if self.processes.is_empty() { "unavailable" } else { "available" }.into(),
+                component: "Processes".into(),
+                status: if self.processes.is_empty() {
+                    "unavailable"
+                } else {
+                    "available"
+                }
+                .into(),
                 provider: "Windows process counters / sysinfo".into(),
-                detail: if self.processes.is_empty() { "No process data was returned.".into() } else { format!("{} processes enumerated; per-process GPU attribution unavailable.", self.processes.len()) },
+                detail: if self.processes.is_empty() {
+                    "No process data was returned.".into()
+                } else {
+                    format!(
+                        "{} processes enumerated; per-process GPU attribution unavailable.",
+                        self.processes.len()
+                    )
+                },
             },
         ];
         if self.gpus.is_empty() {
-            checks.push(HardwareCheckItem { component: "GPU".into(), status: "unavailable".into(), provider: "Windows device enumeration / NVIDIA NVML".into(), detail: "No GPU adapter was enumerated.".into() });
+            checks.push(HardwareCheckItem {
+                component: "GPU".into(),
+                status: "unavailable".into(),
+                provider: "Windows device enumeration / NVIDIA NVML".into(),
+                detail: "No GPU adapter was enumerated.".into(),
+            });
         } else {
             for gpu in &self.gpus {
-                let telemetry = gpu.utilization_percent.is_some() || gpu.dedicated_total_bytes.is_some();
+                let telemetry =
+                    gpu.utilization_percent.is_some() || gpu.dedicated_total_bytes.is_some();
                 checks.push(HardwareCheckItem {
                     component: gpu.name.clone(), status: if telemetry { "available" } else { "partial" }.into(), provider: gpu.provider.clone(),
                     detail: if telemetry { format!("GPU telemetry active; utilization {}, dedicated VRAM {}.", gpu.utilization_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "unavailable".into()), gpu.dedicated_total_bytes.map(|value| format!("{value} bytes")).unwrap_or_else(|| "unavailable".into())) } else { "Adapter identified by Windows; GPU telemetry provider unavailable. Sensor values are not estimated.".into() },
                 });
             }
         }
-        HardwareCheckReport { checked_at: self.collected_at.clone(), checks }
+        HardwareCheckReport {
+            checked_at: self.collected_at.clone(),
+            checks,
+        }
     }
 
     pub fn history_point(&self) -> HistoryPoint {
@@ -283,6 +346,7 @@ struct Shared {
     app: RwLock<Option<tauri::AppHandle>>,
     database: Arc<Database>,
     memory: Arc<MemoryEngine>,
+    intelligence: Option<Arc<crate::intelligence::IntelligenceEngine>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 pub struct MonitorEngine {
@@ -306,6 +370,14 @@ fn validate_settings(settings: &MonitoringSettings) -> Result<(), String> {
 
 impl MonitorEngine {
     pub fn new(database: Arc<Database>, memory: Arc<MemoryEngine>) -> Self {
+        Self::with_intelligence(database, memory, None)
+    }
+
+    pub fn with_intelligence(
+        database: Arc<Database>,
+        memory: Arc<MemoryEngine>,
+        intelligence: Option<Arc<crate::intelligence::IntelligenceEngine>>,
+    ) -> Self {
         let settings = database.load_settings().ok().flatten().unwrap_or_default();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shared = Arc::new(Shared {
@@ -314,6 +386,7 @@ impl MonitorEngine {
             app: RwLock::new(None),
             database,
             memory,
+            intelligence,
             shutdown: Arc::clone(&shutdown),
         });
         let (stop, receiver) = mpsc::channel();
@@ -394,6 +467,9 @@ fn monitor_loop(shared: Arc<Shared>, stop: mpsc::Receiver<()>) {
             .read()
             .map(|s| s.clone())
             .unwrap_or_default();
+        if let Some(intelligence) = &shared.intelligence {
+            intelligence.collection_status(settings.monitoring_enabled, settings.persist_history);
+        }
         if settings.monitoring_enabled {
             let snapshot = collector.collect();
             if let Ok(mut current) = shared.snapshot.write() {
@@ -408,6 +484,9 @@ fn monitor_loop(shared: Arc<Shared>, stop: mpsc::Receiver<()>) {
                 }
             }
             shared.memory.tick(&snapshot);
+            if let Some(intelligence) = &shared.intelligence {
+                intelligence.tick(&snapshot);
+            }
             if settings.persist_history && last_persist.elapsed() >= Duration::from_secs(5) {
                 if let Err(error) = shared.database.record_snapshot(&snapshot) {
                     eprintln!("FluxCore history persistence error: {error}");
@@ -474,7 +553,9 @@ impl Collector {
     }
     #[cfg(windows)]
     fn cpu_frequency_mhz(&mut self) -> Option<u64> {
-        self.cpu_frequency.as_mut().and_then(|counter| counter.read())
+        self.cpu_frequency
+            .as_mut()
+            .and_then(|counter| counter.read())
     }
     #[cfg(not(windows))]
     fn cpu_frequency_mhz(&mut self) -> Option<u64> {
@@ -562,11 +643,7 @@ impl Collector {
         let total = self.system.total_memory();
         let available = self.system.available_memory();
         let used = total.saturating_sub(available);
-        let (
-            cached_bytes,
-            committed_bytes,
-            commit_limit_bytes,
-        ) = windows_memory_accounting();
+        let (cached_bytes, committed_bytes, commit_limit_bytes) = windows_memory_accounting();
         let (pagefile_used_bytes, pagefile_total_bytes) = windows_pagefile();
         let memory = MemoryMetrics {
             total_bytes: total,
@@ -634,7 +711,7 @@ impl Collector {
             .map(|(pid, process)| ProcessMetrics {
                 pid: pid.as_u32(),
                 name: process.name().to_string_lossy().to_string(),
-                cpu_percent: (process.cpu_usage() <= 100.0).then_some(process.cpu_usage()),
+                cpu_percent: normalize_process_cpu(process.cpu_usage(), cpu.logical_processors),
                 memory_bytes: process.memory(),
                 memory_percent: percent(process.memory(), total),
                 gpu_percent: None,
@@ -701,7 +778,10 @@ fn windows_pagefile() -> (Option<u64>, Option<u64>) {
         status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
         if GlobalMemoryStatusEx(&mut status).is_ok() {
             let total = status.ullTotalPageFile;
-            (Some(total.saturating_sub(status.ullAvailPageFile)), Some(total))
+            (
+                Some(total.saturating_sub(status.ullAvailPageFile)),
+                Some(total),
+            )
         } else {
             (None, None)
         }
@@ -755,11 +835,13 @@ fn drive_kind(disk: &sysinfo::Disk) -> String {
 /// `IOCTL_DISK_PERFORMANCE` query (no elevated rights required).
 #[cfg(windows)]
 fn windows_disk_io(mount_point: &str) -> Option<(u64, u64)> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE};
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Ioctl::{DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE};
+    use windows::Win32::System::IO::DeviceIoControl;
     let device = volume_device_path(mount_point)?;
     let path = windows::core::HSTRING::from(device);
     unsafe {
@@ -786,9 +868,12 @@ fn windows_disk_io(mount_point: &str) -> Option<(u64, u64)> {
             None,
         );
         let _ = CloseHandle(handle);
-        result
-            .ok()
-            .map(|_| (performance.BytesRead as u64, performance.BytesWritten as u64))
+        result.ok().map(|_| {
+            (
+                performance.BytesRead as u64,
+                performance.BytesWritten as u64,
+            )
+        })
     }
 }
 
@@ -797,13 +882,15 @@ fn windows_disk_io(mount_point: &str) -> Option<(u64, u64)> {
 fn windows_drive_properties(mount_point: &str) -> (Option<u32>, Option<bool>) {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{
-        PropertyStandardQuery, DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
-        STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
-        StorageDeviceSeekPenaltyProperty,
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
+    use windows::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
+        DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_DESCRIPTOR,
+        STORAGE_PROPERTY_QUERY,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
     let Some(device) = volume_device_path(mount_point) else {
         return (None, None);
     };
@@ -904,7 +991,9 @@ impl NvmlSession {
         use libloading::Library;
         let library = unsafe { Library::new("nvml.dll").or_else(|_| Library::new("nvml64.dll")) };
         let Ok(library) = library else {
-            errors.push("NVIDIA NVML provider is unavailable; using OS GPU identification only.".into());
+            errors.push(
+                "NVIDIA NVML provider is unavailable; using OS GPU identification only.".into(),
+            );
             return None;
         };
         unsafe {
@@ -918,9 +1007,15 @@ impl NvmlSession {
             }
             let (Ok(count_fn), Ok(by_index), Ok(name), Ok(memory)) = (
                 library.get::<unsafe extern "C" fn(*mut u32) -> i32>(b"nvmlDeviceGetCount_v2"),
-                library.get::<unsafe extern "C" fn(u32, *mut NvmlDevice) -> i32>(b"nvmlDeviceGetHandleByIndex_v2"),
-                library.get::<unsafe extern "C" fn(NvmlDevice, *mut i8, u32) -> i32>(b"nvmlDeviceGetName"),
-                library.get::<unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfo) -> i32>(b"nvmlDeviceGetMemoryInfo"),
+                library.get::<unsafe extern "C" fn(u32, *mut NvmlDevice) -> i32>(
+                    b"nvmlDeviceGetHandleByIndex_v2",
+                ),
+                library.get::<unsafe extern "C" fn(NvmlDevice, *mut i8, u32) -> i32>(
+                    b"nvmlDeviceGetName",
+                ),
+                library.get::<unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfo) -> i32>(
+                    b"nvmlDeviceGetMemoryInfo",
+                ),
             ) else {
                 errors.push("NVML is missing required monitoring functions.".into());
                 return None;
@@ -941,7 +1036,10 @@ impl NvmlSession {
                 shutdown: library.get(b"nvmlShutdown").ok().map(|f| *f),
                 name: *name,
                 memory: *memory,
-                utilization: library.get(b"nvmlDeviceGetUtilizationRates").ok().map(|f| *f),
+                utilization: library
+                    .get(b"nvmlDeviceGetUtilizationRates")
+                    .ok()
+                    .map(|f| *f),
                 temperature: library.get(b"nvmlDeviceGetTemperature").ok().map(|f| *f),
                 clock: library.get(b"nvmlDeviceGetClockInfo").ok().map(|f| *f),
                 power: library.get(b"nvmlDeviceGetPowerUsage").ok().map(|f| *f),
@@ -958,7 +1056,9 @@ impl NvmlSession {
         unsafe {
             let mut name = [0i8; 96];
             let display_name = if (self.name)(device, name.as_mut_ptr(), name.len() as u32) == 0 {
-                std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy().to_string()
+                std::ffi::CStr::from_ptr(name.as_ptr())
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 "NVIDIA GPU".to_string()
             };
@@ -1250,6 +1350,109 @@ pub fn benchmark_collect_and_tick(iterations: u32, memory: &MemoryEngine) -> (u1
     )
 }
 
+/// Aggregate timings from [`benchmark_intelligence`], in microseconds per
+/// iteration.
+#[derive(Clone, Copy, Debug)]
+pub struct IntelligenceBenchmark {
+    pub iterations: u32,
+    /// Phase 1 collector pass.
+    pub collect_us: u128,
+    /// Phase 2 memory engine tick.
+    pub memory_tick_us: u128,
+    /// Phase 4 sample including forecast, anomaly and recommendation analysis,
+    /// with SQLite persistence disabled.
+    pub analysis_us: u128,
+    /// Phase 4 sample including the SQLite observation/write transaction.
+    pub sample_us: u128,
+    /// Difference between `sample_us` and `analysis_us`; the storage-write cost.
+    pub persistence_us: u128,
+    /// Phase 4 tick inside the 15-second sampling window (early return).
+    pub gate_us: u128,
+}
+
+/// Measures the Phase 4 intelligence engine on live collected snapshots.
+///
+/// Metric values are real OS readings; only the snapshot timestamp is shifted
+/// by the 15-second cadence so each iteration performs a full analysis and
+/// persistence pass instead of the sampler's early return. The benchmark only
+/// reads system state and writes to its throwaway database.
+pub fn benchmark_intelligence(
+    iterations: u32,
+    memory: &MemoryEngine,
+    intelligence: &crate::intelligence::IntelligenceEngine,
+) -> IntelligenceBenchmark {
+    let iterations = iterations.clamp(2, 40);
+    let mut collector = Collector::new();
+    let base = Utc::now();
+    let mut collect_micros = 0u128;
+    let mut memory_micros = 0u128;
+    let mut analysis_micros = 0u128;
+    let mut sample_micros = 0u128;
+
+    // In-memory pass: analysis, forecasting and anomaly work only.
+    intelligence.collection_status(true, false);
+    let mut last: Option<SystemSnapshot> = None;
+    for index in 0..iterations {
+        let start = Instant::now();
+        let mut snapshot = collector.collect();
+        collect_micros += start.elapsed().as_micros();
+        snapshot.collected_at =
+            (base + chrono::Duration::seconds(15 * i64::from(index))).to_rfc3339();
+        let start = Instant::now();
+        memory.tick(&snapshot);
+        memory_micros += start.elapsed().as_micros();
+        let start = Instant::now();
+        intelligence.tick(&snapshot);
+        analysis_micros += start.elapsed().as_micros();
+        last = Some(snapshot);
+    }
+
+    // Full pass: the same analysis plus the local persistence transaction.
+    intelligence.collection_status(true, true);
+    for index in 0..iterations {
+        let start = Instant::now();
+        let mut snapshot = collector.collect();
+        collect_micros += start.elapsed().as_micros();
+        snapshot.collected_at = (base
+            + chrono::Duration::seconds(15 * (i64::from(iterations) + i64::from(index))))
+        .to_rfc3339();
+        let start = Instant::now();
+        memory.tick(&snapshot);
+        memory_micros += start.elapsed().as_micros();
+        let start = Instant::now();
+        intelligence.tick(&snapshot);
+        sample_micros += start.elapsed().as_micros();
+        last = Some(snapshot);
+    }
+
+    // Early-return cost paid by every monitoring tick inside the 15 s window.
+    let mut gate_micros = 0u128;
+    if let Some(snapshot) = last.as_ref() {
+        let runs = 200u32;
+        for _ in 0..runs {
+            let start = Instant::now();
+            intelligence.tick(snapshot);
+            gate_micros += start.elapsed().as_micros();
+        }
+        gate_micros /= u128::from(runs);
+    }
+
+    let divisor = u128::from(2 * iterations);
+    let collect = collect_micros / divisor;
+    let memory_tick = memory_micros / divisor;
+    let analysis = analysis_micros / u128::from(iterations);
+    let sample = sample_micros / u128::from(iterations);
+    IntelligenceBenchmark {
+        iterations,
+        collect_us: collect,
+        memory_tick_us: memory_tick,
+        analysis_us: analysis,
+        sample_us: sample,
+        persistence_us: sample.saturating_sub(analysis),
+        gate_us: gate_micros,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,8 +1462,20 @@ mod tests {
         let available = 4 * 1024u64.pow(3);
         let used = total - available;
         assert_eq!(percent(used, total), Some(75.0));
-        assert_eq!(percent(used, 0), None, "unknown totals must not become zeros");
+        assert_eq!(
+            percent(used, 0),
+            None,
+            "unknown totals must not become zeros"
+        );
     }
+    #[test]
+    fn process_cpu_is_normalized_to_total_machine_capacity() {
+        assert_eq!(normalize_process_cpu(240.0, 12), Some(20.0));
+        assert_eq!(normalize_process_cpu(1200.0, 12), Some(100.0));
+        assert_eq!(normalize_process_cpu(10.0, 0), None);
+        assert_eq!(normalize_process_cpu(f32::NAN, 12), None);
+    }
+
     #[test]
     fn rate_helper_derives_bytes_per_second() {
         let elapsed = Duration::from_secs(2);
@@ -1282,14 +1497,23 @@ mod tests {
             classify_drive(None, None, false),
             "Mounted volume (device type unavailable)"
         );
-        assert_eq!(classify_drive(Some(17), Some(false), true), "Removable volume");
+        assert_eq!(
+            classify_drive(Some(17), Some(false), true),
+            "Removable volume"
+        );
     }
     #[test]
     fn gpu_class_inference_is_conservative() {
         assert_eq!(gpu_class_for("NVIDIA", false), Some("Dedicated".into()));
-        assert_eq!(gpu_class_for("Intel Corporation", false), Some("Integrated".into()));
+        assert_eq!(
+            gpu_class_for("Intel Corporation", false),
+            Some("Integrated".into())
+        );
         assert_eq!(gpu_class_for("Advanced Micro Devices", false), None);
-        assert_eq!(gpu_class_for("Advanced Micro Devices", true), Some("Dedicated".into()));
+        assert_eq!(
+            gpu_class_for("Advanced Micro Devices", true),
+            Some("Dedicated".into())
+        );
     }
     #[test]
     fn cim_entry_parser_maps_name_vendor_and_driver() {
@@ -1302,7 +1526,8 @@ mod tests {
         assert_eq!(name, "NVIDIA GeForce RTX 2050");
         assert_eq!(vendor, "NVIDIA");
         assert_eq!(driver.as_deref(), Some("31.0.15.1694"));
-        let missing = serde_json::json!({ "Name": "Basic adapter", "AdapterCompatibility": "Contoso" });
+        let missing =
+            serde_json::json!({ "Name": "Basic adapter", "AdapterCompatibility": "Contoso" });
         let (name, _, driver) = parse_gpu_entry(&missing).expect("parsed entry");
         assert_eq!(name, "Basic adapter");
         assert_eq!(driver, None);
@@ -1407,28 +1632,43 @@ mod tests {
     fn settings_reject_unreasonable_intervals() {
         let mut settings = MonitoringSettings::default();
         settings.refresh_interval_ms = 100;
-        assert!(validate_settings(&settings).is_err(), "100 ms is below the 250 ms floor");
+        assert!(
+            validate_settings(&settings).is_err(),
+            "100 ms is below the 250 ms floor"
+        );
         settings.refresh_interval_ms = 60_001;
-        assert!(validate_settings(&settings).is_err(), "over one minute exceeds the ceiling");
+        assert!(
+            validate_settings(&settings).is_err(),
+            "over one minute exceeds the ceiling"
+        );
         settings.refresh_interval_ms = 1000;
         assert!(validate_settings(&settings).is_ok());
         settings.history_duration_minutes = 0;
-        assert!(validate_settings(&settings).is_err(), "history duration must be at least 1 minute");
+        assert!(
+            validate_settings(&settings).is_err(),
+            "history duration must be at least 1 minute"
+        );
     }
     #[test]
     fn monitor_engine_starts_publishes_and_stops() {
         let directory = tempfile::tempdir().expect("temporary database directory");
-        let database =
-            Arc::new(Database::open_at_path(directory.path().join("engine.sqlite3")).expect("open"));
+        let database = Arc::new(
+            Database::open_at_path(directory.path().join("engine.sqlite3")).expect("open"),
+        );
         let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
         let engine = MonitorEngine::new(Arc::clone(&database), memory);
+        // The first collection performs one-off OS probing (a sysinfo refresh, an
+        // NVML probe and a `powershell.exe Get-CimInstance` GPU enumeration on
+        // Windows), which can take several seconds on a cold or loaded machine.
+        // Wait on a wall-clock deadline instead of a fixed two second budget.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut published = false;
-        for _ in 0..200 {
+        while Instant::now() < deadline {
             if engine.snapshot().is_ok() {
                 published = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(50));
         }
         assert!(published, "the monitor loop must publish a snapshot");
         assert!(engine.history().is_ok());
