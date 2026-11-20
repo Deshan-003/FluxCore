@@ -1249,16 +1249,61 @@ fn detect_gpus(nvml: Option<&NvmlSession>) -> (Vec<GpuMetrics>, Vec<String>) {
 
 #[cfg(windows)]
 fn windows_gpu_names() -> Vec<(String, String, Option<String>)> {
-    use std::process::Command;
-    let output = Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","Get-CimInstance Win32_VideoController | Select-Object -Property Name,AdapterCompatibility,DriverVersion | ConvertTo-Json -Compress"]).output();
-    let Ok(output) = output else {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    // This CIM query is normally answered in well under a second, but on a cold or
+    // heavily loaded machine powershell.exe can hang for tens of seconds. Bound it
+    // so the first snapshot is never blocked indefinitely: on timeout we simply
+    // report no OS GPU names and rely on whatever NVML already provided.
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+
+    let mut child = match Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -Property Name,AdapterCompatibility,DriverVersion | ConvertTo-Json -Compress",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+
+    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => break None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Vec::new();
     };
-    if !output.status.success() {
+    if !status.success() {
         return Vec::new();
     }
-    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&output.stdout);
-    match parsed {
+
+    let mut stdout = Vec::new();
+    match child.stdout.take() {
+        Some(mut pipe) => {
+            if pipe.read_to_end(&mut stdout).is_err() {
+                return Vec::new();
+            }
+        }
+        None => return Vec::new(),
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(&stdout) {
         Ok(serde_json::Value::Array(items)) => items.iter().filter_map(parse_gpu_entry).collect(),
         Ok(item) => parse_gpu_entry(&item).into_iter().collect(),
         Err(_) => Vec::new(),
