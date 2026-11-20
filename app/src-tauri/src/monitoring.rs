@@ -1657,13 +1657,18 @@ mod tests {
         );
         let memory = Arc::new(MemoryEngine::new(Arc::clone(&database)));
         let engine = MonitorEngine::new(Arc::clone(&database), memory);
+        // The first collection performs one-off OS probing (a sysinfo refresh, an
+        // NVML probe and a `powershell.exe Get-CimInstance` GPU enumeration on
+        // Windows), which can take several seconds on a cold or loaded machine.
+        // Wait on a wall-clock deadline instead of a fixed two second budget.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut published = false;
-        for _ in 0..200 {
+        while Instant::now() < deadline {
             if engine.snapshot().is_ok() {
                 published = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(50));
         }
         assert!(published, "the monitor loop must publish a snapshot");
         assert!(engine.history().is_ok());
