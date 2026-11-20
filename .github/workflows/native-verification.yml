@@ -127,6 +127,43 @@ jobs:
         working-directory: app
         run: npm run tauri build
 
+      # Native runtime smoke test: launch the real app and confirm it starts and
+      # stays alive. SAC never applies on a hosted runner, so this exercises the
+      # installed binary path (window + WebView2 + collector startup) that cannot
+      # be run on a SAC-enforced developer machine.
+      - name: Smoke-launch the built app
+        shell: pwsh
+        run: |
+          $rel = 'app/src-tauri/target/release'
+          $exe = @(Get-ChildItem -Path $rel -Filter 'FluxCore.exe' -File -ErrorAction SilentlyContinue) +
+                 @(Get-ChildItem -Path $rel -Filter 'fluxcore.exe' -File -ErrorAction SilentlyContinue) |
+                 Select-Object -First 1
+          if (-not $exe) { throw "built executable not found under $rel" }
+
+          $out = Join-Path $env:RUNNER_TEMP 'app-stdout.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'app-stderr.txt'
+          Write-Host "Launching $($exe.FullName)"
+          $proc = Start-Process -FilePath $exe.FullName -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          Start-Sleep -Seconds 20
+
+          if ($proc.HasExited) {
+            $hex = '0x' + ('{0:X8}' -f $proc.ExitCode)
+            Write-Host "Process exited during startup: $hex ($($proc.ExitCode))"
+            if (Test-Path $err) { Write-Host '--- stderr ---'; Get-Content $err }
+            throw "app exited during startup with $hex"
+          }
+
+          Write-Host "App still running after 20s (pid $($proc.Id))"
+          if (Test-Path $err) {
+            $text = Get-Content $err -Raw
+            if ($text -match 'panicked|RUST_BACKTRACE') {
+              Stop-Process -Id $proc.Id -Force
+              throw "app panicked during startup:`n$text"
+            }
+          }
+          Stop-Process -Id $proc.Id -Force
+          Write-Host 'Smoke launch OK'
+
       - name: Upload Windows bundles
         uses: actions/upload-artifact@v6
         with:
