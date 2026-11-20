@@ -1,0 +1,41 @@
+// scale: out[i] = a * x[i]
+// Param order: .u64 pX, .u64 pOut, .f32 pA, .u32 pN
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry scale(
+    .param .u64 pX,
+    .param .u64 pOut,
+    .param .f32 pA,
+    .param .u32 pN
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32  %f<5>;
+    .reg .b32  %r<6>;
+    .reg .b64  %rd<6>;
+
+    ld.param.u64  %rd1, [pX];
+    ld.param.u64  %rd2, [pOut];
+    ld.param.f32  %f1,  [pA];
+    ld.param.u32  %r1,  [pN];
+
+    mov.u32       %r2, %ctaid.x;
+    mov.u32       %r3, %ntid.x;
+    mov.u32       %r4, %tid.x;
+    mad.lo.s32    %r5, %r2, %r3, %r4;   // i
+
+    setp.ge.s32   %p1, %r5, %r1;
+    @%p1 bra      DONE;
+
+    mul.wide.u32  %rd3, %r5, 4;
+    add.u64       %rd4, %rd1, %rd3;     // &x[i]
+    add.u64       %rd5, %rd2, %rd3;     // &out[i]
+    ld.global.f32 %f2, [%rd4];
+    mul.f32       %f3, %f1, %f2;        // a * x
+    st.global.f32 [%rd5], %f3;
+
+DONE:
+    ret;
+}

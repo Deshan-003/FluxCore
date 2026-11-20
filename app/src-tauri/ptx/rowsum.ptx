@@ -1,0 +1,55 @@
+// rowsum: out[i] = sum_c A(i,c),  A = x (rows*cols), y unused.
+// Param order: .u64 pA, .u64 pOut, .u32 pRows, .u32 pCols.
+// One thread per row, 1D grid. Ascending-column accumulation (plain adds) to
+// match the CPU reference exactly.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry rowsum(
+    .param .u64 pA,
+    .param .u64 pOut,
+    .param .u32 pRows,
+    .param .u32 pCols
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32  %f<5>;
+    .reg .b32  %r<12>;
+    .reg .b64  %rd<8>;
+
+    ld.param.u64  %rd1, [pA];
+    ld.param.u64  %rd2, [pOut];
+    ld.param.u32  %r1,  [pRows];
+    ld.param.u32  %r2,  [pCols];
+
+    mov.u32       %r3, %ctaid.x;
+    mov.u32       %r4, %ntid.x;
+    mov.u32       %r5, %tid.x;
+    mad.lo.s32    %r6, %r3, %r4, %r5;    // i = row
+    setp.ge.s32   %p1, %r6, %r1;         // i >= rows
+    @%p1 bra      DONE;
+
+    mov.f32       %f1, 0f00000000;       // sum = 0.0f
+    mov.u32       %r7, 0;                // c = 0
+
+LOOP:
+    setp.ge.u32   %p2, %r7, %r2;         // c >= cols
+    @%p2 bra      STORE;
+
+    mad.lo.u32    %r8, %r6, %r2, %r7;    // idx = i*cols + c
+    mul.wide.u32  %rd3, %r8, 4;
+    add.u64       %rd4, %rd1, %rd3;      // &A[idx]
+    ld.global.f32 %f2, [%rd4];
+    add.f32       %f1, %f1, %f2;         // sum += A[idx]
+    add.u32       %r7, %r7, 1;           // c++
+    bra           LOOP;
+
+STORE:
+    mul.wide.u32  %rd5, %r6, 4;
+    add.u64       %rd6, %rd2, %rd5;      // &out[i]
+    st.global.f32 [%rd6], %f1;
+
+DONE:
+    ret;
+}

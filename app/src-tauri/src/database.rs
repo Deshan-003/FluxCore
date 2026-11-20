@@ -20,6 +20,20 @@ impl Database {
         Self::open_at(path)
     }
 
+    /// Phase 3: lets `gpu_engine::persistence` run its own SQL against the same
+    /// mutex-guarded connection without duplicating lock handling. The closure is
+    /// kept short: GPU writes happen on task completion, never on the monitor tick.
+    pub fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        f(&connection).map_err(|error| format!("gpu database operation: {error}"))
+    }
+
     fn open_at(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -107,6 +121,103 @@ impl Database {
                  INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
                  COMMIT;"
             ).map_err(|error| format!("apply database migration 3: {error}"))?;
+        }
+        // Migration 4: Phase 3 GPU acceleration tables. Additive only; no
+        // existing table is touched. The authoritative schema copy also lives
+        // in migrations/0004_gpu_acceleration.sql for reference.
+        let v4_applied: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if v4_applied == 0 {
+            connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS gpu_providers (
+                   provider_id TEXT PRIMARY KEY,
+                   label TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   available INTEGER NOT NULL,
+                   compute_ready INTEGER NOT NULL,
+                   detail TEXT NOT NULL,
+                   device_count INTEGER NOT NULL,
+                   capabilities TEXT NOT NULL,
+                   last_seen TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS gpu_provider_cache (
+                   id INTEGER PRIMARY KEY CHECK (id = 1),
+                   payload TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS gpu_acceleration_settings (
+                   id INTEGER PRIMARY KEY CHECK (id = 1),
+                   mode TEXT NOT NULL,
+                   payload TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS gpu_workload_settings (
+                   workload_id TEXT PRIMARY KEY,
+                   mode TEXT NOT NULL,
+                   backend TEXT NOT NULL,
+                   enabled INTEGER NOT NULL,
+                   selected_size INTEGER NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS gpu_task_history (
+                   id INTEGER PRIMARY KEY,
+                   task_ref TEXT,
+                   workload_id TEXT NOT NULL,
+                   backend TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   device_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   priority TEXT NOT NULL,
+                   queued_at TEXT NOT NULL,
+                   started_at TEXT,
+                   finished_at TEXT,
+                   duration_ms INTEGER,
+                   queue_ms INTEGER,
+                   cpu_time_ms REAL,
+                   gpu_time_ms REAL,
+                   transfer_time_ms REAL,
+                   total_time_ms REAL,
+                   speedup REAL,
+                   vram_used_bytes INTEGER,
+                   max_abs_error REAL,
+                   validated INTEGER NOT NULL,
+                   fell_back INTEGER NOT NULL,
+                   error TEXT,
+                   warnings TEXT NOT NULL,
+                   payload TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_gpu_task_history_finished ON gpu_task_history(finished_at);
+                 CREATE INDEX IF NOT EXISTS idx_gpu_task_history_workload ON gpu_task_history(workload_id, finished_at);
+                 CREATE TABLE IF NOT EXISTS gpu_benchmark_results (
+                   id INTEGER PRIMARY KEY,
+                   created_at TEXT NOT NULL,
+                   workload_id TEXT NOT NULL,
+                   params TEXT NOT NULL,
+                   backend TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   device_id TEXT NOT NULL,
+                   cpu TEXT NOT NULL,
+                   gpu TEXT,
+                   transfer_ms REAL,
+                   speedup REAL,
+                   vram_used_bytes INTEGER,
+                   validated INTEGER NOT NULL,
+                   max_abs_error REAL,
+                   verdict TEXT NOT NULL,
+                   environment TEXT NOT NULL,
+                   payload TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_gpu_benchmark_created ON gpu_benchmark_results(created_at);
+                 CREATE INDEX IF NOT EXISTS idx_gpu_benchmark_workload ON gpu_benchmark_results(workload_id, created_at);
+                 INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+                 COMMIT;"
+            ).map_err(|error| format!("apply database migration 4: {error}"))?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -526,6 +637,20 @@ impl Database {
                 [],
             )
             .map_err(|e| format!("prune optimization_actions: {e}"))?;
+        // Phase 3: additive retention. A row floor prevents pruning the entire
+        // history on a machine that was idle for longer than the retention window.
+        pruned += connection
+            .execute(
+                "DELETE FROM gpu_task_history WHERE finished_at < datetime('now', ?1) AND rowid NOT IN (SELECT rowid FROM gpu_task_history ORDER BY rowid DESC LIMIT 5000)",
+                params![cutoff],
+            )
+            .map_err(|e| format!("prune gpu_task_history: {e}"))?;
+        pruned += connection
+            .execute(
+                "DELETE FROM gpu_benchmark_results WHERE created_at < datetime('now', ?1) AND rowid NOT IN (SELECT rowid FROM gpu_benchmark_results ORDER BY rowid DESC LIMIT 2000)",
+                params![cutoff],
+            )
+            .map_err(|e| format!("prune gpu_benchmark_results: {e}"))?;
         Ok(pruned)
     }
 

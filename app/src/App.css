@@ -123,3 +123,52 @@ html[data-theme='light']{filter:invert(.88) hue-rotate(180deg)}
 .event-row.stored{border-left:2px solid #56c7e8}
 @media(max-width:1250px){.mi-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.mi-grid-2,.mi-charts,.mode-grid{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:760px){.mi-overview{grid-template-columns:minmax(0,1fr)}.action-row{grid-template-columns:minmax(0,1fr)}.action-side{justify-content:space-between}.audit-detail{max-width:none}}
+
+/* Phase 3 — GPU acceleration (gpu-* section only; reuses existing tokens) */
+.gpu-page{display:flex;flex-direction:column;gap:14px;min-width:0}
+.gpu-tabs{display:flex;flex-direction:column;gap:14px}
+.gpu-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.gpu-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px 14px;padding:10px 13px;font-size:11px;color:#93a2b5}
+.gpu-grid>span{display:flex;flex-direction:column;gap:2px;min-width:0}
+.gpu-grid strong{color:#dbe4ee;font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.gpu-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font:9px 'DM Mono',monospace;letter-spacing:.6px;text-transform:uppercase;border:1px solid #243144;color:#93a2b5}
+.gpu-badge.cuda{border-color:#76b900;color:#a3e635}
+.gpu-badge.wgpu{border-color:#a78bfa;color:#c4b5fd}
+.gpu-badge.cpu{border-color:#22d3ee;color:#67e8f9}
+.gpu-badge-fallback{font-style:normal;color:#f4b75e}
+.gpu-pill{display:inline-flex;padding:2px 8px;border-radius:999px;font:9px 'DM Mono',monospace;letter-spacing:.5px;text-transform:uppercase;background:#131d2b;border:1px solid #243144;color:#93a2b5}
+.gpu-pill.gpuRecommended{border-color:#76b900;color:#a3e635}
+.gpu-pill.cpuRecommended{border-color:#22d3ee;color:#67e8f9}
+.gpu-pill.gpuAvailableNotBeneficial{border-color:#f4b75e;color:#f4b75e}
+.gpu-pill.insufficientGpuResources,.gpu-pill.status-failed,.gpu-pill.status-rejected{border-color:#f27682;color:#f27682}
+.gpu-pill.status-running{border-color:#56c7e8;color:#56c7e8}
+.gpu-pill.status-succeeded{border-color:#76b900;color:#a3e635}
+.gpu-pill.status-cancelled,.gpu-pill.status-timedOut{border-color:#f4b75e;color:#f4b75e}
+.gpu-workload-row{display:flex;flex-direction:column;gap:8px;padding:12px 13px;border:1px solid #243144;border-radius:8px;background:#131d2b;margin:10px 13px}
+.gpu-workload-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.gpu-workload-head strong{font-size:12px;color:#dbe4ee}
+.gpu-estimate-source{font:8px 'DM Mono',monospace;letter-spacing:.6px;text-transform:uppercase;color:#66758a}
+.gpu-reason{font-size:11px;color:#93a2b5;line-height:1.5;margin:0}
+.gpu-blocker{font-size:10px;color:#f4b75e;margin:0}
+.gpu-workload-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.gpu-size-picker{display:flex;align-items:center;gap:6px;font-size:10px;color:#93a2b5}
+.gpu-size-picker select,.gpu-config-grid select,.gpu-pin-controls select,.setting-row select{background:#0b1220;border:1px solid #243144;color:#dbe4ee;border-radius:6px;padding:4px 6px;font-size:11px}
+.gpu-last-bench{font:9px 'DM Mono',monospace;color:#66758a}
+.gpu-task-table{width:100%;border-collapse:collapse;font-size:11px}
+.gpu-task-table th{font:9px 'DM Mono',monospace;letter-spacing:.6px;text-transform:uppercase;color:#66758a;text-align:left;padding:8px 10px;border-bottom:1px solid #243144}
+.gpu-task-table td{padding:8px 10px;border-bottom:1px solid #1a2432;color:#93a2b5;vertical-align:top}
+.gpu-task-notes{display:flex;flex-direction:column;gap:3px;max-width:320px}
+.gpu-error{color:#f27682;font-size:10px}
+.gpu-warning{color:#f4b75e;font-size:10px}
+.gpu-empty-row{padding:14px;font-size:11px;color:#66758a}
+.gpu-config-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;padding:12px 13px}
+.gpu-config-grid label{display:flex;flex-direction:column;gap:4px;font-size:10px;color:#93a2b5}
+.gpu-config-grid input{background:#0b1220;border:1px solid #243144;color:#dbe4ee;border-radius:6px;padding:5px 6px;font-size:11px}
+.gpu-pin-controls{display:flex;align-items:center;gap:8px}
+.gpu-bench-chart{padding:10px 13px}
+.gpu-verdicts{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.gpu-verdicts li{display:flex;gap:8px;align-items:baseline;font-size:10px;color:#93a2b5;flex-wrap:wrap}
+.gpu-verdicts strong{color:#dbe4ee}
+.gpu-verdicts em{font-style:normal;color:#66758a}
+@media(max-width:1250px){.gpu-columns{grid-template-columns:minmax(0,1fr)}.gpu-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.gpu-config-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.gpu-grid{grid-template-columns:minmax(0,1fr)}.gpu-config-grid{grid-template-columns:minmax(0,1fr)}}

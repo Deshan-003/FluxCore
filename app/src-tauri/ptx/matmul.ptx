@@ -1,0 +1,76 @@
+// matmul: C(i,j) = sum_t A(i,t) * B(t,j),  A = x (m*k), B = y (k*n), C = out (m*n)
+// Param order: .u64 pA, .u64 pB, .u64 pC, .u32 pM, .u32 pK, .u32 pN
+//
+// Launched with a 2D grid so no integer division is needed:
+//   j = ctaid.x * ntid.x + tid.x  (column)
+//   i = ctaid.y * ntid.y + tid.y  (row)
+// Ascending-t accumulation with a separate mul then add (non-fused) to match
+// the CPU reference's arithmetic.
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry matmul(
+    .param .u64 pA,
+    .param .u64 pB,
+    .param .u64 pC,
+    .param .u32 pM,
+    .param .u32 pK,
+    .param .u32 pN
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32  %f<6>;
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<12>;
+
+    ld.param.u64  %rd1, [pA];
+    ld.param.u64  %rd2, [pB];
+    ld.param.u64  %rd3, [pC];
+    ld.param.u32  %r1,  [pM];        // m
+    ld.param.u32  %r2,  [pK];        // k
+    ld.param.u32  %r3,  [pN];        // n
+
+    mov.u32       %r5, %ctaid.x;
+    mov.u32       %r6, %ntid.x;
+    mov.u32       %r7, %tid.x;
+    mad.lo.s32    %r8, %r5, %r6, %r7;    // j
+    mov.u32       %r9, %ctaid.y;
+    mov.u32       %r10, %ntid.y;
+    mov.u32       %r11, %tid.y;
+    mad.lo.s32    %r12, %r9, %r10, %r11; // i
+
+    setp.ge.u32   %p1, %r12, %r1;        // i >= m
+    @%p1 bra      DONE;
+    setp.ge.u32   %p1, %r8, %r3;         // j >= n
+    @%p1 bra      DONE;
+
+    mov.f32       %f1, 0f00000000;       // sum = 0.0f
+    mov.u32       %r13, 0;               // t = 0
+
+LOOP:
+    setp.ge.u32   %p2, %r13, %r2;        // t >= k
+    @%p2 bra      STORE;
+
+    mad.lo.u32    %r14, %r12, %r2, %r13; // idxA = i*k + t
+    mad.lo.u32    %r15, %r13, %r3, %r8;  // idxB = t*n + j
+    mul.wide.u32  %rd4, %r14, 4;
+    mul.wide.u32  %rd5, %r15, 4;
+    add.u64       %rd7, %rd1, %rd4;      // &A[idxA]
+    add.u64       %rd8, %rd2, %rd5;      // &B[idxB]
+    ld.global.f32 %f2, [%rd7];
+    ld.global.f32 %f3, [%rd8];
+    mul.f32       %f4, %f2, %f3;         // A * B (non-fused)
+    add.f32       %f1, %f1, %f4;         // sum += A * B
+    add.u32       %r13, %r13, 1;         // t++
+    bra           LOOP;
+
+STORE:
+    mad.lo.u32    %r14, %r12, %r3, %r8;  // idx = i*n + j
+    mul.wide.u32  %rd6, %r14, 4;
+    add.u64       %rd9, %rd3, %rd6;      // &C[idx]
+    st.global.f32 [%rd9], %f1;
+
+DONE:
+    ret;
+}

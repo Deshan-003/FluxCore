@@ -1,0 +1,337 @@
+//! CPU provider: the authoritative reference and the CPU fallback.
+//!
+//! Implements all four workloads with plain `f32` loops. To honour cooperative
+//! cancellation and the wall-clock timeout, the outer loop is split into
+//! chunks and each chunk is executed through `WorkloadParams::run_cpu` on a
+//! sub-problem (sub-params + sliced inputs). This reproduces `run_cpu`'s exact
+//! per-element arithmetic (identical operation order, so bit-identical output)
+//! while giving us cancellation checkpoints between chunks.
+
+use super::{
+    build_outcome, check_interrupt, pick_device_id, CancelToken, ExecutionOutcome,
+    ExecutionRequest, GpuDeviceInfo, GpuError, GpuMemoryInfo, GpuProvider, GpuResult,
+    ProviderCapabilities, ProviderKind, TimingBreakdown, WorkloadInputs, WorkloadParams,
+    WorkloadRequirement, WorkloadSupport,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Work-element budget per chunk (used to derive chunk sizes for each shape).
+const CHUNK: usize = 1 << 18; // 262144
+
+const SUPPORTED: [&str; 4] = ["vector_axpy", "vector_scale", "matmul", "row_sum"];
+
+/// Max host bytes a single CPU attempt may allocate for its buffers.
+const MAX_CPU_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+pub struct CpuProvider {
+    ready: AtomicBool,
+}
+
+impl CpuProvider {
+    pub fn new() -> Self {
+        CpuProvider {
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    fn device() -> GpuDeviceInfo {
+        GpuDeviceInfo {
+            device_id: "cpu".to_string(),
+            name: "CPU (scalar reference / fallback)".to_string(),
+            vendor: std::env::consts::ARCH.to_string(),
+            backend: "cpu".to_string(),
+            monitor_gpu_index: None,
+            dedicated_total_bytes: None,
+            dedicated_free_bytes: None,
+            compute_capability: None,
+            driver_version: None,
+            max_workgroup_size: None,
+            max_storage_buffer_bytes: Some(MAX_CPU_BYTES),
+            is_discrete: false,
+            notes: vec![
+                "Runs on worker threads; no device context is held.".to_string(),
+                "This is the reference used to validate every GPU result.".to_string(),
+            ],
+        }
+    }
+}
+
+impl Default for CpuProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute `params` into `out` via chunked `run_cpu` sub-problems, checking
+/// cancel/timeout between chunks. `out.len()` must equal `params.output_len()`.
+fn run_chunked(
+    params: &WorkloadParams,
+    inputs: &WorkloadInputs,
+    out: &mut [f32],
+    provider: &str,
+    cancel: &CancelToken,
+    timeout: Duration,
+    started: Instant,
+) -> GpuResult<()> {
+    match *params {
+        WorkloadParams::VectorAxpy { n, a } => {
+            let step = n.min(CHUNK).max(1);
+            let mut s = 0usize;
+            while s < n {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let e = (s + step).min(n);
+                let sub = WorkloadParams::VectorAxpy { n: e - s, a };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[s..e].to_vec(),
+                    y: inputs.y[s..e].to_vec(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[s..e]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                s = e;
+            }
+        }
+        WorkloadParams::VectorScale { n, a } => {
+            let step = n.min(CHUNK).max(1);
+            let mut s = 0usize;
+            while s < n {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let e = (s + step).min(n);
+                let sub = WorkloadParams::VectorScale { n: e - s, a };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[s..e].to_vec(),
+                    y: Vec::new(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[s..e]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                s = e;
+            }
+        }
+        WorkloadParams::Matmul { m, k, n } => {
+            let rows_per_chunk = (CHUNK / n.max(1)).max(1);
+            let mut rs = 0usize;
+            while rs < m {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let re = (rs + rows_per_chunk).min(m);
+                let sub = WorkloadParams::Matmul { m: re - rs, k, n };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[rs * k..re * k].to_vec(),
+                    y: inputs.y.clone(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[rs * n..re * n])
+                    .map_err(|err| GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    })?;
+                rs = re;
+            }
+        }
+        WorkloadParams::RowSum { rows, cols } => {
+            let rows_per_chunk = (CHUNK / cols.max(1)).max(1);
+            let mut rs = 0usize;
+            while rs < rows {
+                check_interrupt(provider, cancel, started, timeout)?;
+                let re = (rs + rows_per_chunk).min(rows);
+                let sub = WorkloadParams::RowSum {
+                    rows: re - rs,
+                    cols,
+                };
+                let sub_inputs = WorkloadInputs {
+                    x: inputs.x[rs * cols..re * cols].to_vec(),
+                    y: Vec::new(),
+                };
+                sub.run_cpu(&sub_inputs, &mut out[rs..re]).map_err(|err| {
+                    GpuError::Internal {
+                        provider: provider.to_string(),
+                        detail: err,
+                    }
+                })?;
+                rs = re;
+            }
+        }
+    }
+    check_interrupt(provider, cancel, started, timeout)?;
+    Ok(())
+}
+
+impl GpuProvider for CpuProvider {
+    fn id(&self) -> &'static str {
+        "cpu"
+    }
+
+    fn label(&self) -> &'static str {
+        "CPU reference (scalar)"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Cpu
+    }
+
+    fn initialize(&self) -> GpuResult<Vec<GpuDeviceInfo>> {
+        self.ready.store(true, Ordering::SeqCst);
+        Ok(vec![Self::device()])
+    }
+
+    fn is_available(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    fn devices(&self) -> Vec<GpuDeviceInfo> {
+        vec![Self::device()]
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            compute_ready: true,
+            unavailable_reason: None,
+            max_threads_per_workgroup: None,
+            max_workgroup_size_x: None,
+            max_workgroup_size_y: None,
+            max_workgroup_size_z: None,
+            max_buffer_bytes: Some(MAX_CPU_BYTES),
+            allocation_alignment: 64,
+            backend_notes: vec![
+                "Scalar Rust loops; chunked for cooperative cancellation.".to_string(),
+                "No device memory is used (VRAM is never converted into RAM).".to_string(),
+            ],
+        }
+    }
+
+    fn supported_workloads(&self) -> Vec<WorkloadSupport> {
+        vec![
+            WorkloadSupport {
+                workload_id: "vector_axpy".to_string(),
+                max_elements: 64 * 1024 * 1024,
+                notes: vec!["n <= 64M (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "vector_scale".to_string(),
+                max_elements: 64 * 1024 * 1024,
+                notes: vec!["n <= 64M (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "matmul".to_string(),
+                max_elements: 2048,
+                notes: vec!["m,k,n <= 2048 (catalogue cap)".to_string()],
+            },
+            WorkloadSupport {
+                workload_id: "row_sum".to_string(),
+                max_elements: 32 * 1024 * 1024,
+                notes: vec!["rows*cols <= 32M (catalogue cap)".to_string()],
+            },
+        ]
+    }
+
+    fn memory_info(&self) -> Option<GpuMemoryInfo> {
+        None
+    }
+
+    fn can_execute(&self, requirement: &WorkloadRequirement) -> GpuResult<()> {
+        if !SUPPORTED.contains(&requirement.workload_id.as_str()) {
+            return Err(GpuError::Unsupported {
+                provider: "cpu".to_string(),
+                detail: format!("unknown workload id '{}'", requirement.workload_id),
+            });
+        }
+        if let Some(support) = self
+            .supported_workloads()
+            .into_iter()
+            .find(|support| support.workload_id == requirement.workload_id)
+        {
+            if requirement.input_size as u64 > support.max_elements {
+                return Err(GpuError::Unsupported {
+                    provider: "cpu".to_string(),
+                    detail: format!(
+                        "workload '{}' size {} above the provider cap {}",
+                        requirement.workload_id, requirement.input_size, support.max_elements
+                    ),
+                });
+            }
+        }
+        if requirement.device_bytes > MAX_CPU_BYTES {
+            return Err(GpuError::ResourceExhausted {
+                provider: "cpu".to_string(),
+                detail: format!(
+                    "workload needs {} host bytes, above the {} byte CPU cap",
+                    requirement.device_bytes, MAX_CPU_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, request: &ExecutionRequest) -> GpuResult<ExecutionOutcome> {
+        let start = Instant::now();
+        let params = &request.params;
+
+        let setup_start = Instant::now();
+        let inputs = params.make_inputs();
+        let setup_ns = setup_start.elapsed().as_nanos() as u64;
+
+        let mut out = vec![0.0f32; params.output_len()];
+        let compute_start = Instant::now();
+        run_chunked(
+            params,
+            &inputs,
+            &mut out,
+            "cpu",
+            &request.cancel,
+            request.timeout,
+            start,
+        )?;
+        let compute_ns = compute_start.elapsed().as_nanos() as u64;
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+        let timing = TimingBreakdown {
+            setup_ns,
+            transfer_in_ns: 0,
+            compute_ns,
+            transfer_out_ns: 0,
+            validation_ns: 0,
+            total_ns,
+            transferred_bytes: 0,
+        };
+
+        let devices = self.devices();
+        let (device_id, substituted) = pick_device_id(&devices, &request.device_id);
+        let mut notes = vec![
+            "CPU scalar reference; output is bit-identical to WorkloadParams::run_cpu.".to_string(),
+            format!("chunked outer loop (budget {CHUNK} work elements/chunk)"),
+        ];
+        if substituted {
+            notes.push(format!(
+                "requested device '{}' not found; used CPU device",
+                request.device_id
+            ));
+        }
+
+        Ok(build_outcome(
+            "cpu",
+            "cpu",
+            device_id,
+            params,
+            &out,
+            timing,
+            0,
+            notes,
+            false,
+            None,
+        ))
+    }
+
+    fn shutdown(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+}
