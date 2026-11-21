@@ -150,9 +150,12 @@ fn main() {
             // Calibration sample. The run above is a controlled, idle workload:
             // no anomaly is injected, so any alert is a false positive. Forecasts
             // whose target time has passed carry the observed `actual` value.
-            let mature: Vec<_> = state
-                .forecasts
+            // In-memory forecasts are regenerated with actual=None; matured
+            // comparisons are persisted by the storage pass and exposed here.
+            let mature: Vec<_> = ["cpu", "ram", "commit"]
                 .iter()
+                .filter_map(|metric| intelligence.history(metric, 1).ok())
+                .flat_map(|history| history.comparisons.into_iter())
                 .filter(|forecast| forecast.actual.is_some() && forecast.value.is_some())
                 .collect();
             if mature.is_empty() {
