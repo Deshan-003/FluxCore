@@ -298,7 +298,17 @@ pub fn run() {
         Arc::clone(&engine),
     ));
     intelligence.attach_gpu(&gpu);
-    tauri::Builder::default()
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default();
+    // Optional WebDriver server for the native UI E2E build only; the shipped
+    // build does not enable the `e2e` feature and never registers these plugins.
+    #[cfg(feature = "e2e")]
+    {
+        builder = builder
+            .plugin(tauri_plugin_wdio::init())
+            .plugin(tauri_plugin_wdio_webdriver::init());
+    }
+    builder
         .manage(AppState {
             engine,
             memory,

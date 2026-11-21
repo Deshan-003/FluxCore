@@ -3,9 +3,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// Point at the built release binary; tauri.conf.json names the product FluxCore
-// but Cargo names the executable fluxcore, so this is the raw target path.
-const appBinaryPath = path.resolve(here, '../src-tauri/target/release/fluxcore.exe');
+// The embedded WebDriver server is registered only in the feature-gated debug
+// build, so drive that binary rather than the shipped release one.
+const appBinaryPath = path.resolve(here, '../src-tauri/target/debug/fluxcore.exe');
 
 export const config = {
   runner: 'local',
@@ -21,19 +21,15 @@ export const config = {
     },
   ],
 
-  // 'external' drives the real app through tauri-driver. It works with the
-  // release binary and needs no WebDriver plugin compiled into the app. The
-  // service installs tauri-driver and a matching Edge WebDriver automatically.
+  // 'embedded' connects to the WebDriver server running inside the feature-gated
+  // debug build. No msedgedriver or tauri-driver is needed, which avoids the
+  // external driver's version-detection fragility on current WebView2 runtimes.
   services: [
     [
       '@wdio/tauri-service',
       {
-        driverProvider: 'external',
-        autoInstallTauriDriver: true,
-        // The service's download helper calls a ZipFile.ExtractToDirectory
-        // overload that does not exist under the Windows PowerShell 5.1 it
-        // invokes. CI installs the matching driver beforehand; use that one.
-        autoDownloadEdgeDriver: false,
+        driverProvider: 'embedded',
+        startTimeout: 60000,
         captureBackendLogs: true,
         captureFrontendLogs: true,
       },
