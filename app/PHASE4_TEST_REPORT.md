@@ -177,17 +177,19 @@ workload — all allocations released. AMD/Intel adapters have **no compute kern
 
 A 40-observation pass over the real collector (10 simulated minutes, idle CI runner) produced:
 
-| Metric | Result |
-| --- | --- |
-| Matured 1-minute forecasts | 21 / 21 |
-| MAE | 4.264 |
-| MAPE (capped at 10×) | 51.3% |
-| Interval coverage | 20 / 21 (95.2%) |
-| Anomalies on idle workload | 2 over 80 samples (0.025 per sample) |
+| Metric | PR run (44897794534) | Main run (44899078959) |
+| --- | --- | --- |
+| Matured 1-minute forecasts | 21 / 21 | 21 / 21 |
+| MAE | 4.264 | 4.285 |
+| MAPE (capped at 10×) | 51.3% | 27.0% |
+| Interval coverage | 20 / 21 (95.2%) | 21 / 21 (100%) |
+| Anomalies on idle workload | 2 / 80 (0.025 per sample) | 0 / 80 (0) |
 
-These are **controlled-CI numbers**, not a representative desktop workload. The non-zero idle anomaly
-count is a genuine finding: the detector is not false-positive-free. Longer 5- and 15-minute horizons
-did not mature within this run and remain unmeasured.
+The two runs disagree — MAE is stable but MAPE, coverage and the idle anomaly count vary with the
+runner's host conditions. **These are controlled-CI numbers, not a representative desktop workload**,
+and no single run should be quoted as a definitive accuracy figure. The non-zero count in one run is
+still a genuine finding: the detector is not guaranteed false-positive-free. Longer 5- and
+15-minute horizons did not mature within these runs and remain unmeasured.
 
 ## Not verified / measured
 
