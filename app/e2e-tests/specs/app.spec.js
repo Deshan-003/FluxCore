@@ -35,7 +35,7 @@ describe('FluxCore native UI', () => {
   it('navigates to Settings and flips the monitoring switch both ways', async () => {
     await navigateTo('Settings');
     expect(
-      await $('//strong[normalize-space()="Monitoring preferences"]').isExisting(),
+      await $('//h2[normalize-space()="Monitoring preferences"]').isExisting(),
     ).toBe(true);
 
     const toggle = await $(
