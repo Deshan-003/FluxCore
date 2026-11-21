@@ -1,0 +1,77 @@
+{
+  "driver": "NVIDIA GeForce RTX 2050",
+  "max_threads_per_block": 1024,
+  "all_validated": true,
+  "all_vram_released": true,
+  "results": [
+    {
+      "workload": "axpy",
+      "params": {
+        "n": 1048576,
+        "a": 1.5
+      },
+      "pass": true,
+      "max_abs_error": 2.384185791015625e-07,
+      "tolerance": 0.001,
+      "transfer_in_ms": 4.8091,
+      "kernel_ms": 3.3798,
+      "transfer_out_ms": 2.1432,
+      "gpu_total_ms": 10.3321,
+      "vram_before_free_mib": 3302.2,
+      "vram_after_free_mib": 3302.2,
+      "vram_released": true
+    },
+    {
+      "workload": "scale",
+      "params": {
+        "n": 1048576,
+        "a": 1.5
+      },
+      "pass": true,
+      "max_abs_error": 0.0,
+      "tolerance": 0.001,
+      "transfer_in_ms": 1.2195,
+      "kernel_ms": 0.3121,
+      "transfer_out_ms": 1.1807,
+      "gpu_total_ms": 2.7123,
+      "vram_before_free_mib": 3302.2,
+      "vram_after_free_mib": 3302.2,
+      "vram_released": true
+    },
+    {
+      "workload": "matmul",
+      "params": {
+        "m": 256,
+        "k": 256,
+        "n": 256
+      },
+      "pass": true,
+      "max_abs_error": 5.7220458984375e-06,
+      "tolerance": 0.001,
+      "transfer_in_ms": 0.5664,
+      "kernel_ms": 0.2288,
+      "transfer_out_ms": 0.1428,
+      "gpu_total_ms": 0.938,
+      "vram_before_free_mib": 3302.2,
+      "vram_after_free_mib": 3302.2,
+      "vram_released": true
+    },
+    {
+      "workload": "rowsum",
+      "params": {
+        "rows": 1024,
+        "cols": 1024
+      },
+      "pass": true,
+      "max_abs_error": 0.0,
+      "tolerance": 0.001,
+      "transfer_in_ms": 2.1406,
+      "kernel_ms": 0.3588,
+      "transfer_out_ms": 0.1054,
+      "gpu_total_ms": 2.6048,
+      "vram_before_free_mib": 3302.2,
+      "vram_after_free_mib": 3302.2,
+      "vram_released": true
+    }
+  ]
+}

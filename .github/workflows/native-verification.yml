@@ -89,12 +89,21 @@ jobs:
           cargo run --locked --release --example intelligence_benchmark |
             Tee-Object -FilePath native_benchmark_output.txt
 
+      - name: Forecast calibration sample (40 observations)
+        working-directory: app/src-tauri
+        shell: pwsh
+        run: |
+          cargo run --locked --release --example intelligence_benchmark 40 |
+            Tee-Object -FilePath calibration_output.txt
+
       - name: Upload benchmark output
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: native-benchmark-output
-          path: app/src-tauri/native_benchmark_output.txt
+          path: |
+            app/src-tauri/native_benchmark_output.txt
+            app/src-tauri/calibration_output.txt
           if-no-files-found: warn
 
   installer:

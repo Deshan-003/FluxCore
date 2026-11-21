@@ -138,13 +138,70 @@ fn main() {
     }
 
     match intelligence.state() {
-        Ok(state) => println!(
-            "[engine] serving live intelligence: health=\"{}\" forecasts={} anomalies={} recommendations={}",
-            state.health,
-            state.forecasts.len(),
-            state.anomalies.len(),
-            state.recommendations.len()
-        ),
+        Ok(state) => {
+            println!(
+                "[engine] serving live intelligence: health=\"{}\" forecasts={} anomalies={} recommendations={}",
+                state.health,
+                state.forecasts.len(),
+                state.anomalies.len(),
+                state.recommendations.len()
+            );
+
+            // Calibration sample. The run above is a controlled, idle workload:
+            // no anomaly is injected, so any alert is a false positive. Forecasts
+            // whose target time has passed carry the observed `actual` value.
+            let mature: Vec<_> = state
+                .forecasts
+                .iter()
+                .filter(|forecast| forecast.actual.is_some() && forecast.value.is_some())
+                .collect();
+            if mature.is_empty() {
+                println!("[calibration] no matured forecasts in this run");
+            } else {
+                let count = mature.len() as f64;
+                let mut abs_error = 0.0f64;
+                let mut pct_error = 0.0f64;
+                let mut covered = 0usize;
+                let mut bounded = 0usize;
+                for forecast in &mature {
+                    let actual = forecast.actual.unwrap();
+                    let predicted = forecast.value.unwrap();
+                    abs_error += (actual - predicted).abs();
+                    if actual.abs() > f64::EPSILON {
+                        pct_error += ((actual - predicted).abs() / actual.abs()).min(10.0);
+                    }
+                    if let (Some(low), Some(high)) = (forecast.low, forecast.high) {
+                        bounded += 1;
+                        if actual >= low && actual <= high {
+                            covered += 1;
+                        }
+                    }
+                }
+                println!(
+                    "[calibration] matured forecasts  {}/{} ({} min horizon)",
+                    mature.len(),
+                    state.forecasts.len(),
+                    mature.first().map_or(0, |forecast| forecast.horizon_minutes)
+                );
+                println!("[calibration] MAE               {:.3}", abs_error / count);
+                println!("[calibration] MAPE (capped 10x) {:.1}%", pct_error / count * 100.0);
+                if bounded > 0 {
+                    println!(
+                        "[calibration] interval coverage {}/{} ({:.1}%)",
+                        covered,
+                        bounded,
+                        covered as f64 * 100.0 / bounded as f64
+                    );
+                }
+            }
+            let samples = u32::from(iterations) * 2;
+            println!(
+                "[calibration] anomalies on idle  {} over {} samples ({:.3} per sample)",
+                state.anomalies.len(),
+                samples,
+                state.anomalies.len() as f64 / samples as f64
+            );
+        }
         Err(error) => println!("[engine] intelligence state unavailable: {error}"),
     }
 
