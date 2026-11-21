@@ -30,7 +30,10 @@ export const config = {
       {
         driverProvider: 'external',
         autoInstallTauriDriver: true,
-        autoDownloadEdgeDriver: true,
+        // The service's download helper calls a ZipFile.ExtractToDirectory
+        // overload that does not exist under the Windows PowerShell 5.1 it
+        // invokes. CI installs the matching driver beforehand; use that one.
+        autoDownloadEdgeDriver: false,
         captureBackendLogs: true,
         captureFrontendLogs: true,
       },

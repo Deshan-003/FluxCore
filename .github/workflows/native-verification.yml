@@ -239,6 +239,33 @@ jobs:
           Stop-Process -Id $proc.Id -Force
           Write-Host 'Smoke launch OK'
 
+      # tauri-service's auto-download helper calls a ZipFile.ExtractToDirectory
+      # overload that does not exist under the Windows PowerShell 5.1 it invokes,
+      # so install the driver matching the runner's WebView2 ourselves.
+      - name: Install matching Edge WebDriver
+        shell: pwsh
+        run: |
+          $roots = @(
+            'C:\Program Files (x86)\Microsoft\EdgeWebView\Application',
+            'C:\Program Files (x86)\Microsoft\Edge\Application'
+          )
+          $root = $roots | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $root) { throw 'No WebView2 or Edge installation found' }
+          $version = Get-ChildItem $root -Directory |
+                     Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+                     Sort-Object { [version]$_.Name } -Descending |
+                     Select-Object -First 1 -ExpandProperty Name
+          if (-not $version) { throw "No versioned runtime found under $root" }
+          Write-Host "Installing msedgedriver for WebView2/Edge $version"
+
+          $dir = Join-Path $env:RUNNER_TEMP 'msedgedriver'
+          $zip = Join-Path $env:RUNNER_TEMP 'msedgedriver.zip'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Invoke-WebRequest -Uri "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          Get-ChildItem $dir -Filter 'msedgedriver*.exe' | ForEach-Object { $_.FullName }
+
       # Drives the real release binary through tauri-driver + WebdriverIO:
       # collector status, sidebar navigation and a settings toggle. This covers
       # the interactive native UI path that a headless smoke launch cannot.
