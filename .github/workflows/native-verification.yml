@@ -19,6 +19,7 @@ on:
   pull_request:
     paths:
       - "app/**"
+      - ".github/workflows/native-verification.yml"
 
 permissions:
   contents: read
@@ -118,14 +119,88 @@ jobs:
         working-directory: app
         run: npm ci
 
+      # Optional Authenticode code signing. Set repository secrets
+      # WINDOWS_CERT_PFX_BASE64 (base64 of a .pfx with its private key) and
+      # WINDOWS_CERT_PASSWORD to sign the app and both installers. With no
+      # secrets present the job builds unsigned artifacts exactly as before.
+      #
+      # Signing is done inside `tauri build` via bundle.windows.certificateThumbprint
+      # rather than with a post-build signtool pass: signing the finished .msi/.exe
+      # afterwards does not cover the application executable packaged inside it,
+      # and it is the installed app that Smart App Control evaluates. Note also
+      # that SAC weighs publisher reputation, not merely "is signed" - a freshly
+      # issued standard (OV) certificate can still be blocked until reputation
+      # accrues; EV certificates and Azure Trusted Signing
+      # (bundle.windows.signCommand) are the routes that clear it reliably.
+      - name: Import code-signing certificate (optional)
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_PFX_BASE64) {
+            Write-Host 'No WINDOWS_CERT_PFX_BASE64 secret set - building unsigned artifacts.'
+            Add-Content -Path $env:GITHUB_ENV -Value 'SIGN_CERT_THUMBPRINT='
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          $password = ConvertTo-SecureString -String $env:CERT_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+                  Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          Remove-Item $pfx -Force
+          if (-not $cert) { throw 'the .pfx did not contain a certificate with a private key' }
+          Write-Host "Imported signing certificate; valid until $($cert.NotAfter.ToString('u'))."
+          Add-Content -Path $env:GITHUB_ENV -Value ('SIGN_CERT_THUMBPRINT=' + $cert.Thumbprint)
+
       # Tauri downloads NSIS and WiX v3 on first use. `tauri build` runs the
       # beforeBuildCommand (npm run build) and emits both bundle targets
       # (targets: ["nsis", "msi"] in tauri.conf.json).
-      # To ship signed installers instead of unsigned ones, add the
-      # certificate/TAURI_SIGNING_* secrets and signing settings here.
       - name: Build app and bundles (msi, nsis)
         working-directory: app
-        run: npm run tauri build
+        shell: pwsh
+        run: |
+          if ($env:SIGN_CERT_THUMBPRINT) {
+            $config = Join-Path $env:RUNNER_TEMP 'tauri.signing.conf.json'
+            @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $env:SIGN_CERT_THUMBPRINT
+                  digestAlgorithm       = 'sha256'
+                  timestampUrl          = 'http://timestamp.digicert.com'
+                }
+              }
+            } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $config
+            Write-Host 'Building with code signing enabled.'
+            npm run tauri build -- --config $config
+          } else {
+            Write-Host 'Building unsigned (no signing certificate configured).'
+            npm run tauri build
+          }
+
+      - name: Verify signatures (only when signed)
+        shell: pwsh
+        run: |
+          if (-not $env:SIGN_CERT_THUMBPRINT) {
+            Write-Host 'Signing not configured - skipping signature verification.'
+            exit 0
+          }
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe was not found in the Windows SDK' }
+
+          $targets = @()
+          $targets += Get-ChildItem 'app/src-tauri/target/release' -Filter '*.exe' -File -ErrorAction SilentlyContinue
+          $targets += Get-ChildItem 'app/src-tauri/target/release/bundle/msi' -Filter '*.msi' -File -ErrorAction SilentlyContinue
+          $targets += Get-ChildItem 'app/src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File -ErrorAction SilentlyContinue
+          if (-not $targets) { throw 'no build outputs were found to verify' }
+
+          foreach ($target in $targets) {
+            Write-Host "Verifying $($target.FullName)"
+            & $signtool.FullName verify /pa /v $target.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed for $($target.Name)" }
+          }
+          Write-Host 'All build outputs carry a valid Authenticode signature.'
 
       # Native runtime smoke test: launch the real app and confirm it starts and
       # stays alive. SAC never applies on a hosted runner, so this exercises the
