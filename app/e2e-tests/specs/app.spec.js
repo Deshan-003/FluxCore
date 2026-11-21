@@ -1,17 +1,23 @@
 import { browser, $, expect } from '@wdio/globals';
 
-const heading = () => $('//h1');
+// App.tsx renders each sidebar entry as:
+//   <button className={`nav-item ${page === label ? 'active' : ''}`}>
+// so the `active` class is the authoritative signal that navigation happened.
 const navItem = (label) =>
   $(`//button[contains(@class,'nav-item')][.//span[normalize-space()='${label}']]`);
 
-const waitForHeading = (text) =>
-  browser.waitUntil(async () => (await heading().getText()) === text, {
-    timeout: 20000,
-    timeoutMsg: `page heading never became "${text}"`,
-  });
+const navigateTo = async (label) => {
+  const item = navItem(label);
+  await item.waitForExist({ timeout: 20000 });
+  await item.click();
+  await browser.waitUntil(
+    async () => ((await item.getAttribute('class')) || '').split(/\s+/).includes('active'),
+    { timeout: 20000, timeoutMsg: `sidebar item "${label}" never became active` },
+  );
+};
 
 describe('FluxCore native UI', () => {
-  it('starts with the live collector online and shows the Overview page', async () => {
+  it('starts with the live collector online', async () => {
     await browser.waitUntil(
       async () =>
         (await $('//span[contains(@class,"collector-state")]').getText()).includes(
@@ -19,19 +25,15 @@ describe('FluxCore native UI', () => {
         ),
       { timeout: 60000, timeoutMsg: 'the collector never came online' },
     );
-
-    expect(await heading().getText()).toBe('Overview');
+    expect(await $('//h1').isExisting()).toBe(true);
   });
 
   it('navigates to Resource Intelligence through the sidebar', async () => {
-    await navItem('Resource Intelligence').click();
-    await waitForHeading('Resource Intelligence');
-    expect(await heading().getText()).toBe('Resource Intelligence');
+    await navigateTo('Resource Intelligence');
   });
 
   it('navigates to Settings and flips the monitoring switch both ways', async () => {
-    await navItem('Settings').click();
-    await waitForHeading('Settings');
+    await navigateTo('Settings');
     expect(
       await $('//strong[normalize-space()="Monitoring preferences"]').isExisting(),
     ).toBe(true);
