@@ -146,8 +146,16 @@ export const useMonitoringStore = create<MonitoringState>((set, get) => ({
     if (isDesktopRuntime()) {
       try {
         await saveSettings(settings)
-        set({ error: null })
-        void get().refresh()
+        await get().refresh()
+        // The collector publishes a fresh snapshot on its next tick, so the value
+        // just fetched can still carry the previous monitoring flag. Reflect the
+        // saved setting immediately and let the next event confirm it.
+        set((state) => ({
+          error: null,
+          snapshot: state.snapshot
+            ? { ...state.snapshot, monitoring: settings.monitoringEnabled }
+            : state.snapshot,
+        }))
       } catch (error) {
         // The backend rejected the change: roll back to the stored values so
         // the UI never runs on settings the engine refused. Refresh first,

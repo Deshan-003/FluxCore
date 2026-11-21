@@ -239,7 +239,33 @@ jobs:
           Stop-Process -Id $proc.Id -Force
           Write-Host 'Smoke launch OK'
 
+      # Build the debug binary that carries the feature-gated embedded WebDriver
+      # server. The shipped release build is unaffected: it never enables `e2e`.
+      - name: Build E2E app with embedded WebDriver
+        working-directory: app
+        run: npm run tauri build -- --debug --no-bundle --features e2e
+
+      # Drives the real debug app through its embedded WebDriver server:
+      - name: Install UI E2E dependencies
+        working-directory: app/e2e-tests
+        run: npm ci --no-audit --no-fund
+
+      - name: Native UI E2E (embedded WebDriver + WebdriverIO)
+        working-directory: app/e2e-tests
+        run: npm test
+
+      - name: Upload UI E2E logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ui-e2e-logs
+          path: |
+            app/e2e-tests/logs/**
+            app/e2e-tests/*.log
+          if-no-files-found: warn
+
       - name: Upload Windows bundles
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: fluxcore-windows-bundles

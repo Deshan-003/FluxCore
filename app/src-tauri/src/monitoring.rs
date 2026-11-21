@@ -493,9 +493,29 @@ fn monitor_loop(shared: Arc<Shared>, stop: mpsc::Receiver<()>) {
                 }
                 last_persist = Instant::now();
             }
-        } else if let Ok(mut current) = shared.snapshot.write() {
-            if let Some(snapshot) = current.as_mut() {
-                snapshot.monitoring = false;
+        } else {
+            // Publish the paused state once. Snapshot events are the UI's primary
+            // feed and polling only runs as a fallback, so without this emit the
+            // sidebar keeps showing "Monitoring active" after collection stops.
+            let paused = match shared.snapshot.write() {
+                Ok(mut current) => match current.as_mut() {
+                    Some(snapshot) if snapshot.monitoring => {
+                        snapshot.monitoring = false;
+                        Some(snapshot.clone())
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            if let Some(snapshot) = paused {
+                if let Ok(app) = shared.app.read() {
+                    if let Some(app) = app.as_ref() {
+                        use tauri::Emitter;
+                        if let Err(error) = app.emit("fluxcore-snapshot", &snapshot) {
+                            eprintln!("FluxCore snapshot event error: {error}");
+                        }
+                    }
+                }
             }
         }
         let interval = Duration::from_millis(settings.refresh_interval_ms.clamp(250, 60000));

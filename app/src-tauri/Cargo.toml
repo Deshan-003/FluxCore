@@ -25,6 +25,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Phase 3: vendor-neutral GPU compute (DX12/Vulkan/WGSL), no CUDA toolkit required.
 wgpu = { version = "30", default-features = false, features = ["wgsl", "dx12", "vulkan"] }
 pollster = "1"
+# Optional, feature-gated WebDriver server used only by the native UI E2E build.
+tauri-plugin-wdio = { version = "1.5", optional = true }
+tauri-plugin-wdio-webdriver = { version = "1.5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -37,3 +40,5 @@ windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Registers the embedded WebDriver server for UI E2E; never enabled in shipped builds.
+e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
