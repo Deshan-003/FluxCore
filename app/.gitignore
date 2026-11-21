@@ -13,6 +13,7 @@ src-tauri/target
 src-tauri/gen
 dist-ssr
 *.local
+flux_probe.exe
 
 # Editor directories and files
 .vscode/*
