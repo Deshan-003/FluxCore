@@ -239,7 +239,29 @@ jobs:
           Stop-Process -Id $proc.Id -Force
           Write-Host 'Smoke launch OK'
 
+      # Drives the real release binary through tauri-driver + WebdriverIO:
+      # collector status, sidebar navigation and a settings toggle. This covers
+      # the interactive native UI path that a headless smoke launch cannot.
+      - name: Install UI E2E dependencies
+        working-directory: app/e2e-tests
+        run: npm ci --no-audit --no-fund
+
+      - name: Native UI E2E (tauri-driver + WebdriverIO)
+        working-directory: app/e2e-tests
+        run: npm test
+
+      - name: Upload UI E2E logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ui-e2e-logs
+          path: |
+            app/e2e-tests/logs/**
+            app/e2e-tests/*.log
+          if-no-files-found: warn
+
       - name: Upload Windows bundles
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: fluxcore-windows-bundles
