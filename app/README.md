@@ -15,6 +15,32 @@ telemetry, never treats GPU memory as system RAM, and never performs destructive
 - Dark dashboard, CPU/memory/GPU/storage/process/hardware/settings pages, event-driven live updates (`fluxcore-snapshot`), timestamp-windowed history charts, health thresholds and configurable refresh.
 - Local SQLite preferences and a five-second history sampler with seven-day retention; nullable percentages persist as NULL instead of fabricated zeros.
 
+## UI design system (approved redesign, 2026-11-21)
+
+The interface follows a token-driven design system (dark-first with a real curated light theme,
+local CSP-safe font stack, documented status language with icon + text + color, fixed
+resource→color mapping). It replaces the previous hand-written `App.css` theme, the
+`filter: invert()` light-mode hack and the Google-Fonts dependency.
+
+- Design tokens + component styles: [`src/ui/design-system.css`](src/ui/design-system.css) (scoped under `.rx-root`)
+- Shared UI kit (cards, chips, bars, buttons, tabs, switch, confirm dialog, toasts, info tips,
+  skeletons, empty/error states): [`src/ui/kit.tsx`](src/ui/kit.tsx) · [`src/ui/toast-store.ts`](src/ui/toast-store.ts) · [`src/ui/chart-config.ts`](src/ui/chart-config.ts)
+- Helpers (status thresholds, data-age, formatting): [`src/lib/format.ts`](src/lib/format.ts)
+- Pages: one file per screen in [`src/pages/`](src/pages/) — Dashboard, CPU, Memory, GPU, Storage,
+  Processes, Hardware, Memory Management, Adaptive Optimization, GPU Acceleration,
+  Resource Intelligence, Settings. Page ids (e.g. `memory-management`) are stable; sidebar
+  labels are display-only.
+- Navigation groups: Overview · Monitoring · Optimization · Intelligence · System.
+- Interactions: `window.confirm` and double-click confirms are replaced by a shared confirm
+  dialog that states what happens, the benefit and the risk; async actions report via toasts;
+  loading uses skeletons. Harmless actions never confirm.
+- Accessibility: visible focus ring on every interactive element, WCAG-AA text contrast,
+  sentence-case ≥12 px typography, status never color-only, keyboard-complete controls.
+- Spec + audit record: [`../UI_DESIGN_SYSTEM.md`](../UI_DESIGN_SYSTEM.md),
+  [`../UI_UX_AUDIT_REPORT.md`](../UI_UX_AUDIT_REPORT.md),
+  [`../UI_INTEGRATION_REPORT.md`](../UI_INTEGRATION_REPORT.md).
+
+
 ## Phase 2 — intelligent memory management
 
 - **Memory Intelligence dashboard**: physical/available/committed/compressed/pagefile/standby

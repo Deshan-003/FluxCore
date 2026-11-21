@@ -28,6 +28,22 @@ export const titleCase = (page: string): string =>
     : page === 'Optimization Center' ? 'Optimization center'
     : `${page} monitor`
 
+/* ---------- redesign status language (UI_DESIGN_SYSTEM.md §2.4) ---------- */
+
+export type RxStatus = 'healthy' | 'normal' | 'attention' | 'critical' | 'unavailable'
+
+/** Documented thresholds: <30 healthy, <60 normal, <85 needs attention, ≥85 critical. */
+export const statusForPercent = (value: number | null | undefined): RxStatus =>
+  value == null ? 'unavailable' : value >= 85 ? 'critical' : value >= 60 ? 'attention' : value >= 30 ? 'normal' : 'healthy'
+
+export const fmtTime = (timestamp: string | number): string =>
+  new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+export const ageOf = (timestamp: string | number, now = Date.now()): string => {
+  const seconds = Math.max(0, Math.round((now - new Date(timestamp).getTime()) / 1000))
+  return seconds < 5 ? 'just now' : seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`
+}
+
 export type MetricSeriesKey = 'cpuPercent' | 'memoryPercent' | 'gpuPercent' | 'vramUsedBytes'
 
 // The VRAM tile charts dedicated GPU memory in bytes; it must never fall back

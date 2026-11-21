@@ -1,29 +1,62 @@
 import { useEffect, useState } from 'react'
+import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import {
-  Gauge, ListChecks, MonitorCog, RefreshCw, Sparkles, Trash2, Zap,
+  Gauge, ListTodo, MonitorCog, Play, RefreshCw, Trash2, X, Zap,
 } from 'lucide-react'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
-import {
-  Detail, EmptyState, Panel, SensorNotice, SettingRow, Toggle,
-} from '../components/monitoring'
 import { useGpuStore } from '../stores/gpu'
 import { onGpuCapabilitiesEvent, onGpuTaskEvent } from '../services/gpu'
+import {
+  Button, Card, ChartFrame, ConfirmDialog, DetailList, Disclose, EmptyState, InfoTip, PageHeader,
+  RXTooltip, ResourceBar, StatusChip, Tabs, ToggleGroup, type ConfirmSpec,
+} from '../ui/kit'
+import { fmtBytes } from '../lib/format'
+import { rxAxis, rxGrid, rxTick } from '../ui/chart-config'
+import { toast } from '../ui/toast-store'
 import type {
-  AccelerationConfig, AccelerationMode, BackendKind, WorkloadParams, WorkloadSetting, WorkloadView,
+  AccelerationConfig, AccelerationMode, BackendKind, GpuTask, ProviderStatus,
+  TaskStatus, WorkloadParams, WorkloadSetting, WorkloadView,
 } from '../types/gpu'
-import GpuStatusCard from '../components/gpu/GpuStatusCard'
-import ResourceBudgetPanel from '../components/gpu/ResourceBudgetPanel'
-import WorkloadRecommendationRow from '../components/gpu/WorkloadRecommendationRow'
-import TaskMonitorTable from '../components/gpu/TaskMonitorTable'
-import BenchmarkComparisonChart from '../components/gpu/BenchmarkComparisonChart'
-import UnsupportedState from '../components/gpu/UnsupportedState'
 
-const MODES: { value: AccelerationMode; label: string; hint: string }[] = [
-  { value: 'cpuOnly', label: 'CPU Only', hint: 'Every workload runs on the CPU; GPU is still monitored.' },
-  { value: 'gpuAcceleration', label: 'GPU Acceleration', hint: 'Supported workloads use the GPU when available and safe.' },
-  { value: 'intelligentAuto', label: 'Intelligent Auto', hint: 'The engine decides per workload from size and measured history.' },
-  { value: 'manual', label: 'Manual', hint: 'Per-workload backend pins below are honoured.' },
-]
+const TABS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'workloads', label: 'Workload intelligence' },
+  { id: 'center', label: 'Acceleration center' },
+  { id: 'tasks', label: 'Task monitor' },
+  { id: 'benchmarks', label: 'Performance comparison' },
+] as const
+
+const MODE_LABELS: Record<AccelerationMode, string> = {
+  cpuOnly: 'CPU only',
+  gpuAcceleration: 'GPU acceleration',
+  intelligentAuto: 'Intelligent auto',
+  manual: 'Manual',
+}
+const MODE_HINTS: Record<AccelerationMode, string> = {
+  cpuOnly: 'Every workload runs on the CPU; the GPU is still monitored.',
+  gpuAcceleration: 'Supported workloads use the GPU when available and safe.',
+  intelligentAuto: 'The engine decides per workload from size and measured history.',
+  manual: 'Per-workload backend pins are honoured.',
+}
+const CLASS_LABELS: Record<string, string> = {
+  gpuRecommended: 'GPU recommended',
+  cpuRecommended: 'CPU recommended',
+  gpuAvailableNotBeneficial: 'GPU available, not beneficial',
+  insufficientGpuResources: 'Insufficient GPU resources',
+  unsupportedWorkload: 'Unsupported workload',
+  accelerationUnavailable: 'Acceleration unavailable',
+}
+const TASK_STATUS: Record<TaskStatus, { status: 'healthy' | 'normal' | 'attention' | 'critical' | 'unavailable'; label: string }> = {
+  queued: { status: 'unavailable', label: 'Queued' },
+  running: { status: 'normal', label: 'Running' },
+  succeeded: { status: 'healthy', label: 'Completed' },
+  failed: { status: 'critical', label: 'Failed' },
+  cancelled: { status: 'attention', label: 'Cancelled' },
+  timedOut: { status: 'critical', label: 'Timed out' },
+  rejected: { status: 'attention', label: 'Rejected' },
+}
+const backendLabel = (backend: BackendKind | null) => backend === 'cuda' ? 'CUDA' : backend === 'wgpu' ? 'WebGPU (DX12)' : 'CPU'
+
+const ms = (value: number | null) => (value === null ? '—' : `${value.toFixed(2)} ms`)
 
 function paramsFor(workloadId: string, size: number): WorkloadParams {
   switch (workloadId) {
@@ -34,17 +67,57 @@ function paramsFor(workloadId: string, size: number): WorkloadParams {
   }
 }
 
-function upsertSetting(
-  settings: WorkloadSetting[], id: string, patch: Partial<WorkloadSetting>,
-): WorkloadSetting[] {
+function upsertSetting(settings: WorkloadSetting[], id: string, patch: Partial<WorkloadSetting>): WorkloadSetting[] {
   const existing = settings.find((item) => item.workloadId === id)
-  const base: WorkloadSetting = existing ?? {
-    workloadId: id, mode: 'intelligentAuto', backend: 'cpu', enabled: true, selectedSize: 0,
-  }
+  const base: WorkloadSetting = existing ?? { workloadId: id, mode: 'intelligentAuto', backend: 'cpu', enabled: true, selectedSize: 0 }
   const next = { ...base, ...patch }
-  return existing
-    ? settings.map((item) => (item.workloadId === id ? next : item))
-    : [...settings, next]
+  return existing ? settings.map((item) => (item.workloadId === id ? next : item)) : [...settings, next]
+}
+
+function ProviderCard({ provider }: { provider: ProviderStatus }) {
+  const chip = provider.computeReady ? <StatusChip status="healthy" label="Ready" />
+    : provider.available ? <StatusChip status="attention" label="Limited" />
+    : <StatusChip status="unavailable" label="Unavailable" />
+  return <div className="rx-rec-card">
+    <h3>{provider.label} <span style={{ marginLeft: 6 }}>{chip}</span></h3>
+    <p>{provider.detail}</p>
+    {provider.lastError && <p className="rx-chart-caption" role="status">{provider.lastError}</p>}
+    <DetailList rows={[
+      { label: 'Devices', value: provider.devices.length ? provider.devices.map((device) => device.name).join(', ') : 'None' },
+      { label: 'Selected device', value: provider.selectedDevice || '—' },
+    ]} />
+  </div>
+}
+
+function TaskTable({ tasks, onCancel, confirm }: { tasks: GpuTask[]; onCancel?: (id: number) => void; confirm: (spec: ConfirmSpec) => void }) {
+  if (tasks.length === 0) {
+    return <EmptyState title="No tasks yet" detail="Run a workload from the Workload intelligence tab to see it here." />
+  }
+  return <div className="rx-table-wrap"><table className="rx-table">
+    <thead><tr><th>Task</th><th>Backend</th><th>Status</th><th style={{ width: '22%' }}>Progress</th><th className="num">Duration</th>{onCancel && <th />}</tr></thead>
+    <tbody>
+      {tasks.map((task) => {
+        const meta = TASK_STATUS[task.status]
+        return <tr key={task.id}>
+          <td><strong>{task.title}</strong>{task.fellBack && <span className="rx-chip attention" style={{ marginLeft: 6 }}>fell back to CPU</span>}</td>
+          <td><span className="rx-chip info">{backendLabel(task.selectedBackend ?? task.requestedBackend)}</span></td>
+          <td><StatusChip status={meta.status} label={meta.label} /></td>
+          <td>{task.status === 'running' && task.progressPercent != null
+            ? <div className="rx-metric-bar" style={{ ['--rx-metric-color' as string]: 'var(--rx-c-other)' }}><span style={{ width: `${task.progressPercent}%` }} /></div>
+            : <span style={{ color: 'var(--rx-text-muted)', fontSize: 12 }}>{task.progressPercent == null ? '—' : `${Math.round(task.progressPercent)}%`}</span>}</td>
+          <td className="num">{task.durationMs == null ? '—' : task.durationMs < 1000 ? `${task.durationMs} ms` : `${(task.durationMs / 1000).toFixed(1)} s`}</td>
+          {onCancel && <td>{(task.status === 'queued' || task.status === 'running') && <Button small variant="danger" icon={X}
+            onClick={() => confirm({
+              title: 'Cancel this task?',
+              body: 'The GPU task stops immediately and its partial result is discarded. Completed work is unaffected.',
+              confirmLabel: 'Cancel task',
+              onConfirm: () => onCancel(task.id),
+              onCancel: () => undefined,
+            })}>Cancel</Button>}</td>}
+        </tr>
+      })}
+    </tbody>
+  </table></div>
 }
 
 export default function GpuAccelerationPage() {
@@ -69,11 +142,12 @@ export default function GpuAccelerationPage() {
   const clearBenchmarks = useGpuStore((s) => s.clearBenchmarks)
   const setPrefs = useGpuStore((s) => s.setPrefs)
 
-  const [draftOverride, setDraft] = useState<AccelerationConfig | null>(null)
+  const [draft, setDraft] = useState<AccelerationConfig | null>(null)
   const [benchWorkload, setBenchWorkload] = useState('vector_axpy')
   const [benchSize, setBenchSize] = useState(1_048_576)
   const [warmup, setWarmup] = useState(2)
   const [runs, setRuns] = useState(5)
+  const [confirm, setConfirm] = useState<ConfirmSpec | null>(null)
 
   useEffect(() => {
     void refresh()
@@ -99,22 +173,27 @@ export default function GpuAccelerationPage() {
   }, [prefs.autoRefresh])
 
   if (error && !state) {
-    return (
-      <div className="gpu-page">
-        <EmptyState title="GPU engine unavailable" detail={error} />
-        <button className="button primary" onClick={() => void refresh()}>Retry</button>
-      </div>
-    )
+    return <>
+      <PageHeader title="GPU acceleration" description="Run supported workloads on your graphics card instead of the CPU — when it helps." />
+      <Card><EmptyState icon={Zap} title="GPU engine unavailable" detail={error}
+        action={<Button variant="primary" onClick={() => void refresh()}>Retry</Button>} /></Card>
+    </>
   }
   if (!state || !config) {
-    return (
-      <div className="gpu-page">
-        <EmptyState title="Loading GPU engine" detail="Reading provider capabilities and resource budget…" />
-      </div>
-    )
+    return <>
+      <PageHeader title="GPU acceleration" description="Run supported workloads on your graphics card instead of the CPU — when it helps." />
+      <Card>
+        <div className="rx-stack" aria-hidden="true">
+          <div className="rx-skeleton" style={{ height: 90 }} />
+          <div className="rx-skeleton" style={{ height: 200 }} />
+        </div>
+        <EmptyState icon={Zap} title="Loading GPU engine" detail="Reading provider capabilities and the resource budget…" />
+      </Card>
+    </>
   }
 
-  const draft = draftOverride ?? config
+  const active = draft ?? config
+  const patchDraft = (patch: Partial<AccelerationConfig>) => setDraft({ ...active, ...patch })
   const runWorkload = (workload: WorkloadView) => {
     void submit({
       workloadId: workload.id,
@@ -124,230 +203,284 @@ export default function GpuAccelerationPage() {
       clientRef: null,
       requireGpu: false,
       timeoutMs: null,
+    }).then((task) => {
+      if (task) toast(`"${workload.title}" submitted (${backendLabel(task.selectedBackend ?? task.requestedBackend)})`, 'success')
     })
   }
   const changeSize = (workload: WorkloadView, size: number) => {
     setPrefs({ selectedSizes: { ...prefs.selectedSizes, [workload.id]: size } })
-    void saveConfig({
-      ...config,
-      workloadSettings: upsertSetting(config.workloadSettings, workload.id, { selectedSize: size }),
-    })
+    void saveConfig({ ...config, workloadSettings: upsertSetting(config.workloadSettings, workload.id, { selectedSize: size }) })
   }
-  const patchDraft = (patch: Partial<AccelerationConfig>) => setDraft({ ...draft, ...patch })
   const benchSizes = state.workloads.find((w) => w.id === benchWorkload)?.sizes ?? [1_048_576]
+  const resources = state.resources
+  const budgetPercent = resources.budgetBytes > 0 ? (resources.reservedBytes / resources.budgetBytes) * 100 : null
+  const benchRecords = benchmarks.slice(0, 8).reverse().map((record) => ({
+    name: `${record.workloadId} #${record.id}`,
+    cpu: Number(record.cpu.medianMs.toFixed(3)),
+    gpu: record.gpu === null ? null : Number(record.gpu.medianMs.toFixed(3)),
+  }))
+  const latestBenchmark = benchmarks[0] ?? null
 
-  return (
-    <div className="gpu-page">
-      <Tabs
-        value={prefs.lastTab}
-        onValueChange={(value) => setPrefs({ lastTab: value })}
-        className="gpu-tabs"
-      >
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="workloads">Workload Intelligence</TabsTrigger>
-          <TabsTrigger value="center">Acceleration Center</TabsTrigger>
-          <TabsTrigger value="tasks">Task Monitor</TabsTrigger>
-          <TabsTrigger value="benchmarks">Performance Comparison</TabsTrigger>
-        </TabsList>
+  return <>
+    <PageHeader title="GPU acceleration"
+      description="Run supported workloads on your graphics card instead of the CPU. FluxCore only uses the GPU's own memory (VRAM) — never as system RAM." />
 
-        <TabsContent value="overview">
-          {!state.available && (
-            <UnsupportedState reason={state.unavailableReason} />
-          )}
-          {state.safetyNotes.map((note) => <SensorNotice key={note} text={note} />)}
-          <div className="gpu-columns">
-            {state.providers.map((provider) => <GpuStatusCard key={provider.id} provider={provider} />)}
+    <Tabs tabs={TABS.map((tab) => ({ id: tab.id, label: tab.label, count: tab.id === 'tasks' ? state.tasks.length : undefined }))}
+      active={prefs.lastTab} onChange={(id) => setPrefs({ lastTab: id })} />
+
+    {error && <div className="rx-card status-edge critical" role="alert">
+      <div className="rx-card-head"><h2>The last GPU operation failed</h2></div>
+      <p className="rx-card-sub" style={{ margin: 0 }}>{error}</p>
+    </div>}
+
+    {prefs.lastTab === 'overview' && <>
+      {!state.available && <Card><EmptyState icon={Zap} title="GPU acceleration is not available on this system"
+        detail={state.unavailableReason ?? 'No supported compute provider was found. Supported workloads will run on the CPU automatically.'} /></Card>}
+      {state.safetyNotes.map((note) => <p className="rx-chart-caption" key={note}>{note}</p>)}
+      <div className="rx-grid-side">
+        <Card title="Compute providers" icon={Zap} sub="The paths FluxCore can use to run a workload. The first ready provider in the priority order wins.">
+          <div className="rx-stack" style={{ gap: 10 }}>
+            {state.providers.map((provider) => <ProviderCard key={provider.id} provider={provider} />)}
           </div>
-          <ResourceBudgetPanel resources={state.resources} />
-          <Panel title="Environment" icon={MonitorCog} action={
-            <button className="button ghost" onClick={() => void probe(true)} disabled={loading}>
-              <RefreshCw size={14} /> Re-probe
-            </button>
-          }>
-            <div className="gpu-grid">
-              <Detail label="OS" value={`${state.environment.osName} ${state.environment.osVersion}`} />
-              <Detail label="CPU" value={state.environment.cpuName} />
-              <Detail label="Logical processors" value={String(state.environment.logicalProcessors)} />
-              <Detail label="GPU" value={state.environment.gpuName} />
-              <Detail label="Driver" value={state.environment.driverVersion ?? 'Unavailable'} />
-              <Detail label="CUDA toolkit" value={state.environment.cudaToolkitPresent ? 'Present' : 'Absent'} />
-              <Detail label="CUDA compute path" value={state.environment.cudaComputePath} />
-              <Detail label="wgpu" value={`${state.environment.wgpuVersion} (${state.environment.wgpuBackend ?? 'no adapter'})`} />
-              <Detail label="Vulkan / DX12" value={`${state.environment.vulkanPresent ? 'yes' : 'no'} / ${state.environment.dx12Present ? 'yes' : 'no'}`} />
+        </Card>
+        <Card title="VRAM budget" icon={Gauge}
+          sub="FluxCore only ever budgets VRAM for its own GPU compute tasks. VRAM is the graphics card's own memory and is never used as system RAM.">
+          <ResourceBar label="Budgeted for FluxCore tasks" value={fmtBytes(resources.reservedBytes)} total={fmtBytes(resources.budgetBytes)}
+            percent={budgetPercent} color="var(--rx-c-vram)" />
+          <DetailList rows={[
+            { label: 'Dedicated VRAM total', value: fmtBytes(resources.totalVramBytes) },
+            { label: 'Dedicated VRAM free', value: fmtBytes(resources.freeVramBytes) },
+            { label: 'Remaining budget', value: fmtBytes(resources.remainingBudgetBytes) },
+            { label: 'Running GPU tasks', value: `${resources.runningGpuTasks} / ${resources.maxConcurrentGpuTasks}` },
+            { label: 'GPU utilization', value: resources.gpuUtilizationPercent == null ? 'Unavailable' : `${resources.gpuUtilizationPercent.toFixed(0)}%` },
+            { label: 'GPU temperature', value: resources.temperatureC == null ? 'Unavailable' : `${resources.temperatureC.toFixed(0)} °C` },
+          ]} />
+          {resources.gates.map((gate) => <p className="rx-chart-caption" key={gate}>{gate}</p>)}
+        </Card>
+      </div>
+      <Card>
+        <Disclose summary="Environment details">
+          <div className="rx-disclose-body">
+            <DetailList rows={[
+              { label: 'OS', value: `${state.environment.osName} ${state.environment.osVersion}` },
+              { label: 'CPU', value: state.environment.cpuName },
+              { label: 'Logical processors', value: String(state.environment.logicalProcessors) },
+              { label: 'GPU', value: state.environment.gpuName },
+              { label: 'Driver', value: state.environment.driverVersion ?? 'Unavailable' },
+              { label: 'CUDA toolkit', value: state.environment.cudaToolkitPresent ? 'Present' : 'Absent' },
+              { label: 'CUDA compute path', value: state.environment.cudaComputePath },
+              { label: 'wgpu', value: `${state.environment.wgpuVersion} (${state.environment.wgpuBackend ?? 'no adapter'})` },
+              { label: 'Vulkan / DX12', value: `${state.environment.vulkanPresent ? 'yes' : 'no'} / ${state.environment.dx12Present ? 'yes' : 'no'}` },
+            ]} />
+            <div style={{ marginTop: 12 }}>
+              <Button icon={RefreshCw} loading={loading} onClick={() => void probe(true)}>Re-probe providers</Button>
             </div>
-          </Panel>
-        </TabsContent>
+          </div>
+        </Disclose>
+      </Card>
+    </>
 
-        <TabsContent value="workloads">
-          <Panel title="Workload suitability" icon={Sparkles}>
-            {state.workloads.map((workload) => (
-              <WorkloadRecommendationRow
-                key={workload.id}
-                workload={workload}
-                busy={loading}
-                onRun={runWorkload}
-                onSize={changeSize}
-              />
-            ))}
-          </Panel>
-        </TabsContent>
+    }
 
-        <TabsContent value="center">
-          <Panel title="Execution mode" icon={Zap}>
-            <SettingRow title="Acceleration mode" description={MODES.find((m) => m.value === state.mode)?.hint ?? ''}>
-              <select
-                value={state.mode}
-                onChange={(event) => void setMode(event.target.value as AccelerationMode)}
-              >
-                {MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
-              </select>
-            </SettingRow>
-          </Panel>
-          <Panel title="Resource limits" icon={Gauge} action={
-            <span>
-              <button className="button ghost" onClick={() => setDraft(null)}>Reset</button>
-              <button className="button primary" onClick={() => void saveConfig(draft)}>Save</button>
-            </span>
-          }>
-            <div className="gpu-config-grid">
-              <label>VRAM budget (%)<input type="number" min={1} max={90} step={1} value={draft.vramBudgetPercent} onChange={(e) => patchDraft({ vramBudgetPercent: Number(e.target.value) })} /></label>
-              <label>VRAM cap (MiB, 0 = none)<input type="number" min={0} max={4096} value={draft.vramBudgetCapMb} onChange={(e) => patchDraft({ vramBudgetCapMb: Number(e.target.value) })} /></label>
-              <label>Max GPU utilisation (%)<input type="number" min={10} max={100} value={draft.maxGpuUtilizationPercent} onChange={(e) => patchDraft({ maxGpuUtilizationPercent: Number(e.target.value) })} /></label>
-              <label>Max temperature (°C)<input type="number" min={40} max={110} value={draft.maxTemperatureC} onChange={(e) => patchDraft({ maxTemperatureC: Number(e.target.value) })} /></label>
-              <label>Concurrent GPU tasks<input type="number" min={1} max={2} value={draft.maxConcurrentGpuTasks} onChange={(e) => patchDraft({ maxConcurrentGpuTasks: Number(e.target.value) })} /></label>
-              <label>Concurrent CPU tasks<input type="number" min={1} max={4} value={draft.maxConcurrentCpuTasks} onChange={(e) => patchDraft({ maxConcurrentCpuTasks: Number(e.target.value) })} /></label>
-              <label>Max queue length<input type="number" min={1} max={256} value={draft.maxQueueLength} onChange={(e) => patchDraft({ maxQueueLength: Number(e.target.value) })} /></label>
-              <label>Task timeout (ms)<input type="number" min={500} max={60000} step={100} value={draft.taskTimeoutMs} onChange={(e) => patchDraft({ taskTimeoutMs: Number(e.target.value) })} /></label>
-              <label>Min system RAM available (%)<input type="number" min={1} max={50} value={draft.minSystemRamAvailablePercent} onChange={(e) => patchDraft({ minSystemRamAvailablePercent: Number(e.target.value) })} /></label>
-              <label>Retention (days)<input type="number" min={1} max={90} value={draft.retentionDays} onChange={(e) => patchDraft({ retentionDays: Number(e.target.value) })} /></label>
+    {prefs.lastTab === 'workloads' && <Card title="Detected workloads & recommendations" icon={Zap}
+      sub="FluxCore matches each workload to the fastest available path and tells you why. Sizes and runs are safe and repeatable.">
+      <div className="rx-stack" style={{ gap: 12 }}>
+        {state.workloads.map((workload) => {
+          const assessment = workload.assessment
+          return <div className="rx-rec-card" key={workload.id}>
+            <h3>{workload.title} <span className="rx-chip neutral" style={{ marginLeft: 6 }}>{workload.selectedSize.toLocaleString()} elements</span></h3>
+            <div className="rx-rec-meta">
+              <span className={`rx-chip ${assessment.classification === 'gpuRecommended' ? 'success' : assessment.classification === 'cpuRecommended' ? 'neutral' : 'warning'}`}>
+                {CLASS_LABELS[assessment.classification] ?? assessment.classification}
+              </span>
+              <span className="rx-chip info">{backendLabel(assessment.selectedBackend)}</span>
+              <span className="rx-chip neutral">{assessment.estimateSource === 'measured' ? 'measured evidence' : assessment.estimateSource === 'mixed' ? 'mixed evidence' : 'model estimate'}</span>
             </div>
-            <SettingRow title="Validate GPU results" description="Compare every GPU output against the CPU reference.">
-              <Toggle checked={draft.validateResults} onChange={(checked) => patchDraft({ validateResults: checked })} />
-            </SettingRow>
-            <SettingRow title="Persist history" description="Store task history and benchmarks in SQLite.">
-              <Toggle checked={draft.persistHistory} onChange={(checked) => patchDraft({ persistHistory: checked })} />
-            </SettingRow>
-            <SettingRow title="Live task events" description="Emit fluxcore-gpu-task events to the UI.">
-              <Toggle checked={draft.emitEvents} onChange={(checked) => patchDraft({ emitEvents: checked })} />
-            </SettingRow>
-            <SettingRow title="Auto refresh" description="Refresh this page while it is visible.">
-              <Toggle checked={prefs.autoRefresh} onChange={(checked) => setPrefs({ autoRefresh: checked })} />
-            </SettingRow>
-          </Panel>
-          <Panel title="Provider priority" icon={ListChecks}>
-            {draft.providerPriority.map((id, index) => (
-              <SettingRow key={id} title={id} description={`Preference position ${index + 1}`}>
-                <span>
-                  <button className="button ghost" disabled={index === 0} onClick={() => {
-                    const order = [...draft.providerPriority]
+            <p><strong>Why:</strong> {assessment.reason}</p>
+            <DetailList rows={[
+              { label: 'CPU estimate', value: ms(assessment.estimatedCpuMs) },
+              { label: 'GPU estimate (end-to-end)', value: ms(assessment.estimatedGpuTotalMs) },
+              { label: 'Transfer overhead', value: `${ms(assessment.transferOverheadMs)} (${fmtBytes(assessment.transferBytes)})` },
+              { label: 'VRAM needed / budget', value: `${fmtBytes(assessment.requiredVramBytes)} / ${fmtBytes(assessment.gpuBudgetBytes)}` },
+            ]} />
+            {assessment.blockers.map((blocker) => <p className="rx-chart-caption" key={blocker} style={{ color: 'var(--rx-warning)' }}>{blocker}</p>)}
+            <div className="rx-rec-row">
+              <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12.5 }}>
+                Size
+                <select className="rx-select" value={workload.selectedSize} aria-label={`${workload.title} size`}
+                  onChange={(event) => changeSize(workload, Number(event.target.value))}>
+                  {workload.sizes.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+                </select>
+              </label>
+              <Button variant="primary" icon={Play} loading={loading} onClick={() => runWorkload(workload)}>Run workload</Button>
+              {workload.lastBenchmark && <span className="rx-chart-caption" title={workload.lastBenchmark.verdict}>
+                last benchmark: {workload.lastBenchmark.speedup === null ? 'CPU only' : `${workload.lastBenchmark.speedup.toFixed(2)}× faster on GPU`}
+              </span>}
+            </div>
+          </div>
+        })}
+      </div>
+    </Card>}
+
+    {prefs.lastTab === 'center' && <>
+      <Card title="Execution mode" icon={Zap} sub="What happens when a supported workload starts.">
+        <ToggleGroup
+          options={(Object.keys(MODE_LABELS) as AccelerationMode[]).map((value) => ({ id: value, label: MODE_LABELS[value] }))}
+          value={state.mode}
+          onChange={(id) => void setMode(id as AccelerationMode).then(() => toast(`Execution mode set to "${MODE_LABELS[id as AccelerationMode]}"`, 'success'))}
+        />
+        <p className="rx-chart-caption" style={{ marginTop: 10 }}>{MODE_HINTS[state.mode]}</p>
+      </Card>
+
+      <div className="rx-grid-2">
+        <Card title="Resource limits" icon={Gauge}
+          sub="Hard caps that protect the GPU and your VRAM budget."
+          right={<><Button small onClick={() => setDraft(null)}>Reset</Button><Button small variant="primary" onClick={() => void saveConfig(active).then(() => toast('Resource limits saved', 'success'))}>Save</Button></>}>
+          <div className="rx-detail-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+            <div className="rx-field"><label>VRAM budget (%)</label><input className="rx-input rx-number-input" type="number" min={1} max={90} value={active.vramBudgetPercent} aria-label="VRAM budget percent" onChange={(e) => patchDraft({ vramBudgetPercent: Number(e.target.value) })} /><span className="help">Share of dedicated VRAM FluxCore may reserve.</span></div>
+            <div className="rx-field"><label>VRAM cap (MiB, 0 = none)</label><input className="rx-input rx-number-input" type="number" min={0} max={4096} value={active.vramBudgetCapMb} aria-label="VRAM cap in MiB" onChange={(e) => patchDraft({ vramBudgetCapMb: Number(e.target.value) })} /><span className="help">Absolute upper bound on top of the percent.</span></div>
+            <div className="rx-field"><label>Max GPU utilization (%)</label><input className="rx-input rx-number-input" type="number" min={10} max={100} value={active.maxGpuUtilizationPercent} aria-label="Max GPU utilization percent" onChange={(e) => patchDraft({ maxGpuUtilizationPercent: Number(e.target.value) })} /><span className="help">Tasks defer when the GPU is busier.</span></div>
+            <div className="rx-field"><label>Max temperature (°C)</label><input className="rx-input rx-number-input" type="number" min={40} max={110} value={active.maxTemperatureC} aria-label="Max temperature" onChange={(e) => patchDraft({ maxTemperatureC: Number(e.target.value) })} /><span className="help">Tasks defer above this temperature.</span></div>
+            <div className="rx-field"><label>Concurrent GPU tasks</label><input className="rx-input rx-number-input" type="number" min={1} max={2} value={active.maxConcurrentGpuTasks} aria-label="Concurrent GPU tasks" onChange={(e) => patchDraft({ maxConcurrentGpuTasks: Number(e.target.value) })} /><span className="help">How many GPU tasks may run at once.</span></div>
+            <div className="rx-field"><label>Concurrent CPU tasks</label><input className="rx-input rx-number-input" type="number" min={1} max={4} value={active.maxConcurrentCpuTasks} aria-label="Concurrent CPU tasks" onChange={(e) => patchDraft({ maxConcurrentCpuTasks: Number(e.target.value) })} /><span className="help">CPU fallback parallelism.</span></div>
+            <div className="rx-field"><label>Max queue length</label><input className="rx-input rx-number-input" type="number" min={1} max={256} value={active.maxQueueLength} aria-label="Max queue length" onChange={(e) => patchDraft({ maxQueueLength: Number(e.target.value) })} /><span className="help">Pending tasks allowed before rejection.</span></div>
+            <div className="rx-field"><label>Task timeout (ms)</label><input className="rx-input rx-number-input" type="number" min={500} max={60000} step={100} value={active.taskTimeoutMs} aria-label="Task timeout" onChange={(e) => patchDraft({ taskTimeoutMs: Number(e.target.value) })} /><span className="help">Hard wall-clock limit per task.</span></div>
+            <div className="rx-field"><label>Min system RAM available (%)</label><input className="rx-input rx-number-input" type="number" min={1} max={50} value={active.minSystemRamAvailablePercent} aria-label="Min system RAM available percent" onChange={(e) => patchDraft({ minSystemRamAvailablePercent: Number(e.target.value) })} /><span className="help">Safety floor for shared-memory fallbacks.</span></div>
+            <div className="rx-field"><label>Retention (days)</label><input className="rx-input rx-number-input" type="number" min={1} max={90} value={active.retentionDays} aria-label="History retention days" onChange={(e) => patchDraft({ retentionDays: Number(e.target.value) })} /><span className="help">How long task/benchmark history is kept.</span></div>
+          </div>
+          <div className="rx-setting-row" style={{ borderBottom: 0 }}>
+            <div className="rx-setting-text"><h3>Validate GPU results</h3><p>Compare every GPU output against the CPU reference.</p></div>
+            <div className="rx-setting-control"><Button small variant={active.validateResults ? 'primary' : 'secondary'} onClick={() => patchDraft({ validateResults: !active.validateResults })}>{active.validateResults ? 'On' : 'Off'}</Button></div>
+          </div>
+          <div className="rx-setting-row">
+            <div className="rx-setting-text"><h3>Persist history</h3><p>Store task history and benchmarks in SQLite.</p></div>
+            <div className="rx-setting-control"><Button small variant={active.persistHistory ? 'primary' : 'secondary'} onClick={() => patchDraft({ persistHistory: !active.persistHistory })}>{active.persistHistory ? 'On' : 'Off'}</Button></div>
+          </div>
+          <div className="rx-setting-row">
+            <div className="rx-setting-text"><h3>Live task events</h3><p>Emit fluxcore-gpu-task events to the UI.</p></div>
+            <div className="rx-setting-control"><Button small variant={active.emitEvents ? 'primary' : 'secondary'} onClick={() => patchDraft({ emitEvents: !active.emitEvents })}>{active.emitEvents ? 'On' : 'Off'}</Button></div>
+          </div>
+          <div className="rx-setting-row" style={{ borderBottom: 0 }}>
+            <div className="rx-setting-text"><h3>Auto refresh</h3><p>Refresh this page while it is visible.</p></div>
+            <div className="rx-setting-control"><Button small variant={prefs.autoRefresh ? 'primary' : 'secondary'} onClick={() => setPrefs({ autoRefresh: !prefs.autoRefresh })}>{prefs.autoRefresh ? 'On' : 'Off'}</Button></div>
+          </div>
+        </Card>
+
+        <div className="rx-stack">
+          <Card title="Provider priority" icon={ListTodo} sub="Order matters: the first ready provider runs the workload.">
+            <div className="rx-stack" style={{ gap: 8 }}>
+              {active.providerPriority.map((id, index) => {
+                const provider = state.providers.find((entry) => entry.id === id)
+                return <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--rx-surface-2)', borderRadius: 8, padding: '9px 12px' }}>
+                  <span className="rx-chip neutral">{index + 1}</span>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>{provider?.label ?? id}</span>
+                  <span className="rx-data-age" style={{ marginLeft: 'auto' }}>{provider?.computeReady ? 'Ready' : 'Unavailable'}</span>
+                  <Button small disabled={index === 0 || draft === null} onClick={() => {
+                    if (draft === null) setDraft({ ...config })
+                    const order = [...(draft ?? config).providerPriority]
                     ;[order[index - 1], order[index]] = [order[index], order[index - 1]]
                     patchDraft({ providerPriority: order })
-                  }}>Up</button>
-                  <button className="button ghost" disabled={index === draft.providerPriority.length - 1} onClick={() => {
-                    const order = [...draft.providerPriority]
-                    ;[order[index + 1], order[index]] = [order[index], order[index + 1]]
-                    patchDraft({ providerPriority: order })
-                  }}>Down</button>
-                </span>
-              </SettingRow>
-            ))}
-          </Panel>
-          <Panel title="Per-workload pins (Manual mode)" icon={ListChecks}>
-            {state.workloads.map((workload) => {
-              const setting = draft.workloadSettings.find((item) => item.workloadId === workload.id)
-              return (
-                <SettingRow key={workload.id} title={workload.title} description="Honoured when the execution mode is Manual.">
-                  <span className="gpu-pin-controls">
-                    <select
-                      value={setting?.mode ?? 'intelligentAuto'}
-                      onChange={(e) => patchDraft({
-                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { mode: e.target.value as AccelerationMode }),
-                      })}
-                    >
-                      {MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
-                    </select>
-                    <select
-                      value={setting?.backend ?? 'cpu'}
-                      onChange={(e) => patchDraft({
-                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { backend: e.target.value as BackendKind }),
-                      })}
-                    >
-                      <option value="cpu">CPU</option>
-                      <option value="cuda">CUDA</option>
-                      <option value="wgpu">wgpu</option>
-                    </select>
-                    <Toggle
-                      checked={setting?.enabled ?? true}
-                      onChange={(checked) => patchDraft({
-                        workloadSettings: upsertSetting(draft.workloadSettings, workload.id, { enabled: checked }),
-                      })}
-                    />
-                  </span>
-                </SettingRow>
-              )
-            })}
-          </Panel>
-        </TabsContent>
-
-        <TabsContent value="tasks">
-          <Panel title="Active tasks" icon={ListChecks} action={
-            <button className="button ghost" onClick={() => void clearFinished()}>
-              <Trash2 size={14} /> Clear finished
-            </button>
-          }>
-            <TaskMonitorTable tasks={state.tasks} onCancel={(id) => void cancel(id)} />
-          </Panel>
-          <Panel title="Task history (SQLite)" icon={ListChecks} action={
-            <button className="button ghost" onClick={() => void loadHistory()}>
-              <RefreshCw size={14} /> Reload
-            </button>
-          }>
-            <TaskMonitorTable tasks={history} onCancel={() => undefined} />
-          </Panel>
-        </TabsContent>
-
-        <TabsContent value="benchmarks">
-          <Panel title="Run a CPU-vs-GPU benchmark" icon={Gauge} action={
-            <button
-              className="button primary"
-              disabled={benchmarkBusy}
-              onClick={() => void runBenchmark({
-                workloadId: benchWorkload,
-                params: paramsFor(benchWorkload, benchSize),
-                warmupRuns: warmup,
-                measuredRuns: runs,
-                validate: true,
+                  }}>Up</Button>
+                </div>
               })}
-            >
-              <Sparkles size={14} /> {benchmarkBusy ? 'Benchmarking…' : 'Run benchmark'}
-            </button>
-          }>
-            <div className="gpu-config-grid">
-              <label>Workload
-                <select value={benchWorkload} onChange={(e) => { setBenchWorkload(e.target.value); setBenchSize(state.workloads.find((w) => w.id === e.target.value)?.sizes[0] ?? 1_048_576) }}>
-                  {state.workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.title}</option>)}
-                </select>
-              </label>
-              <label>Size
-                <select value={benchSize} onChange={(e) => setBenchSize(Number(e.target.value))}>
-                  {benchSizes.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
-                </select>
-              </label>
-              <label>Warm-up runs<input type="number" min={0} max={10} value={warmup} onChange={(e) => setWarmup(Number(e.target.value))} /></label>
-              <label>Measured runs<input type="number" min={1} max={50} value={runs} onChange={(e) => setRuns(Number(e.target.value))} /></label>
             </div>
-            <SensorNotice text="Benchmarks use identical inputs on both backends, discard warm-ups and report medians. A slowdown is reported as a slowdown." />
-          </Panel>
-          <Panel title="Measured comparison" icon={Gauge} action={
-            <button className="button ghost" onClick={() => void clearBenchmarks()}>
-              <Trash2 size={14} /> Clear history
-            </button>
-          }>
-            <BenchmarkComparisonChart records={benchmarks} />
-          </Panel>
-        </TabsContent>
-      </Tabs>
-    </div>
-  )
+          </Card>
+          <Card>
+            <Disclose summary="Per-workload pins (Manual mode)">
+              <div className="rx-disclose-body">
+                <p className="rx-card-sub" style={{ margin: '0 0 10px' }}>Honoured when the execution mode is Manual.</p>
+                {state.workloads.map((workload) => {
+                  const setting = active.workloadSettings.find((item) => item.workloadId === workload.id)
+                  return <div className="rx-setting-row" key={workload.id}>
+                    <div className="rx-setting-text"><h3>{workload.title}</h3><p>Mode and backend used in Manual mode.</p></div>
+                    <div className="rx-setting-control" style={{ display: 'flex', gap: 8 }}>
+                      <select className="rx-select" value={setting?.mode ?? 'intelligentAuto'} aria-label={`${workload.title} mode`}
+                        onChange={(e) => patchDraft({ workloadSettings: upsertSetting(active.workloadSettings, workload.id, { mode: e.target.value as AccelerationMode }) })}>
+                        {(Object.keys(MODE_LABELS) as AccelerationMode[]).map((value) => <option key={value} value={value}>{MODE_LABELS[value]}</option>)}
+                      </select>
+                      <select className="rx-select" value={setting?.backend ?? 'cpu'} aria-label={`${workload.title} backend`}
+                        onChange={(e) => patchDraft({ workloadSettings: upsertSetting(active.workloadSettings, workload.id, { backend: e.target.value as BackendKind }) })}>
+                        <option value="cpu">CPU</option><option value="cuda">CUDA</option><option value="wgpu">wgpu</option>
+                      </select>
+                    </div>
+                  </div>
+                })}
+              </div>
+            </Disclose>
+          </Card>
+        </div>
+      </div>
+    </>
+
+    }
+
+    {prefs.lastTab === 'tasks' && <>
+      <Card title="Active tasks" icon={ListTodo} right={<Button small icon={Trash2} onClick={() => void clearFinished().then(() => toast('Finished tasks cleared', 'success'))}>Clear finished</Button>}>
+        <TaskTable tasks={state.tasks} confirm={setConfirm} onCancel={(id) => void cancel(id).then(() => toast('Task cancelled', 'info'))} />
+      </Card>
+      <Card title="Task history" icon={ListTodo} note="Kept locally on this PC" right={<Button small icon={RefreshCw} onClick={() => void loadHistory()}>Reload</Button>}>
+        <TaskTable tasks={history} confirm={setConfirm} />
+      </Card>
+    </>}
+
+    {prefs.lastTab === 'benchmarks' && <>
+      <Card title="Run a benchmark" icon={Play}
+        sub="Runs the same workload on CPU and GPU and compares the time. Safe and repeatable — results are kept locally.">
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+          <div className="rx-field"><label>Workload</label>
+            <select className="rx-select" value={benchWorkload} aria-label="Benchmark workload"
+              onChange={(e) => { setBenchWorkload(e.target.value); setBenchSize(state.workloads.find((w) => w.id === e.target.value)?.sizes[0] ?? 1_048_576) }}>
+              {state.workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.title}</option>)}
+            </select></div>
+          <div className="rx-field"><label>Size</label>
+            <select className="rx-select" value={benchSize} aria-label="Benchmark size" onChange={(e) => setBenchSize(Number(e.target.value))}>
+              {benchSizes.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+            </select></div>
+          <div className="rx-field"><label>Warm-up runs</label><input className="rx-input rx-number-input" type="number" min={0} max={10} value={warmup} aria-label="Warm-up runs" onChange={(e) => setWarmup(Number(e.target.value))} /></div>
+          <div className="rx-field"><label>Measured runs</label><input className="rx-input rx-number-input" type="number" min={1} max={50} value={runs} aria-label="Measured runs" onChange={(e) => setRuns(Number(e.target.value))} /></div>
+          <Button variant="primary" icon={Play} loading={benchmarkBusy}
+            onClick={() => void runBenchmark({
+              workloadId: benchWorkload, params: paramsFor(benchWorkload, benchSize),
+              warmupRuns: warmup, measuredRuns: runs, validate: true,
+            }).then((record) => {
+              if (record) toast(`Benchmark finished: ${record.verdict}`, 'success')
+            })}>
+            {benchmarkBusy ? 'Benchmarking…' : 'Run benchmark'}
+          </Button>
+        </div>
+        <p className="rx-chart-caption" style={{ marginTop: 10 }}>
+          Benchmarks use identical inputs on both backends, discard warm-ups and report medians. A slowdown is reported as a slowdown.
+        </p>
+      </Card>
+
+      <Card title="Measured comparison" icon={Gauge} right={<Button small icon={Trash2} onClick={() => void clearBenchmarks().then(() => toast('Benchmark history cleared', 'info'))}>Clear history</Button>}>
+        {benchRecords.length === 0
+          ? <EmptyState title="No benchmarks yet" detail="Run a CPU-vs-GPU benchmark to see measured comparisons here." />
+          : <ChartFrame ariaLabel="Benchmark comparison chart" height="tall"
+              caption="Lower is better (median duration, ms). GPU bars show end-to-end time including transfers.">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={benchRecords} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
+                  <CartesianGrid {...rxGrid} />
+                  <XAxis dataKey="name" {...rxAxis} tick={rxTick} />
+                  <YAxis {...rxAxis} tick={rxTick} unit=" ms" />
+                  <Tooltip content={<RXTooltip formatter={(v) => `${Number(v).toFixed(2)} ms`} />} cursor={{ fill: 'var(--rx-accent-subtle)' }} />
+                  <Legend wrapperStyle={{ color: 'var(--rx-text-muted)', fontSize: 12 }} />
+                  <Bar dataKey="cpu" name="CPU median" fill="var(--rx-c-other)" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                  <Bar dataKey="gpu" name="GPU median (end-to-end)" fill="var(--rx-c-gpu)" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                </BarChart>
+              </ResponsiveContainer>
+            </ChartFrame>}
+        {latestBenchmark && <div className="rx-hero" style={{ padding: 14 }}>
+          <MonitorCog size={24} style={{ color: 'var(--rx-c-gpu)' }} />
+          <div className="rx-hero-text">
+            <h2>{latestBenchmark.workloadId.replaceAll('_', ' ')} · {latestBenchmark.verdict}</h2>
+            <p>CPU median {latestBenchmark.cpu.medianMs.toFixed(2)} ms · GPU median {latestBenchmark.gpu == null ? 'did not run' : `${latestBenchmark.gpu.medianMs.toFixed(2)} ms`}{latestBenchmark.transferMs != null ? ` · transfer ${latestBenchmark.transferMs.toFixed(2)} ms` : ''}{latestBenchmark.speedup != null ? ` · ${latestBenchmark.speedup.toFixed(2)}× speed-up` : ''}</p>
+          </div>
+        </div>}
+        <InfoTip text="Medians filter out outliers from Windows scheduling. Benchmarks never modify models or files; they only measure." />
+      </Card>
+    </>}
+
+    <ConfirmDialog spec={confirm} />
+  </>
 }

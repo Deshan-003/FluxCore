@@ -1,10 +1,10 @@
 import { browser, $, expect } from '@wdio/globals';
 
 // App.tsx renders each sidebar entry as:
-//   <button className={`nav-item ${page === label ? 'active' : ''}`}>
+//   <button className={`rx-nav-item ${page === id ? 'active' : ''}`}>
 // so the `active` class is the authoritative signal that navigation happened.
 const navItem = (label) =>
-  $(`//button[contains(@class,'nav-item')][.//span[normalize-space()='${label}']]`);
+  $(`//button[contains(@class,'rx-nav-item')][.//span[normalize-space()='${label}']]`);
 
 const navigateTo = async (label) => {
   const item = navItem(label);
@@ -20,8 +20,8 @@ describe('FluxCore native UI', () => {
   it('starts with the live collector online', async () => {
     await browser.waitUntil(
       async () =>
-        (await $('//span[contains(@class,"collector-state")]').getText()).includes(
-          'COLLECTOR ONLINE',
+        (await $('[data-testid="collector-state"]').getText()).includes(
+          'Monitoring active',
         ),
       { timeout: 60000, timeoutMsg: 'the collector never came online' },
     );
@@ -35,12 +35,12 @@ describe('FluxCore native UI', () => {
   it('navigates to Settings and flips the monitoring switch both ways', async () => {
     await navigateTo('Settings');
     expect(
-      await $('//h2[normalize-space()="Monitoring preferences"]').isExisting(),
+      await $('//h2[normalize-space()="Monitoring"]').isExisting(),
     ).toBe(true);
 
     const toggle = await $(
-      '//div[contains(@class,"setting-row")]' +
-        '[.//strong[normalize-space()="Enable monitoring"]]' +
+      '//div[contains(@class,"rx-setting-row")]' +
+        '[.//h3[normalize-space()="Enable monitoring"]]' +
         '//button[@role="switch"]',
     );
     expect(await toggle.isExisting()).toBe(true);
@@ -53,10 +53,10 @@ describe('FluxCore native UI', () => {
     );
     await browser.waitUntil(
       async () =>
-        (await $('//div[contains(@class,"system-pill")]').getText()).includes(
+        (await $('[data-testid="collector-state"]').getText()).includes(
           'Monitoring paused',
         ),
-      { timeout: 10000, timeoutMsg: 'the sidebar did not reflect the pause' },
+      { timeout: 10000, timeoutMsg: 'the topbar did not reflect the pause' },
     );
 
     // Restore the original state so the app is left as it was found.

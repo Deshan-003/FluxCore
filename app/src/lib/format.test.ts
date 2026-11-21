@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { fmtBytes, fmtRate, metricSeriesKey, pct, statusFor, titleCase } from './format'
+import { ageOf, fmtBytes, fmtRate, metricSeriesKey, pct, statusFor, statusForPercent, titleCase } from './format'
 
 describe('fmtBytes', () => {
   it('renders unavailable sensors as an explicit placeholder, never as zero', () => {
@@ -87,5 +87,30 @@ describe('metricSeriesKey', () => {
   it('maps CPU and GPU tiles to their own series', () => {
     expect(metricSeriesKey('CPU')).toBe('cpuPercent')
     expect(metricSeriesKey('GPU')).toBe('gpuPercent')
+  })
+})
+
+describe('statusForPercent (redesign status language)', () => {
+  it('maps documented thresholds: healthy < 30, normal < 60, attention < 85, critical >= 85', () => {
+    expect(statusForPercent(10)).toBe('healthy')
+    expect(statusForPercent(45)).toBe('normal')
+    expect(statusForPercent(72)).toBe('attention')
+    expect(statusForPercent(91)).toBe('critical')
+    expect(statusForPercent(85)).toBe('critical')
+    expect(statusForPercent(60)).toBe('attention')
+  })
+
+  it('never turns an unavailable sensor into a health verdict', () => {
+    expect(statusForPercent(null)).toBe('unavailable')
+    expect(statusForPercent(undefined)).toBe('unavailable')
+  })
+})
+
+describe('ageOf', () => {
+  it('stays human and truthful about data age', () => {
+    const now = Date.parse('2026-11-21T12:00:00Z')
+    expect(ageOf('2026-11-21T11:59:58Z', now)).toBe('just now')
+    expect(ageOf('2026-11-21T11:59:40Z', now)).toBe('20s ago')
+    expect(ageOf('2026-11-21T11:57:00Z', now)).toBe('3m ago')
   })
 })

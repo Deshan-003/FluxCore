@@ -77,6 +77,17 @@ function desktopSnapshot(): SystemSnapshot {
   }
 }
 
+async function connectDesktop() {
+  mocks.isDesktopRuntime.mockReturnValue(true)
+  mocks.getSettings.mockResolvedValue({
+    refreshIntervalMs: 1000, historyDurationMinutes: 10, persistHistory: false,
+    monitoringEnabled: true, startOnLogin: false, minimizeToTray: false, theme: 'dark',
+  })
+  mocks.getSnapshot.mockResolvedValue(desktopSnapshot())
+  render(<App />)
+  expect(await screen.findByText('Monitoring active', {}, { timeout: 4000 })).toBeTruthy()
+}
+
 beforeEach(() => {
   vi.stubGlobal('ResizeObserver', class {
     observe() {}
@@ -88,7 +99,7 @@ beforeEach(() => {
   mocks.saveSettings.mockResolvedValue(undefined)
   mocks.listen.mockResolvedValue(() => {})
   useMonitoringStore.setState({
-    snapshot: null, history: [], status: 'loading', error: null, page: 'Overview',
+    snapshot: null, history: [], status: 'loading', error: null, page: 'dashboard',
   })
 })
 
@@ -102,42 +113,33 @@ describe('App in browser preview', () => {
     mocks.isDesktopRuntime.mockReturnValue(false)
     render(<App />)
     expect(await screen.findByText('Open FluxCore for Windows')).toBeTruthy()
-    expect(screen.getByText('PREVIEW MODE')).toBeTruthy()
     expect(screen.getByText('Desktop app required')).toBeTruthy()
     expect(screen.getByText(/No sample metrics are shown in browser preview/)).toBeTruthy()
-    expect(screen.queryByText('WAITING FOR DATA')).toBeTruthy()
+    expect(screen.getByText('Waiting for data')).toBeTruthy()
     expect(screen.queryByText('NVIDIA GeForce RTX 2050')).toBeNull()
   })
 })
 
 describe('App GPU page', () => {
   it('presents dedicated VRAM separately from system RAM', async () => {
-    mocks.isDesktopRuntime.mockReturnValue(true)
-    mocks.getSettings.mockResolvedValue({
-      refreshIntervalMs: 1000, historyDurationMinutes: 10, persistHistory: false,
-      monitoringEnabled: true, startOnLogin: false, minimizeToTray: false, theme: 'dark',
-    })
-    mocks.getSnapshot.mockResolvedValue(desktopSnapshot())
-    render(<App />)
-
-    expect(await screen.findByText('Monitoring active', {}, { timeout: 4000 })).toBeTruthy()
-
-    useMonitoringStore.setState({ page: 'GPU' })
+    await connectDesktop()
+    useMonitoringStore.setState({ page: 'gpu' })
 
     expect(await screen.findByText('NVIDIA GeForce RTX 2050')).toBeTruthy()
 
-    const vramRow = screen.getByText('VRAM usage').parentElement as HTMLElement
-    expect(vramRow.querySelector('strong')?.textContent).toBe('50%')
+    // The dedicated-VRAM card shows used/total from the GPU contract, not system RAM.
+    expect(screen.getByText('Dedicated VRAM')).toBeTruthy()
+    // Used and Available rows both read "2.0 GB of 4.0 GB" on this symmetric fixture.
+    expect(screen.getAllByText('2.0 GB of 4.0 GB').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText(/VRAM is the graphics card's own memory/)).toBeTruthy()
+    // Stated in both the page description and the dedicated-VRAM card.
+    expect(screen.getAllByText(/separate from system RAM/).length).toBeGreaterThanOrEqual(1)
 
-    const controllerRow = screen.getByText('Memory controller activity').parentElement as HTMLElement
-    expect(controllerRow.querySelector('strong')?.textContent).toBe('12%')
+    const controllerRow = screen.getByText('Memory controller').closest('.rx-bar-row') as HTMLElement
+    expect(controllerRow.textContent).toContain('12%')
 
-    expect(screen.getByText('Dedicated VRAM and shared GPU memory are separate pools. Neither is presented as system RAM.')).toBeTruthy()
-
-    const driverRow = screen.getByText('Driver version').parentElement as HTMLElement
-    expect(driverRow.querySelector('strong')?.textContent).toBe('555.99')
-    const classRow = screen.getByText('GPU class').parentElement as HTMLElement
-    expect(classRow.querySelector('strong')?.textContent).toBe('Dedicated')
+    const driverRow = screen.getByText('Driver version').closest('.rx-detail-row') as HTMLElement
+    expect(driverRow.querySelector('dd')?.textContent).toBe('555.99')
 
     // The 62.5% system-RAM figure must not appear anywhere on the GPU page.
     expect(screen.queryByText('63%')).toBeNull()
@@ -164,13 +166,14 @@ describe('App GPU page', () => {
     })
     render(<App />)
     expect(await screen.findByText('Monitoring active', {}, { timeout: 4000 })).toBeTruthy()
-    useMonitoringStore.setState({ page: 'GPU' })
+    useMonitoringStore.setState({ page: 'gpu' })
 
-    expect(await screen.findByText('Dedicated memory used')).toBeTruthy()
-    const usedRow = screen.getByText('Dedicated memory used').parentElement as HTMLElement
-    expect(usedRow.querySelector('strong')?.textContent).toBe('Unavailable')
-    const clockRow = screen.getByText('Core clock').parentElement as HTMLElement
-    expect(clockRow.querySelector('strong')?.textContent).toBe('Unavailable')
+    expect(await screen.findByText('Core clock')).toBeTruthy()
+    const clockRow = screen.getByText('Core clock').closest('.rx-detail-row') as HTMLElement
+    expect(clockRow.querySelector('dd')?.textContent).toBe('Unavailable')
+    const powerRow = screen.getByText('Power draw').closest('.rx-detail-row') as HTMLElement
+    expect(powerRow.querySelector('dd')?.textContent).toBe('Unavailable')
     expect(screen.queryByText('0 MHz')).toBeNull()
+    expect(screen.queryByText('0 W')).toBeNull()
   })
 })
