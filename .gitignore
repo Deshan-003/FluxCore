@@ -7,6 +7,9 @@ target/
 
 # Local tooling: installers, DLLs, archives and build logs (not source)
 tools/
+# Source verification tools under app/tools are tracked, unlike local tooling above.
+!app/tools/
+!app/tools/*.py
 logs/
 *.log
 

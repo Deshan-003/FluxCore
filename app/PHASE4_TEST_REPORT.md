@@ -154,22 +154,55 @@ pass on both WSL and CI.
 
 Synthetic series are used only in unit tests, never in production data or the shipped dashboard.
 
+## CUDA verification on real hardware
+
+All four PTX kernels shipped on this branch were re-run against an **NVIDIA GeForce RTX 2050**
+(driver 591.59, CUDA 13.1) using [tools/cuda_verify.py](tools/cuda_verify.py), which JIT-compiles the
+exact shipped PTX through `nvcuda.dll` with the Rust input generator and launch geometry reproduced.
+This works around the local policy that blocks running Rust-built executables. Full write-up and raw
+evidence: [PHASE4_CUDA_VERIFICATION.md](PHASE4_CUDA_VERIFICATION.md).
+
+| Workload | Kernel (ms) | GPU total (ms) | Max abs error | Validated |
+| --- | --- | --- | --- | --- |
+| vector_axpy | 3.3798 | 10.3321 | 2.38e-07 | ✅ |
+| vector_scale | 0.3121 | 2.7123 | 0 | ✅ |
+| matmul | 0.2288 | 0.9380 | 5.72e-06 | ✅ |
+| row_sum | 0.3588 | 2.6048 | 0 | ✅ |
+
+All four passed the 1e-3 tolerance, and free VRAM was identical (3302.2 MiB) before and after every
+workload — all allocations released. AMD/Intel adapters have **no compute kernels** in FluxCore
+(device-identification only), so there is nothing equivalent to benchmark on them.
+
+## Forecast calibration sample
+
+A 40-observation pass over the real collector (10 simulated minutes, idle CI runner) produced:
+
+| Metric | Result |
+| --- | --- |
+| Matured 1-minute forecasts | 21 / 21 |
+| MAE | 4.264 |
+| MAPE (capped at 10×) | 51.3% |
+| Interval coverage | 20 / 21 (95.2%) |
+| Anomalies on idle workload | 2 over 80 samples (0.025 per sample) |
+
+These are **controlled-CI numbers**, not a representative desktop workload. The non-zero idle anomaly
+count is a genuine finding: the detector is not false-positive-free. Longer 5- and 15-minute horizons
+did not mature within this run and remain unmeasured.
+
 ## Not verified / measured
 
-- An interactive native Windows Tauri UI session and signed-app verification remain unexecuted. The
-  app binary is verified to *start* and stay alive on CI, but no one drives the UI end to end.
-- Installed-app working set, cold-start cost and long-run behaviour are unmeasured. (Native per-sample
-  overhead itself is now measured — see above.)
-- Phase 3 reported CUDA driver-level results apply to its earlier code and were not re-run against this
-  Phase 4 branch. AMD/Intel, wgpu/DX12 runtime, and new Phase 4 GPU telemetry remain unverified here.
-- Real-world prediction accuracy, calibration, and anomaly false-positive rate remain unmeasured.
+- Interactive native Windows UI is now covered by automated E2E (3 cases, all passing). **Signed-app verification remains unexecuted** and requires a code-signing certificate.
+- Installed-app working set, cold-start cost and long-run behaviour are unmeasured. (Native per-sample overhead itself is now measured — see above.)
+- wgpu/DX12 runtime behaviour on non-NVIDIA adapters remains unverified. NVIDIA CUDA kernels are verified on real hardware; AMD/Intel ship no compute kernels.
+- Calibration is measured on a controlled idle CI workload only. Representative desktop workloads and the 5/15-minute forecast horizons remain unmeasured.
 
 ## Evidence-based status
 
-- Analysis, statistical forecasting, anomaly rules and recommendations: **COMPLETE for tested implementation; real-world calibration UNVERIFIED**.
-- Safe adaptive optimization path: **COMPLETE for tested backend path; native Windows UX unverified** (no interactive UI session).
-- UI, IPC and SQLite persistence: **COMPLETE for type/build/unit, Linux SQLite and native Windows test scope; interactive installed-app E2E UNVERIFIED**.
+- Analysis, statistical forecasting, anomaly rules and recommendations: **COMPLETE for tested implementation; calibration measured on a controlled CI workload** (MAE 4.264, MAPE 51.3%, coverage 95.2%, 2 idle anomalies / 80 samples).
+- Safe adaptive optimization path: **COMPLETE for tested backend path; native Windows UX covered by automated E2E**.
+- UI, IPC and SQLite persistence: **COMPLETE for type/build/unit, Linux SQLite, native Windows tests and 3-case native UI E2E**.
 - Outcome evaluation: **PARTIAL** (measures FluxCore scan cost; reports inconclusive when conditions change; never claims overall system speedup).
 - Phase 4 resource-overhead measurement: **COMPLETE** on both paths — Linux 0.78–0.94 ms per 15 s sample; native Windows 4.64 ms per 15 s sample (99.2% SQLite); gated tick < 1 μs on both.
-- Native Windows build, test, bundle and launch: **VERIFIED on CI** (`windows-latest`). Executing them on the developer's own machine remains blocked by Smart App Control, which is still enabled by choice; no security setting was changed.
-- Overall acceptance: **PARTIAL** — the native Windows build/runtime/installer/benchmark blockers are closed; what remains is real-workload calibration and false-positive measurement, an interactive UI session, signed-app verification, and the GPU-lab re-runs.
+- Native Windows build, test, bundle, launch and UI E2E: **VERIFIED on CI** (`windows-latest`). Local execution remains blocked by Smart App Control, which is still enabled by choice; no security setting was changed.
+- CUDA kernels on real NVIDIA hardware: **VERIFIED** (4/4 kernels, no VRAM leak).
+- Overall acceptance: **PARTIAL** — remaining items are signed-app verification (certificate required), representative real-world workload calibration, installed-app footprint/cold start, and non-NVIDIA GPU runtime.
